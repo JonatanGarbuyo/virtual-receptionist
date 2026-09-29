@@ -1,0 +1,2 @@
+# Spike dependency: pin the alpha API so the experiment is reproducible.
+baresip-python==0.5.2a1
