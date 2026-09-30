@@ -38,4 +38,10 @@ class ConfigService:
         return self._repository.get(LANGUAGE_KEY)
 
     def missing_required(self) -> list[str]:
-        return [key for key in REQUIRED_KEYS if self._repository.get(key) is None]
+        """Required keys that are absent or blank."""
+        missing = []
+        for key in REQUIRED_KEYS:
+            value = self._repository.get(key)
+            if value is None or not value.strip():
+                missing.append(key)
+        return missing

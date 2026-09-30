@@ -353,6 +353,56 @@ class HealthSemanticsTest(unittest.TestCase):
         self.assertEqual(core.health.status, HealthStatus.NOT_READY)
         self.assertIn("greeting", core.health.detail)
 
+    def test_blank_required_values_count_as_missing(self) -> None:
+        blank_greeting, _, _, _, _ = make_core(
+            config_values={"greeting": "   ", "language": "es"}
+        )
+        blank_greeting.start()
+        self.assertEqual(blank_greeting.health.status, HealthStatus.NOT_READY)
+        self.assertIn("greeting", blank_greeting.health.detail)
+
+        blank_language, _, _, _, _ = make_core(
+            config_values={"greeting": GREETING, "language": ""}
+        )
+        blank_language.start()
+        self.assertEqual(blank_language.health.status, HealthStatus.NOT_READY)
+        self.assertIn("language", blank_language.health.detail)
+
+
+class SessionEvictionTest(unittest.TestCase):
+    def test_ended_session_is_evicted_from_core(self) -> None:
+        core, _, _, _, _ = make_core()
+        core.start()
+        session = core.incoming_call("+34910000001")
+
+        self.assertIs(core.get_session("call-1"), session)
+
+        session.end_call()
+
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertIsNone(core.get_session("call-1"))
+
+    def test_rejected_session_is_evicted_but_summary_persists(self) -> None:
+        core, _, _, _, calls = make_core(policy=FakePolicy(allow=False))
+        core.start()
+        session = core.incoming_call("+34910000002")
+
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertIsNone(core.get_session("call-1"))
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.outcome, CallOutcome.REJECTED)
+
+    def test_caller_hangup_evicted_after_completion(self) -> None:
+        core, telephony, voice, _, _ = make_core()
+        core.start()
+        core.incoming_call("+34910000001")
+        voice.sessions["call-1"].finish_playback(1)
+
+        telephony.simulate_caller_hangup("call-1")
+
+        self.assertIsNone(core.get_session("call-1"))
+
 
 if __name__ == "__main__":
     unittest.main()

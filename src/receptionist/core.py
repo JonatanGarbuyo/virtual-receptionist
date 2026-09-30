@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from receptionist.boundaries import (
     CallRepository,
     Clock,
@@ -9,7 +11,7 @@ from receptionist.boundaries import (
     TelephonyAdapter,
     VoiceBackend,
 )
-from receptionist.call_session import CallSession
+from receptionist.call_session import CallSession, CallState
 from receptionist.config import ConfigService
 from receptionist.health import ServiceHealth
 
@@ -74,21 +76,30 @@ class ReceptionistCore:
             session.request_answer()
         else:
             session.reject()
+            del self._sessions[call_id]
         return session
+
+    def get_session(self, call_id: str) -> CallSession | None:
+        return self._sessions.get(call_id)
 
     # -- TelephonyListener (called by the telephony adapter) -----------------
 
-    def on_answered(self, call_id: str) -> None:
+    def _dispatch(self, call_id: str, handler: Callable[[CallSession], None]) -> None:
+        """Route a telephony event; evict the session once it ends."""
         session = self._sessions.get(call_id)
-        if session is not None:
-            session.handle_answered()
+        if session is None:
+            return
+        handler(session)
+        if session.state is CallState.ENDED:
+            # pop: the handler may have completed synchronously through a
+            # nested event (e.g. auto-confirmed hangup) and evicted already.
+            self._sessions.pop(call_id, None)
+
+    def on_answered(self, call_id: str) -> None:
+        self._dispatch(call_id, CallSession.handle_answered)
 
     def on_caller_hangup(self, call_id: str) -> None:
-        session = self._sessions.get(call_id)
-        if session is not None:
-            session.handle_caller_hangup()
+        self._dispatch(call_id, CallSession.handle_caller_hangup)
 
     def on_hangup_completed(self, call_id: str) -> None:
-        session = self._sessions.get(call_id)
-        if session is not None:
-            session.handle_hangup_completed()
+        self._dispatch(call_id, CallSession.handle_hangup_completed)
