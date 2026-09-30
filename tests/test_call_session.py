@@ -228,11 +228,53 @@ class PolicyRejectTest(unittest.TestCase):
         self.assertEqual(policy.decisions, ["+34910000002"])
         self.assertEqual(telephony.rejected, ["call-1"])
         self.assertEqual(telephony.answered, [])
-        self.assertEqual(voice.sessions["call-1"].spoken, [])
+        self.assertNotIn("call-1", voice.sessions)
         summary = calls.get("call-1")
         assert summary is not None
         self.assertEqual(summary.outcome, CallOutcome.REJECTED)
         self.assertEqual(summary.turn_count, 0)
+
+
+class ReadinessGateTest(unittest.TestCase):
+    def test_call_before_start_opens_no_voice_and_never_reaches_active(self) -> None:
+        core, telephony, voice, _, calls = make_core()
+        # no start(): health is STARTING
+        session = core.incoming_call("+34910000001")
+
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertEqual(session.history, [CallState.INCOMING, CallState.ENDED])
+        self.assertEqual(telephony.answered, [])
+        self.assertEqual(telephony.rejected, ["call-1"])
+        self.assertNotIn("call-1", voice.sessions)
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.outcome, CallOutcome.REJECTED)
+
+    def test_call_when_not_ready_opens_no_voice_and_never_reaches_active(self) -> None:
+        core, telephony, voice, _, calls = make_core(config_values={"language": "es"})
+        core.start()
+        self.assertEqual(core.health.status, HealthStatus.NOT_READY)
+        session = core.incoming_call("+34910000001")
+
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertEqual(session.history, [CallState.INCOMING, CallState.ENDED])
+        self.assertEqual(telephony.answered, [])
+        self.assertEqual(telephony.rejected, ["call-1"])
+        self.assertNotIn("call-1", voice.sessions)
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.outcome, CallOutcome.REJECTED)
+
+    def test_ready_call_opens_voice_and_reaches_active_greeting(self) -> None:
+        core, telephony, voice, _, _ = make_core()
+        core.start()
+        self.assertEqual(core.health.status, HealthStatus.READY)
+        session = core.incoming_call("+34910000001")
+
+        self.assertEqual(session.state, CallState.ACTIVE)
+        self.assertEqual(session.mode, ActiveMode.GREETING)
+        self.assertIn("call-1", voice.sessions)
+        self.assertEqual(telephony.answered, ["call-1"])
 
 
 class LateEventsTest(unittest.TestCase):

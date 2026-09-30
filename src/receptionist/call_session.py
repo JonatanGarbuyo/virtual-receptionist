@@ -16,6 +16,7 @@ from receptionist.boundaries import (
     Clock,
     TelephonyAdapter,
     VoiceBackend,
+    VoiceSession,
 )
 
 
@@ -51,6 +52,10 @@ class CallSession:
         self.call_id = call_id
         self.caller_id = caller_id
         self._telephony = telephony
+        self._voice_backend = voice
+        # Opened lazily in request_answer, so refused calls never acquire it.
+        # Non-None whenever the session leaves INCOMING via admission.
+        self._voice_session: VoiceSession | None = None
         self._greeting = greeting
         self._calls = calls
         self._clock = clock
@@ -61,7 +66,6 @@ class CallSession:
         self._turn_count = 0
         self._pending_outcome: CallOutcome | None = None
         self._started_at = clock.now()
-        self._voice = voice.open_session(call_id, self)
 
     @property
     def state(self) -> CallState:
@@ -86,10 +90,11 @@ class CallSession:
     # -- admission --------------------------------------------------------
 
     def request_answer(self) -> None:
-        """Move INCOMING -> ANSWERING and ask telephony to answer."""
+        """Move INCOMING -> ANSWERING, acquire voice, ask telephony to answer."""
         if self._state is not CallState.INCOMING:
             return
         self._transition(CallState.ANSWERING)
+        self._voice_session = self._voice_backend.open_session(self.call_id, self)
         self._telephony.answer(self.call_id)
 
     def reject(self) -> None:
@@ -104,10 +109,11 @@ class CallSession:
     def handle_answered(self) -> None:
         if self._state is not CallState.ANSWERING:
             return
+        assert self._voice_session is not None  # opened in request_answer
         self._transition(CallState.ACTIVE)
         self._mode = ActiveMode.GREETING
         self._turn = 1
-        self._voice.speak(self._greeting, self._turn)
+        self._voice_session.speak(self._greeting, self._turn)
 
     def handle_caller_hangup(self) -> None:
         if self._state in (CallState.TERMINATING, CallState.ENDED):
@@ -145,8 +151,9 @@ class CallSession:
             return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
+        assert self._voice_session is not None  # opened in request_answer
         self._mode = ActiveMode.SPEAKING
-        self._voice.speak(text, turn_id)
+        self._voice_session.speak(text, turn_id)
 
     def on_playback_finished(self, turn_id: int) -> None:
         if self._state is not CallState.ACTIVE:
@@ -172,7 +179,8 @@ class CallSession:
 
     def _finish(self, outcome: CallOutcome) -> None:
         self._transition(CallState.ENDED)
-        self._voice.close()
+        if self._voice_session is not None:
+            self._voice_session.close()
         self._calls.save(
             CallSummary(
                 call_id=self.call_id,

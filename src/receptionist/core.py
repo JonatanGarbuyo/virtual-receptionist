@@ -13,7 +13,7 @@ from receptionist.boundaries import (
 )
 from receptionist.call_session import CallSession, CallState
 from receptionist.config import ConfigService
-from receptionist.health import ServiceHealth
+from receptionist.health import HealthStatus, ServiceHealth
 
 
 class ReceptionistCore:
@@ -58,7 +58,7 @@ class ReceptionistCore:
     # -- admission -----------------------------------------------------------
 
     def incoming_call(self, caller_id: str) -> CallSession:
-        """Synthetic inbound entry point: policy decides answer vs reject."""
+        """Synthetic inbound entry point: readiness, then policy, then answer."""
         call_id = f"call-{self._next_call}"
         self._next_call += 1
         greeting = self._config.get_greeting() or ""
@@ -72,7 +72,12 @@ class ReceptionistCore:
             clock=self._clock,
         )
         self._sessions[call_id] = session
-        if self._policy.should_answer(caller_id):
+        # No AI session may start while STARTING/NOT_READY. Refusing here
+        # acquires no voice resources (lazy open in request_answer); exact
+        # real-adapter fallback behavior belongs to a later ticket.
+        # DEGRADED handling is left to its ticket as well.
+        admitted = self.health.status not in (HealthStatus.STARTING, HealthStatus.NOT_READY)
+        if admitted and self._policy.should_answer(caller_id):
             session.request_answer()
         else:
             session.reject()
