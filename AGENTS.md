@@ -11,3 +11,8 @@ Default five canonical roles (`needs-triage`, `needs-info`, `ready-for-agent`, `
 ### Domain docs
 
 Single-context layout (root `CONTEXT.md` + `docs/adr/`). See `docs/agents/domain.md`.
+
+## Testing rules
+
+- Do not write tautological tests.
+- Prefer tests of public behaviour and repository contracts over implementation details.
