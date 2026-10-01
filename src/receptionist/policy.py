@@ -43,6 +43,7 @@ class RetentionPolicy:
     history_days: int = 180
     transcripts_days: int = 7
     audit_days: int = 30
+    prune_interval_seconds: float = 3600.0
 
 
 class DestinationStatus(Enum):

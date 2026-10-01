@@ -53,7 +53,7 @@ class InMemoryCallRepository:
 class InMemoryMessageRepository:
     """Confirmed messages only. The id is assigned here, on successful save."""
 
-    def __init__(self, clock: Clock | None = None) -> None:
+    def __init__(self, clock: Clock) -> None:
         self._messages: dict[str, MessageRecord] = {}
         self._clock = clock
         self._next_id = 1
@@ -67,7 +67,7 @@ class InMemoryMessageRepository:
             caller_id=draft.caller_id,
             caller_name=draft.caller_name,
             text=draft.text,
-            created_at=self._clock.now() if self._clock is not None else 0.0,
+            created_at=self._clock.now(),
         )
         self._messages[message_id] = record
         return record
@@ -132,21 +132,25 @@ class RuntimeStorage:
 
     def __init__(
         self,
-        calls: CallRepository | None = None,
-        messages: MessageRepository | None = None,
-        transcripts: TranscriptStore | None = None,
-        audit: AuditLog | None = None,
+        *,
+        calls: CallRepository,
+        messages: MessageRepository,
+        transcripts: TranscriptStore,
+        audit: AuditLog,
     ) -> None:
-        self.calls = calls if calls is not None else InMemoryCallRepository()
-        self.messages = messages if messages is not None else InMemoryMessageRepository()
-        self.transcripts = transcripts if transcripts is not None else InMemoryTranscriptStore()
-        self.audit = audit if audit is not None else InMemoryAuditLog()
+        self.calls = calls
+        self.messages = messages
+        self.transcripts = transcripts
+        self.audit = audit
 
     @classmethod
-    def create(cls, clock: Clock | None = None) -> RuntimeStorage:
-        storage = cls()
-        storage.messages = InMemoryMessageRepository(clock=clock)
-        return storage
+    def create(cls, clock: Clock) -> RuntimeStorage:
+        return cls(
+            calls=InMemoryCallRepository(),
+            messages=InMemoryMessageRepository(clock=clock),
+            transcripts=InMemoryTranscriptStore(),
+            audit=InMemoryAuditLog(),
+        )
 
     def prune_expired(self, retention: RetentionPolicy, now: float) -> dict[str, int]:
         """Delete records older than the policy. Idempotent: reruns delete 0."""

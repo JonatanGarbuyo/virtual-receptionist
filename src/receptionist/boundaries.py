@@ -145,7 +145,14 @@ class MessageRecord:
 
 
 class MessageRepository(Protocol):
-    """Runtime persistence boundary for confirmed messages."""
+    """Runtime persistence boundary for confirmed messages.
+
+    Atomicity contract: save() either commits the record and returns it,
+    or raises before committing anything. A TransientStoreError therefore
+    implies no record was stored, which is what makes the session's bounded
+    retry safe against duplicates. Stores must only raise
+    TransientStoreError (retryable) or StoreUnavailableError (fallback).
+    """
 
     def save(self, draft: MessageDraft) -> MessageRecord: ...
     def get(self, message_id: str) -> MessageRecord | None: ...

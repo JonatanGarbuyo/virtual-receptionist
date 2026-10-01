@@ -41,6 +41,7 @@ class ReceptionistCore:
         self._policy_engine = policy_engine
         self._runtime = runtime
         self._retention = retention
+        self._last_prune: float | None = None
         self.health = ServiceHealth()
         self._sessions: dict[str, CallSession] = {}
         self._next_call = 1
@@ -101,11 +102,20 @@ class ReceptionistCore:
 
         The production runtime calls this periodically; under test the fake
         clock advances first. No background timers live in the core.
+        Retention cleanup rides along on a deterministic throttle so expired
+        records are pruned without anyone remembering to call for it.
         """
         for call_id in list(self._sessions):
             session = self._sessions.get(call_id)
             if session is not None:
                 session.check_timeouts()
+        now = self._clock.now()
+        if (
+            self._last_prune is None
+            or now - self._last_prune >= self._retention.prune_interval_seconds
+        ):
+            self._runtime.prune_expired(self._retention, now)
+            self._last_prune = now
 
     def prune_expired(self) -> dict[str, int]:
         """Run bounded-retention cleanup over runtime storage. Idempotent."""

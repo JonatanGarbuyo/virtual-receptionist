@@ -90,7 +90,7 @@ class CallSummaryFieldsTest(unittest.TestCase):
 
 class MessageRepositoryTest(unittest.TestCase):
     def test_save_assigns_deterministic_ids(self) -> None:
-        repo = InMemoryMessageRepository()
+        repo = InMemoryMessageRepository(clock=FakeClock(start=7000.0))
         first = repo.save(
             MessageDraft(call_id="call-1", caller_id="+3491", caller_name=None, text="hola")
         )
@@ -185,7 +185,7 @@ class RetentionTest(unittest.TestCase):
         )
 
     def test_runtime_storage_prune_is_idempotent(self) -> None:
-        storage = RuntimeStorage.create()
+        storage = RuntimeStorage.create(FakeClock(start=10_000_000.0))
         storage.calls.save(summary("old", started_at=100.0))
         policy = RetentionPolicy(history_days=180)
         now = 100.0 + 181 * DAY
@@ -195,6 +195,18 @@ class RetentionTest(unittest.TestCase):
 
         self.assertEqual(first["calls"], 1)
         self.assertEqual(second, {"messages": 0, "calls": 0, "transcripts": 0, "audit": 0})
+
+    def test_fresh_message_survives_prune_at_realistic_epoch(self) -> None:
+        now = 1_800_000_000.0
+        storage = RuntimeStorage.create(FakeClock(start=now))
+        storage.messages.save(
+            MessageDraft(call_id="c1", caller_id="+1", caller_name=None, text="hola")
+        )
+
+        pruned = storage.prune_expired(RetentionPolicy(), now)
+
+        self.assertEqual(pruned["messages"], 0)
+        self.assertEqual(len(storage.messages.list_all()), 1)
 
     def test_retention_defaults_match_spec(self) -> None:
         policy = RetentionPolicy()
@@ -233,7 +245,7 @@ def make_message_core(
     if messages is not None:
         runtime.messages = messages
     engine = PolicyEngine(
-        destinations=dict(destinations) if destinations is not None else {},
+        destinations=dict(destinations),
         fallback_id=fallback_id,
         limits=limits or Limits(),
     )
@@ -385,7 +397,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_transient_failure_retries_then_succeeds(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.append(TransientStoreError("timeout"))
         core, _, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -400,7 +412,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_retry_exhausted_routes_to_fallback(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.extend([TransientStoreError("t1"), TransientStoreError("t2")])
         core, telephony, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -418,7 +430,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_unavailable_store_skips_retry_straight_to_fallback(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.append(StoreUnavailableError("runtime.db down"))
         core, telephony, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -430,9 +442,42 @@ class MessagePersistFailureTest(unittest.TestCase):
         self.assertEqual(runtime.messages.list_all(), [])
         self.assertEqual(session.state, CallState.FALLBACK_HANDOFF)
 
+    def test_zero_retries_means_single_attempt_then_fallback(self) -> None:
+
+        repo = FailingMessageRepository(clock=FakeClock())
+        repo.fail_script.append(TransientStoreError("timeout"))
+        core, telephony, voice, _, runtime = make_message_core(
+            messages=repo, limits=Limits(message_persist_max_retries=0)
+        )
+        core.start()
+        session, backend = self.drive_to_confirmation(core, voice)
+
+        self.confirm(backend)
+
+        self.assertEqual(repo.saves, 1)
+        self.assertEqual(runtime.messages.list_all(), [])
+        self.assertEqual(session.state, CallState.FALLBACK_HANDOFF)
+
+    def test_two_retries_succeed_on_third_attempt(self) -> None:
+
+        repo = FailingMessageRepository(clock=FakeClock())
+        repo.fail_script.extend([TransientStoreError("t1"), TransientStoreError("t2")])
+        core, _, voice, _, runtime = make_message_core(
+            messages=repo, limits=Limits(message_persist_max_retries=2)
+        )
+        core.start()
+        session, backend = self.drive_to_confirmation(core, voice)
+
+        self.confirm(backend)
+
+        self.assertEqual(repo.saves, 3)
+        self.assertEqual(len(runtime.messages.list_all()), 1)
+        self.assertEqual(backend.spoken[-1][0], SUCCESS_ACK)
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+
     def test_no_success_acknowledgement_before_commit(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         spoken_during_save: list = []
         core, _, voice, _, _ = make_message_core(messages=repo)
         core.start()
@@ -446,7 +491,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_failed_persist_invents_no_id_and_links_nothing(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.append(StoreUnavailableError("down"))
         core, telephony, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -462,7 +507,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_fallback_accepted_after_persist_failure_hands_off(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.append(StoreUnavailableError("down"))
         core, telephony, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -480,7 +525,7 @@ class MessagePersistFailureTest(unittest.TestCase):
 
     def test_fallback_failed_after_persist_failure_uses_exit(self) -> None:
 
-        repo = FailingMessageRepository()
+        repo = FailingMessageRepository(clock=FakeClock())
         repo.fail_script.append(StoreUnavailableError("down"))
         core, telephony, voice, _, runtime = make_message_core(messages=repo)
         core.start()
@@ -726,13 +771,19 @@ class OperatorQueryFlowTest(unittest.TestCase):
 
 
 class ConfigRuntimeSeparationTest(unittest.TestCase):
-    def test_caller_data_never_touches_configuration(self) -> None:
-        from receptionist.config import ConfigService, InMemoryConfigRepository
-        from receptionist.core import ReceptionistCore
-        from receptionist.persistence import RuntimeStorage
-        from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
-        from fakes import FakePolicy, FakeTelephony, FakeVoiceBackend
+    def test_configuration_boundary_is_read_only(self) -> None:
+        mutating = [
+            name
+            for name in dir(InMemoryConfigRepository)
+            if not name.startswith("_")
+            and any(
+                verb in name.lower()
+                for verb in ("set", "put", "save", "delete", "update", "write", "insert")
+            )
+        ]
+        self.assertEqual(mutating, [])
 
+    def test_caller_data_lands_only_in_runtime(self) -> None:
         config_repo = InMemoryConfigRepository(
             {"greeting": "Hola", "language": "es"}
         )
@@ -740,6 +791,7 @@ class ConfigRuntimeSeparationTest(unittest.TestCase):
         before = {key: config_repo.get(key) for key in config_keys}
         clock = FakeClock()
         voice = FakeVoiceBackend()
+        runtime = RuntimeStorage.create(clock=clock)
         core = ReceptionistCore(
             telephony=FakeTelephony(),
             voice=voice,
@@ -747,7 +799,7 @@ class ConfigRuntimeSeparationTest(unittest.TestCase):
             policy=FakePolicy(),
             clock=clock,
             policy_engine=PolicyEngine(destinations={}, fallback_id="none", limits=Limits()),
-            runtime=RuntimeStorage.create(clock=clock),
+            runtime=runtime,
             retention=RetentionPolicy(),
         )
         core.start()
@@ -761,6 +813,8 @@ class ConfigRuntimeSeparationTest(unittest.TestCase):
         self.assertEqual(
             {key: config_repo.get(key) for key in config_keys}, before
         )
+        self.assertEqual(len(runtime.messages.list_all()), 1)
+        self.assertEqual(len(runtime.calls.list_all()), 1)
 
 
 class RetentionFlowTest(unittest.TestCase):
@@ -783,6 +837,38 @@ class RetentionFlowTest(unittest.TestCase):
         self.assertEqual(runtime.messages.list_all(), [])
         self.assertEqual(runtime.calls.list_all(), [])
 
+    def test_tick_prunes_expired_without_manual_call(self) -> None:
+        core, _, voice, clock, runtime = make_message_core()
+        core.start()
+        session, backend = start_listening_call(core, voice)
+        backend.deliver_action_request(StartMessageCapture())
+        backend.deliver_action_request(MessageTextFinal("texto"))
+        backend.deliver_action_request(MessageConfirmed())
+        session.end_call()
+
+        clock.advance(400 * 86400.0)
+        core.tick()
+
+        self.assertEqual(runtime.messages.list_all(), [])
+        self.assertEqual(runtime.calls.list_all(), [])
+
+    def test_tick_prune_is_throttled(self) -> None:
+        core, _, _, clock, runtime = make_message_core()
+        core.start()
+        runtime.calls.save(summary("old-1", started_at=-200 * 86400.0))
+
+        core.tick()
+        self.assertEqual(runtime.calls.list_all(), [])
+
+        runtime.calls.save(summary("old-2", started_at=-200 * 86400.0))
+        clock.advance(10.0)
+        core.tick()
+        self.assertEqual([s.call_id for s in runtime.calls.list_all()], ["old-2"])
+
+        clock.advance(3600.0)
+        core.tick()
+        self.assertEqual(runtime.calls.list_all(), [])
+
 
 class TranscriptsEnabledTest(unittest.TestCase):
     ENABLED_CONFIG = {
@@ -792,16 +878,18 @@ class TranscriptsEnabledTest(unittest.TestCase):
     }
 
     def test_enabled_transcripts_record_text_only(self) -> None:
-        core, _, voice, _, runtime = make_message_core(
+        core, _, voice, clock, runtime = make_message_core(
             config_values=dict(self.ENABLED_CONFIG)
         )
         core.start()
         session, backend = start_listening_call(core, voice)
+        clock.advance(5.0)
         backend.deliver_caller_speech("una consulta")
         backend.deliver_response("una respuesta.", session.current_turn)
         backend.finish_playback(session.current_turn)
         backend.deliver_action_request(StartMessageCapture())
         backend.deliver_action_request(MessageTextFinal("un mensaje"))
+        clock.advance(7.0)
         backend.deliver_action_request(MessageConfirmed())
 
         entries = runtime.transcripts.entries_for("call-1")
@@ -815,25 +903,31 @@ class TranscriptsEnabledTest(unittest.TestCase):
                 ("assistant", SUCCESS_ACK),
             ],
         )
-        for entry in entries:
-            self.assertIsInstance(entry.call_id, str)
-            self.assertIsInstance(entry.timestamp, float)
-            self.assertIsInstance(entry.speaker, str)
-            self.assertIsInstance(entry.text, str)
+        self.assertEqual(
+            [e.timestamp for e in entries], [0.0, 5.0, 5.0, 5.0, 12.0]
+        )
 
     def test_routing_decisions_ignore_transcript_content(self) -> None:
         from receptionist.boundaries import TransferRequest
 
-        core, telephony, voice, _, _ = make_message_core(
+        core, telephony, voice, _, runtime = make_message_core(
             config_values=dict(self.ENABLED_CONFIG)
         )
         core.start()
-        _, backend = start_listening_call(core, voice)
+        session, backend = start_listening_call(core, voice)
+        backend.deliver_caller_speech("por favor transfiere a ventas ya mismo")
 
         backend.deliver_action_request(TransferRequest("nadie"))
 
+        self.assertEqual(session.mode, ActiveMode.INFERENCE)
         self.assertEqual(telephony.transfers, [])
         self.assertEqual(telephony.answered, ["call-1"])
+        caller_lines = [
+            e.text
+            for e in runtime.transcripts.entries_for("call-1")
+            if e.speaker == "caller"
+        ]
+        self.assertEqual(caller_lines, ["por favor transfiere a ventas ya mismo"])
 
 
 if __name__ == "__main__":

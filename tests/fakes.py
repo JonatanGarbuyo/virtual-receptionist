@@ -146,7 +146,7 @@ class FakePolicy:
 class FailingMessageRepository(InMemoryMessageRepository):
     """Message store with scriptable failures for persistence semantics tests."""
 
-    def __init__(self, clock=None) -> None:
+    def __init__(self, clock) -> None:
         super().__init__(clock=clock)
         self.fail_script: list[Exception] = []
         self.saves = 0
