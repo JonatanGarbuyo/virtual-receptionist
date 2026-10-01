@@ -10,21 +10,30 @@ from __future__ import annotations
 from enum import Enum
 
 from receptionist.boundaries import (
+    AuditDecision,
+    AuditEvent,
+    AuditLog,
     CallOutcome,
     CallRepository,
     CallSummary,
     Clock,
     TelephonyAdapter,
+    TransferRequest,
+    TransferResult,
     VoiceBackend,
     VoiceSession,
 )
+from receptionist.policy import DestinationStatus, PolicyEngine
 
 
 class CallState(Enum):
     INCOMING = "incoming"
     ANSWERING = "answering"
     ACTIVE = "active"
+    TRANSFER_HANDOFF = "transfer_handoff"
+    FALLBACK_HANDOFF = "fallback_handoff"
     TERMINATING = "terminating"
+    HANDED_OFF = "handed_off"
     ENDED = "ended"
 
 
@@ -33,6 +42,20 @@ class ActiveMode(Enum):
     LISTENING = "listening"
     INFERENCE = "inference"
     SPEAKING = "speaking"
+
+
+#: Brief deterministic apology spoken before terminating a call whose
+#: handoff and fallback both failed. Kept constant, not configurable.
+EXIT_APOLOGY = "Lo siento, no fue posible comunicarle. La llamada terminará."
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PendingTransfer:
+    destination_id: str
+    is_fallback: bool
 
 
 class CallSession:
@@ -48,6 +71,8 @@ class CallSession:
         greeting: str,
         calls: CallRepository,
         clock: Clock,
+        policy_engine: PolicyEngine,
+        audit: AuditLog,
     ) -> None:
         self.call_id = call_id
         self.caller_id = caller_id
@@ -59,11 +84,15 @@ class CallSession:
         self._greeting = greeting
         self._calls = calls
         self._clock = clock
+        self._policy_engine = policy_engine
+        self._audit = audit
         self._state = CallState.INCOMING
         self._mode: ActiveMode | None = None
         self._history = [CallState.INCOMING]
         self._turn = 0
         self._turn_count = 0
+        self._attempts_used = 0
+        self._pending_transfer: PendingTransfer | None = None
         self._pending_outcome: CallOutcome | None = None
         self._started_at = clock.now()
 
@@ -133,12 +162,24 @@ class CallSession:
 
     # -- voice events ------------------------------------------------------
 
+    def _over_call_limit(self) -> bool:
+        return (
+            self._clock.now() - self._started_at
+            >= self._policy_engine.limits.max_call_seconds
+        )
+
     def on_transcript(self, text: str) -> None:
         if self._state is not CallState.ACTIVE:
+            return
+        if self._over_call_limit():
+            self.end_call()
             return
         if self._mode not in (ActiveMode.LISTENING, ActiveMode.INFERENCE):
             # Barge-in is deferred: speech over the greeting or while the
             # assistant is speaking does not open a turn in this slice.
+            return
+        if self._turn_count >= self._policy_engine.limits.max_turns:
+            self.end_call()
             return
         self._turn += 1
         self._turn_count += 1
@@ -151,6 +192,9 @@ class CallSession:
             return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
+        if self._over_call_limit():
+            self.end_call()
+            return
         assert self._voice_session is not None  # opened in request_answer
         self._mode = ActiveMode.SPEAKING
         self._voice_session.speak(text, turn_id)
@@ -160,8 +204,102 @@ class CallSession:
             return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
+        if self._over_call_limit():
+            self.end_call()
+            return
         if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
             self._mode = ActiveMode.LISTENING
+
+    def on_action_request(self, action: object) -> None:
+        # Privileged actions arrive only as typed objects. Spoken text,
+        # transcripts, and any other channel can never open this path.
+        if not isinstance(action, TransferRequest):
+            self._audit_action("", AuditDecision.DENIED, detail=f"malformed action: {type(action).__name__}")
+            return
+        self._audit_action(action.destination_id, AuditDecision.REQUESTED)
+        if self._state is not CallState.ACTIVE or self._mode not in (
+            ActiveMode.LISTENING,
+            ActiveMode.INFERENCE,
+        ):
+            self._deny(action.destination_id, "out of state")
+            return
+        resolution = self._policy_engine.resolve(action.destination_id)
+        if resolution.status is not DestinationStatus.OK:
+            self._deny(action.destination_id, resolution.status.value)
+            return
+        if not self._policy_engine.transfer_allowed(self._attempts_used):
+            self._deny(action.destination_id, "transfer attempts exceeded")
+            return
+        assert resolution.destination is not None
+        self._attempts_used += 1
+        self._pending_transfer = PendingTransfer(action.destination_id, is_fallback=False)
+        self._audit_action(
+            action.destination_id,
+            AuditDecision.ALLOWED,
+            detail=f"target {resolution.destination.target}",
+        )
+        self._transition(CallState.TRANSFER_HANDOFF)
+        self._mode = None
+        self._telephony.blind_transfer(self.call_id, resolution.destination.target)
+
+    def handle_transfer_result(self, result: TransferResult) -> None:
+        if self._state not in (CallState.TRANSFER_HANDOFF, CallState.FALLBACK_HANDOFF):
+            return
+        pending = self._pending_transfer
+        destination_id = pending.destination_id if pending is not None else ""
+        self._audit_action(destination_id, AuditDecision.COMPLETED, result=result)
+        if result is TransferResult.ACCEPTED_BY_PBX:
+            self._pending_transfer = None
+            self._transition(CallState.HANDED_OFF)
+            self._finish(CallOutcome.TRANSFERRED)
+            return
+        self._pending_transfer = None
+        if self._state is CallState.TRANSFER_HANDOFF:
+            fallback = self._policy_engine.fallback()
+            if (
+                fallback is not None
+                and self._policy_engine.transfer_allowed(self._attempts_used)
+            ):
+                self._attempts_used += 1
+                self._pending_transfer = PendingTransfer(fallback.id, is_fallback=True)
+                self._audit_action(fallback.id, AuditDecision.REQUESTED, detail="fallback")
+                self._audit_action(
+                    fallback.id, AuditDecision.ALLOWED, detail=f"target {fallback.target}"
+                )
+                self._transition(CallState.FALLBACK_HANDOFF)
+                self._telephony.blind_transfer(self.call_id, fallback.target)
+                return
+        self._exit_after_failed_handoff()
+
+    def _exit_after_failed_handoff(self) -> None:
+        """Single deterministic exit: one brief apology, then terminate."""
+        if self._voice_session is not None:
+            self._voice_session.speak(EXIT_APOLOGY, self._turn)
+        self._pending_outcome = CallOutcome.COMPLETED
+        self._transition(CallState.TERMINATING)
+        self._telephony.hangup(self.call_id)
+
+    def _deny(self, destination_id: str, reason: str) -> None:
+        self._audit_action(destination_id, AuditDecision.DENIED, detail=reason)
+
+    def _audit_action(
+        self,
+        destination: str,
+        decision: AuditDecision,
+        result: TransferResult | None = None,
+        detail: str = "",
+    ) -> None:
+        self._audit.record(
+            AuditEvent(
+                timestamp=self._clock.now(),
+                call_id=self.call_id,
+                action="transfer",
+                destination=destination,
+                decision=decision,
+                result=result,
+                detail=detail,
+            )
+        )
 
     # -- local actions -----------------------------------------------------
 

@@ -17,10 +17,20 @@ class Clock(Protocol):
     def now(self) -> float: ...
 
 
+class TransferResult(Enum):
+    """Normalized handoff outcome. Only these four values may cross the seam."""
+
+    ACCEPTED_BY_PBX = "accepted_by_pbx"
+    REJECTED = "rejected"
+    TIMEOUT = "timeout"
+    TRANSPORT_ERROR = "transport_error"
+
+
 class TelephonyListener(Protocol):
     def on_answered(self, call_id: str) -> None: ...
     def on_caller_hangup(self, call_id: str) -> None: ...
     def on_hangup_completed(self, call_id: str) -> None: ...
+    def on_transfer_result(self, call_id: str, result: TransferResult) -> None: ...
 
 
 class TelephonyAdapter(Protocol):
@@ -30,6 +40,17 @@ class TelephonyAdapter(Protocol):
     def answer(self, call_id: str) -> None: ...
     def reject(self, call_id: str) -> None: ...
     def hangup(self, call_id: str) -> None: ...
+    def blind_transfer(self, call_id: str, pbx_target: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class TransferRequest:
+    """The only transfer shape the model/requester may produce.
+
+    A symbolic destination id resolved by policy; never a number or URI.
+    """
+
+    destination_id: str
 
 
 class VoiceListener(Protocol):
@@ -38,6 +59,7 @@ class VoiceListener(Protocol):
     def on_transcript(self, text: str) -> None: ...
     def on_response(self, turn_id: int, text: str) -> None: ...
     def on_playback_finished(self, turn_id: int) -> None: ...
+    def on_action_request(self, action: object) -> None: ...
 
 
 class VoiceSession(Protocol):
@@ -67,6 +89,34 @@ class CallOutcome(Enum):
     COMPLETED = "completed"
     CALLER_HANGUP = "caller_hangup"
     REJECTED = "rejected"
+    TRANSFERRED = "transferred"
+
+
+class AuditDecision(Enum):
+    REQUESTED = "requested"
+    ALLOWED = "allowed"
+    DENIED = "denied"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    """One structured privileged-action record. No transcript content."""
+
+    timestamp: float
+    call_id: str
+    action: str
+    destination: str
+    decision: AuditDecision
+    result: TransferResult | None = None
+    detail: str = ""
+
+
+class AuditLog(Protocol):
+    """Append-only audit boundary for privileged actions."""
+
+    def record(self, event: AuditEvent) -> None: ...
+    def list_all(self) -> list[AuditEvent]: ...
 
 
 @dataclass(frozen=True)

@@ -5,15 +5,18 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from receptionist.boundaries import (
+    AuditLog,
     CallRepository,
     Clock,
     Policy,
     TelephonyAdapter,
+    TransferResult,
     VoiceBackend,
 )
 from receptionist.call_session import CallSession, CallState
 from receptionist.config import ConfigService
 from receptionist.health import HealthStatus, ServiceHealth
+from receptionist.policy import PolicyEngine
 
 
 class ReceptionistCore:
@@ -28,6 +31,8 @@ class ReceptionistCore:
         policy: Policy,
         calls: CallRepository,
         clock: Clock,
+        policy_engine: PolicyEngine,
+        audit: AuditLog,
     ) -> None:
         self._telephony = telephony
         self._voice = voice
@@ -35,6 +40,8 @@ class ReceptionistCore:
         self._policy = policy
         self._calls = calls
         self._clock = clock
+        self._policy_engine = policy_engine
+        self._audit = audit
         self.health = ServiceHealth()
         self._sessions: dict[str, CallSession] = {}
         self._next_call = 1
@@ -70,6 +77,8 @@ class ReceptionistCore:
             greeting=greeting,
             calls=self._calls,
             clock=self._clock,
+            policy_engine=self._policy_engine,
+            audit=self._audit,
         )
         self._sessions[call_id] = session
         # No AI session may start while STARTING/NOT_READY. Refusing here
@@ -89,12 +98,12 @@ class ReceptionistCore:
 
     # -- TelephonyListener (called by the telephony adapter) -----------------
 
-    def _dispatch(self, call_id: str, handler: Callable[[CallSession], None]) -> None:
+    def _dispatch(self, call_id: str, handler: Callable[..., None], *args: object) -> None:
         """Route a telephony event; evict the session once it ends."""
         session = self._sessions.get(call_id)
         if session is None:
             return
-        handler(session)
+        handler(session, *args)
         if session.state is CallState.ENDED:
             # pop: the handler may have completed synchronously through a
             # nested event (e.g. auto-confirmed hangup) and evicted already.
@@ -108,3 +117,6 @@ class ReceptionistCore:
 
     def on_hangup_completed(self, call_id: str) -> None:
         self._dispatch(call_id, CallSession.handle_hangup_completed)
+
+    def on_transfer_result(self, call_id: str, result: TransferResult) -> None:
+        self._dispatch(call_id, CallSession.handle_transfer_result, result)
