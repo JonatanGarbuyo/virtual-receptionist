@@ -35,7 +35,7 @@ from receptionist.persistence import (
 )
 from receptionist.policy import Destination, Limits, PolicyEngine, RetentionPolicy
 
-from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend, FailingMessageRepository
+from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend, FailingMessageRepository
 
 # Independent literal pinning call_session.EXIT_APOLOGY.
 EXIT_APOLOGY = "Lo siento, no fue posible comunicarle. La llamada terminará."
@@ -263,6 +263,7 @@ def make_message_core(
         policy_engine=engine,
         runtime=runtime,
         retention=RetentionPolicy(),
+        call_ids=FakeCallIds(),
     )
     return core, telephony, voice, clock, runtime
 
@@ -801,6 +802,7 @@ class ConfigRuntimeSeparationTest(unittest.TestCase):
             policy_engine=PolicyEngine(destinations={}, fallback_id="none", limits=Limits()),
             runtime=runtime,
             retention=RetentionPolicy(),
+            call_ids=FakeCallIds(),
         )
         core.start()
         session, backend = start_listening_call(core, voice, "+34910000999")

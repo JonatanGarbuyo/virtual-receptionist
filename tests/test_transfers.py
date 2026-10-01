@@ -18,7 +18,6 @@ from receptionist.boundaries import (
 from receptionist.call_session import ActiveMode, CallState
 from receptionist.config import ConfigService, InMemoryConfigRepository
 from receptionist.core import ReceptionistCore
-from receptionist.health import HealthStatus
 from receptionist.persistence import (
     InMemoryAuditLog,
     InMemoryCallRepository,
@@ -28,7 +27,7 @@ from receptionist.persistence import (
 )
 from receptionist.policy import Destination, Limits, PolicyEngine, RetentionPolicy
 
-from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
+from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 
 
 GREETING = "Bienvenido, ¿en qué puedo ayudarle?"
@@ -80,6 +79,7 @@ def make_transfer_core(
             audit=audit,
         ),
         retention=RetentionPolicy(),
+        call_ids=FakeCallIds(),
     )
     return core, telephony, voice, clock, calls, audit, engine
 

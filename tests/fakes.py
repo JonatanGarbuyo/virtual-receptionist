@@ -131,6 +131,18 @@ class FakeVoiceBackend:
         return session
 
 
+class FakeCallIds:
+    """Deterministic call id generator for tests: call-1, call-2, ..."""
+
+    def __init__(self) -> None:
+        self._next = 1
+
+    def next_id(self) -> str:
+        call_id = f"call-{self._next}"
+        self._next += 1
+        return call_id
+
+
 class FakePolicy:
     """Admission policy stand-in. Records every decision."""
 

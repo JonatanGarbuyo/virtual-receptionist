@@ -313,7 +313,7 @@ class SessionOnSqliteTest(unittest.TestCase):
         from receptionist.core import ReceptionistCore
         from receptionist.persistence import RuntimeStorage
         from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
-        from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
+        from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 
         with tempfile.TemporaryDirectory() as tmp:
             runtime_conn = connect(os.path.join(tmp, "runtime.db"))
@@ -338,6 +338,7 @@ class SessionOnSqliteTest(unittest.TestCase):
                 ),
                 runtime=runtime,
                 retention=RetentionPolicy(),
+                call_ids=FakeCallIds(),
             )
             core.start()
             session = core.incoming_call("+34910000001", caller_name="García")
@@ -361,6 +362,92 @@ class SessionOnSqliteTest(unittest.TestCase):
             self.assertEqual(summary.message_id, records[0].id)
             self.assertEqual(summary.caller_name, "García")
             reopened.close()
+
+
+def build_core(runtime_conn, clock, voice, call_ids, destinations=None):
+    from receptionist.config import ConfigService, InMemoryConfigRepository
+    from receptionist.core import ReceptionistCore
+    from receptionist.persistence import RuntimeStorage
+    from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
+    from fakes import FakePolicy, FakeTelephony
+
+    return ReceptionistCore(
+        telephony=FakeTelephony(),
+        voice=voice,
+        config_service=ConfigService(
+            InMemoryConfigRepository({"greeting": "Hola", "language": "es"})
+        ),
+        policy=FakePolicy(),
+        clock=clock,
+        policy_engine=PolicyEngine(
+            destinations=dict(destinations or {}),
+            fallback_id="none",
+            limits=Limits(),
+        ),
+        runtime=RuntimeStorage(
+            calls=SQLiteCallRepository(runtime_conn),
+            messages=SQLiteMessageRepository(runtime_conn, clock=clock),
+            transcripts=SQLiteTranscriptStore(runtime_conn),
+            audit=SQLiteAuditLog(runtime_conn),
+        ),
+        retention=RetentionPolicy(),
+        call_ids=call_ids,
+    )
+
+
+class CallIdUniquenessTest(unittest.TestCase):
+    def test_deterministic_generator_for_tests(self) -> None:
+        from fakes import FakeCallIds
+
+        ids = FakeCallIds()
+        self.assertEqual(ids.next_id(), "call-1")
+        self.assertEqual(ids.next_id(), "call-2")
+
+    def test_call_ids_unique_across_restarts(self) -> None:
+        from receptionist.boundaries import (
+            MessageConfirmed,
+            MessageTextFinal,
+            StartMessageCapture,
+        )
+        from receptionist.ids import UuidCallIds
+        from fakes import FakeClock, FakeVoiceBackend
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "runtime.db")
+            clock = FakeClock()
+            first_ids: list[str] = []
+
+            for n in range(2):
+                conn = connect(path)
+                voice = FakeVoiceBackend()
+                core = build_core(conn, clock, voice, UuidCallIds())
+                core.start()
+                session = core.incoming_call(f"+3491000000{n}")
+                backend = voice.sessions[session.call_id]
+                backend.finish_playback(1)
+                backend.deliver_action_request(StartMessageCapture())
+                backend.deliver_action_request(MessageTextFinal(f"mensaje {n}"))
+                backend.deliver_action_request(MessageConfirmed())
+                session.end_call()
+                first_ids.append(session.call_id)
+                conn.close()
+
+            self.assertNotEqual(first_ids[0], first_ids[1])
+            check = connect(path)
+            calls = SQLiteCallRepository(check)
+            summaries = calls.list_all()
+            self.assertEqual(len(summaries), 2)
+            stored_ids = sorted(s.call_id for s in summaries)
+            self.assertEqual(stored_ids, sorted(first_ids))
+            messages = SQLiteMessageRepository(check, clock=clock)
+            records = messages.list_all()
+            self.assertEqual(len(records), 2)
+            for record in records:
+                self.assertIn(record.call_id, stored_ids)
+                linked = calls.get(record.call_id)
+                assert linked is not None
+                self.assertEqual(linked.message_id, record.id)
+            check.close()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ sys.path.insert(0, "tests")
 from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 from receptionist.config import ConfigService, InMemoryConfigRepository
 from receptionist.core import ReceptionistCore
+from receptionist.ids import UuidCallIds
 from receptionist.persistence import (
     InMemoryCallRepository,
     InMemoryMessageRepository,
@@ -54,6 +55,7 @@ def main() -> None:
             audit=InMemoryAuditLog(),
         ),
         retention=RetentionPolicy(),
+        call_ids=UuidCallIds(),
     )
     core.start()
     print(f"health: {core.health.status.value} ({core.health.detail})")

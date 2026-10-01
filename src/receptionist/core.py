@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from receptionist.boundaries import (
+    CallIdGenerator,
     Clock,
     Policy,
     TelephonyAdapter,
@@ -32,6 +33,7 @@ class ReceptionistCore:
         policy_engine: PolicyEngine,
         runtime: RuntimeStorage,
         retention: RetentionPolicy,
+        call_ids: CallIdGenerator,
     ) -> None:
         self._telephony = telephony
         self._voice = voice
@@ -41,10 +43,10 @@ class ReceptionistCore:
         self._policy_engine = policy_engine
         self._runtime = runtime
         self._retention = retention
-        self._last_prune: float | None = None
+        self._call_ids = call_ids
         self.health = ServiceHealth()
         self._sessions: dict[str, CallSession] = {}
-        self._next_call = 1
+        self._last_prune: float | None = None
         telephony.set_listener(self)
 
     def start(self) -> ServiceHealth:
@@ -66,8 +68,7 @@ class ReceptionistCore:
 
     def incoming_call(self, caller_id: str, caller_name: str | None = None) -> CallSession:
         """Synthetic inbound entry point: readiness, then policy, then answer."""
-        call_id = f"call-{self._next_call}"
-        self._next_call += 1
+        call_id = self._call_ids.next_id()
         greeting = self._config.get_greeting() or ""
         session = CallSession(
             call_id=call_id,

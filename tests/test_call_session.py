@@ -22,7 +22,7 @@ from receptionist.persistence import (
 )
 from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
 
-from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
+from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 
 
 GREETING = "Bienvenido, ¿en qué puedo ayudarle?"
@@ -54,6 +54,7 @@ def make_core(
             audit=InMemoryAuditLog(),
         ),
         retention=RetentionPolicy(),
+        call_ids=FakeCallIds(),
     )
     return core, telephony, voice, clock, calls
 

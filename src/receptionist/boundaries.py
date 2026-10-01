@@ -17,6 +17,16 @@ class Clock(Protocol):
     def now(self) -> float: ...
 
 
+class CallIdGenerator(Protocol):
+    """Issues call ids unique across process restarts.
+
+    Production uses random UUIDs; tests use a deterministic counter.
+    The core never invents ids itself and knows nothing about SQLite.
+    """
+
+    def next_id(self) -> str: ...
+
+
 class TransferResult(Enum):
     """Normalized handoff outcome. Only these four values may cross the seam."""
 
