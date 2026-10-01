@@ -55,7 +55,6 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PendingTransfer:
     destination_id: str
-    is_fallback: bool
 
 
 class CallSession:
@@ -168,11 +167,28 @@ class CallSession:
             >= self._policy_engine.limits.max_call_seconds
         )
 
+    def _terminate_if_over_limit(self) -> bool:
+        """End the call when the hard deadline passed. True when it did."""
+        if self._over_call_limit():
+            self.end_call()
+            return True
+        return False
+
+    def check_deadline(self) -> bool:
+        """Enforce the hard call deadline outside conversational events.
+
+        The runtime calls this periodically; under test the fake clock
+        advances and this method terminates deterministically, with no
+        wall-clock sleeps and no background timers in the core.
+        """
+        if self._state in (CallState.TERMINATING, CallState.ENDED):
+            return False
+        return self._terminate_if_over_limit()
+
     def on_transcript(self, text: str) -> None:
         if self._state is not CallState.ACTIVE:
             return
-        if self._over_call_limit():
-            self.end_call()
+        if self._terminate_if_over_limit():
             return
         if self._mode not in (ActiveMode.LISTENING, ActiveMode.INFERENCE):
             # Barge-in is deferred: speech over the greeting or while the
@@ -192,8 +208,7 @@ class CallSession:
             return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
-        if self._over_call_limit():
-            self.end_call()
+        if self._terminate_if_over_limit():
             return
         assert self._voice_session is not None  # opened in request_answer
         self._mode = ActiveMode.SPEAKING
@@ -204,13 +219,14 @@ class CallSession:
             return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
-        if self._over_call_limit():
-            self.end_call()
+        if self._terminate_if_over_limit():
             return
         if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
             self._mode = ActiveMode.LISTENING
 
     def on_action_request(self, action: object) -> None:
+        if self._terminate_if_over_limit():
+            return
         # Privileged actions arrive only as typed objects. Spoken text,
         # transcripts, and any other channel can never open this path.
         if not isinstance(action, TransferRequest):
@@ -232,7 +248,7 @@ class CallSession:
             return
         assert resolution.destination is not None
         self._attempts_used += 1
-        self._pending_transfer = PendingTransfer(action.destination_id, is_fallback=False)
+        self._pending_transfer = PendingTransfer(action.destination_id)
         self._audit_action(
             action.destination_id,
             AuditDecision.ALLOWED,
@@ -247,6 +263,15 @@ class CallSession:
             return
         pending = self._pending_transfer
         destination_id = pending.destination_id if pending is not None else ""
+        if not isinstance(result, TransferResult):
+            # Fail closed: anomaly, not a normal result. The raw value is
+            # never echoed into the audit record.
+            self._audit_action(
+                destination_id,
+                AuditDecision.DENIED,
+                detail=f"invalid transfer result: {type(result).__name__}",
+            )
+            return
         self._audit_action(destination_id, AuditDecision.COMPLETED, result=result)
         if result is TransferResult.ACCEPTED_BY_PBX:
             self._pending_transfer = None
@@ -256,12 +281,24 @@ class CallSession:
         self._pending_transfer = None
         if self._state is CallState.TRANSFER_HANDOFF:
             fallback = self._policy_engine.fallback()
-            if (
-                fallback is not None
-                and self._policy_engine.transfer_allowed(self._attempts_used)
-            ):
+            if fallback is None:
+                reason = self._policy_engine.resolve(
+                    self._policy_engine.fallback_id
+                ).status.value
+                self._audit_action(
+                    self._policy_engine.fallback_id,
+                    AuditDecision.DENIED,
+                    detail=f"fallback {reason}",
+                )
+            elif not self._policy_engine.transfer_allowed(self._attempts_used):
+                self._audit_action(
+                    fallback.id,
+                    AuditDecision.DENIED,
+                    detail="fallback skipped: transfer attempts exceeded",
+                )
+            else:
                 self._attempts_used += 1
-                self._pending_transfer = PendingTransfer(fallback.id, is_fallback=True)
+                self._pending_transfer = PendingTransfer(fallback.id)
                 self._audit_action(fallback.id, AuditDecision.REQUESTED, detail="fallback")
                 self._audit_action(
                     fallback.id, AuditDecision.ALLOWED, detail=f"target {fallback.target}"

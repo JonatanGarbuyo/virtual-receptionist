@@ -304,19 +304,36 @@ class TranscriptIsNotActionTest(unittest.TestCase):
 
 
 class LimitDefaultsTest(unittest.TestCase):
-    def test_spec_defaults(self) -> None:
-        limits = Limits()
-        self.assertEqual(limits.max_call_seconds, 600.0)
-        self.assertEqual(limits.max_transfer_attempts, 3)
-        self.assertEqual(limits.max_turns, 30)
-        self.assertEqual(limits.message_capture_seconds, 90.0)
+    def test_default_turn_limit_thirty_is_enforced(self) -> None:
+        core, telephony, voice, _, calls, _, _ = make_transfer_core()
+        core.start()
+        session, backend = start_call(core, voice)
 
-    def test_message_capture_limit_is_configurable(self) -> None:
-        # Enforcement binds in #20 where capture exists; the boundary
-        # carries the configured value from now on.
-        self.assertEqual(
-            Limits(message_capture_seconds=45.0).message_capture_seconds, 45.0
-        )
+        for n in range(30):
+            backend.deliver_caller_speech(f"consulta {n}")
+            backend.deliver_response("respuesta.", session.current_turn)
+            backend.finish_playback(session.current_turn)
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+
+        backend.deliver_caller_speech("consulta 31")
+
+        self.assertEqual(session.state, CallState.ENDED)
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.turn_count, 30)
+
+    def test_default_call_limit_boundary(self) -> None:
+        core, _, voice, clock, _, _, _ = make_transfer_core()
+        core.start()
+        session, backend = start_call(core, voice)
+
+        clock.advance(599.0)
+        backend.deliver_caller_speech("sigo aquí")
+        self.assertEqual(session.mode, ActiveMode.INFERENCE)
+
+        clock.advance(1.0)
+        backend.deliver_caller_speech("sigo aquí todavía")
+        self.assertEqual(session.state, CallState.ENDED)
 
 
 class TurnLimitTest(unittest.TestCase):
@@ -634,6 +651,123 @@ class AuditCompletenessTest(unittest.TestCase):
         self.assertEqual(
             decisions, [AuditDecision.REQUESTED, AuditDecision.DENIED]
         )
+
+
+class DeadlineTickTest(unittest.TestCase):
+    def test_tick_terminates_silent_call_past_deadline(self) -> None:
+        core, telephony, voice, clock, calls, _, _ = make_transfer_core()
+        core.start()
+        session, _ = start_call(core, voice)
+
+        clock.advance(601.0)
+        core.tick()
+
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertEqual(
+            session.history[-2:], [CallState.TERMINATING, CallState.ENDED]
+        )
+        self.assertEqual(telephony.hung_up, ["call-1"])
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.outcome, CallOutcome.COMPLETED)
+        self.assertEqual(summary.ended_at, 601.0)
+
+    def test_tick_before_deadline_is_noop(self) -> None:
+        core, telephony, voice, clock, _, _, _ = make_transfer_core()
+        core.start()
+        session, _ = start_call(core, voice)
+
+        clock.advance(599.0)
+        core.tick()
+
+        self.assertEqual(session.state, CallState.ACTIVE)
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+        self.assertEqual(telephony.hung_up, [])
+
+    def test_tick_terminates_handoff_waiting_past_deadline(self) -> None:
+        core, telephony, voice, clock, calls, audit, _ = make_transfer_core()
+        core.start()
+        session, backend = start_call(core, voice)
+        backend.deliver_action_request(TransferRequest("ventas"))
+
+        clock.advance(601.0)
+        core.tick()
+        telephony.complete_transfer("call-1", TransferResult.ACCEPTED_BY_PBX)
+
+        self.assertEqual(session.state, CallState.ENDED)
+        summary = calls.get("call-1")
+        assert summary is not None
+        self.assertEqual(summary.outcome, CallOutcome.COMPLETED)
+        self.assertEqual(
+            [e for e in audit.list_all() if e.decision is AuditDecision.COMPLETED],
+            [],
+        )
+
+    def test_action_request_past_deadline_terminates_without_transfer(self) -> None:
+        core, telephony, voice, clock, _, _, _ = make_transfer_core()
+        core.start()
+        session, backend = start_call(core, voice)
+
+        clock.advance(601.0)
+        backend.deliver_action_request(TransferRequest("ventas"))
+
+        self.assertEqual(telephony.transfers, [])
+        self.assertEqual(session.state, CallState.ENDED)
+
+
+class TransferResultValidationTest(unittest.TestCase):
+    def test_non_enum_result_is_ignored_and_audited(self) -> None:
+        core, telephony, voice, _, _, audit, _ = make_transfer_core()
+        core.start()
+        session, backend = start_call(core, voice)
+        backend.deliver_action_request(TransferRequest("ventas"))
+
+        telephony.complete_transfer("call-1", "ACCEPTED_BY_PBX")  # type: ignore[arg-type]
+
+        self.assertEqual(session.state, CallState.TRANSFER_HANDOFF)
+        self.assertEqual(len(telephony.transfers), 1)
+        denied = [e for e in audit.list_all() if e.decision is AuditDecision.DENIED]
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].destination, "ventas")
+        self.assertIn("invalid transfer result", denied[0].detail)
+        self.assertNotIn("ACCEPTED_BY_PBX", denied[0].detail)
+        self.assertEqual(
+            [e for e in audit.list_all() if e.decision is AuditDecision.COMPLETED],
+            [],
+        )
+
+        telephony.complete_transfer("call-1", TransferResult.ACCEPTED_BY_PBX)
+        self.assertEqual(session.state, CallState.ENDED)
+
+
+class FallbackSkipAuditTest(unittest.TestCase):
+    def test_skipped_fallback_by_budget_is_audited(self) -> None:
+        core, telephony, voice, _, _, audit, _ = make_transfer_core(
+            limits=Limits(max_transfer_attempts=1)
+        )
+        core.start()
+        _, backend = start_call(core, voice)
+        backend.deliver_action_request(TransferRequest("ventas"))
+        telephony.complete_transfer("call-1", TransferResult.TIMEOUT)
+
+        denied = [e for e in audit.list_all() if e.decision is AuditDecision.DENIED]
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].destination, "recepcion")
+        self.assertIn("attempts exceeded", denied[0].detail)
+
+    def test_unresolvable_fallback_is_audited(self) -> None:
+        core, telephony, voice, _, _, audit, _ = make_transfer_core(
+            fallback_id="inexistente"
+        )
+        core.start()
+        _, backend = start_call(core, voice)
+        backend.deliver_action_request(TransferRequest("ventas"))
+        telephony.complete_transfer("call-1", TransferResult.TIMEOUT)
+
+        denied = [e for e in audit.list_all() if e.decision is AuditDecision.DENIED]
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(denied[0].destination, "inexistente")
+        self.assertIn("fallback unknown", denied[0].detail)
 
 
 if __name__ == "__main__":

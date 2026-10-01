@@ -67,6 +67,10 @@ class PolicyEngine:
     def limits(self) -> Limits:
         return self._limits
 
+    @property
+    def fallback_id(self) -> str:
+        return self._fallback_id
+
     def resolve(self, destination_id: object) -> Resolution:
         """Classify one requested id fail-closed. Never raises on input."""
         if not isinstance(destination_id, str):

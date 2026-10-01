@@ -96,6 +96,17 @@ class ReceptionistCore:
     def get_session(self, call_id: str) -> CallSession | None:
         return self._sessions.get(call_id)
 
+    def tick(self) -> None:
+        """Enforce time-based deadlines across sessions, deterministically.
+
+        The production runtime calls this periodically; under test the fake
+        clock advances first. No background timers live in the core.
+        """
+        for call_id in list(self._sessions):
+            session = self._sessions.get(call_id)
+            if session is not None:
+                session.check_deadline()
+
     # -- TelephonyListener (called by the telephony adapter) -----------------
 
     def _dispatch(self, call_id: str, handler: Callable[..., None], *args: object) -> None:
