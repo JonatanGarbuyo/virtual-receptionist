@@ -82,10 +82,12 @@ class SQLiteCallRepository:
             raise _normalize(error) from error
 
     def save(self, summary: CallSummary) -> None:
+        # Plain INSERT: a call_id is immutable history identity. A collision
+        # raises (normalized to StoreUnavailableError), never replaces.
         try:
             with self._conn:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO calls(call_id, caller_id, caller_name, "
+                    "INSERT INTO calls(call_id, caller_id, caller_name, "
                     "started_at, ended_at, outcome, turn_count, "
                     "handoff_destination_id, message_id, failure_category) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

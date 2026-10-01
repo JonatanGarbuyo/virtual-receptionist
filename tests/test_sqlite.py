@@ -235,6 +235,39 @@ class RuntimeTablesTest(unittest.TestCase):
             self.assertEqual(repo.prune_before(1500.0), 1)
             self.assertEqual([s.call_id for s in repo.list_all()], ["call-2"])
 
+    def test_duplicate_call_id_fails_and_keeps_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SQLiteCallRepository(connect(os.path.join(tmp, "runtime.db")))
+            repo.save(
+                CallSummary(
+                    call_id="same-id",
+                    caller_id="+34910000001",
+                    started_at=1000.0,
+                    ended_at=1010.0,
+                    outcome=CallOutcome.COMPLETED,
+                    turn_count=1,
+                )
+            )
+            with self.assertRaises(StoreUnavailableError):
+                repo.save(
+                    CallSummary(
+                        call_id="same-id",
+                        caller_id="+34919999999",
+                        started_at=2000.0,
+                        ended_at=2010.0,
+                        outcome=CallOutcome.TRANSFERRED,
+                        turn_count=9,
+                    )
+                )
+
+            fetched = repo.get("same-id")
+            assert fetched is not None
+            self.assertEqual(fetched.caller_id, "+34910000001")
+            self.assertEqual(fetched.started_at, 1000.0)
+            self.assertEqual(fetched.outcome, CallOutcome.COMPLETED)
+            self.assertEqual(fetched.turn_count, 1)
+            self.assertEqual(len(repo.list_all()), 1)
+
     def test_transcripts_roundtrip_and_prune(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteTranscriptStore(connect(os.path.join(tmp, "runtime.db")))

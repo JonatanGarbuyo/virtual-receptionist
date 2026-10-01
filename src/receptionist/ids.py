@@ -14,4 +14,4 @@ class UuidCallIds:
     """Production generator: random, restart-safe ids."""
 
     def next_id(self) -> str:
-        return f"call-{uuid.uuid4().hex[:12]}"
+        return f"call-{uuid.uuid4().hex}"
