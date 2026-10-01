@@ -17,6 +17,16 @@ class Clock(Protocol):
     def now(self) -> float: ...
 
 
+class CallIdGenerator(Protocol):
+    """Issues call ids unique across process restarts.
+
+    Production uses random UUIDs; tests use a deterministic counter.
+    The core never invents ids itself and knows nothing about SQLite.
+    """
+
+    def next_id(self) -> str: ...
+
+
 class TransferResult(Enum):
     """Normalized handoff outcome. Only these four values may cross the seam."""
 
@@ -51,6 +61,28 @@ class TransferRequest:
     """
 
     destination_id: str
+
+
+@dataclass(frozen=True)
+class StartMessageCapture:
+    """Typed request to open message capture. Carries no content."""
+
+
+@dataclass(frozen=True)
+class MessageTextFinal:
+    """Final usable message text from the voice backend (STT final)."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class MessageConfirmed:
+    """The caller accepted the readback. Persist only after this."""
+
+
+@dataclass(frozen=True)
+class MessageRejected:
+    """The caller rejected the draft. Discard it."""
 
 
 class VoiceListener(Protocol):
@@ -92,6 +124,70 @@ class CallOutcome(Enum):
     TRANSFERRED = "transferred"
 
 
+class StoreUnavailableError(Exception):
+    """The runtime store cannot serve requests right now. Not retryable here."""
+
+
+class TransientStoreError(Exception):
+    """A possibly-transient store failure. Bounded retries may follow."""
+
+
+@dataclass(frozen=True)
+class MessageDraft:
+    """Unpersisted caller message. The id is assigned by the store on save."""
+
+    call_id: str
+    caller_id: str
+    caller_name: str | None
+    text: str
+
+
+@dataclass(frozen=True)
+class MessageRecord:
+    """Persisted confirmed message: text/structure only, never audio."""
+
+    id: str
+    call_id: str
+    caller_id: str
+    caller_name: str | None
+    text: str
+    created_at: float
+
+
+class MessageRepository(Protocol):
+    """Runtime persistence boundary for confirmed messages.
+
+    Atomicity contract: save() either commits the record and returns it,
+    or raises before committing anything. A TransientStoreError therefore
+    implies no record was stored, which is what makes the session's bounded
+    retry safe against duplicates. Stores must only raise
+    TransientStoreError (retryable) or StoreUnavailableError (fallback).
+    """
+
+    def save(self, draft: MessageDraft) -> MessageRecord: ...
+    def get(self, message_id: str) -> MessageRecord | None: ...
+    def list_all(self) -> list[MessageRecord]: ...
+    def prune_before(self, cutoff: float) -> int: ...
+
+
+@dataclass(frozen=True)
+class TranscriptEntry:
+    """One observational transcript line: text only, never authority."""
+
+    call_id: str
+    timestamp: float
+    speaker: str
+    text: str
+
+
+class TranscriptStore(Protocol):
+    """Append-only text transcript boundary. Disabled by default."""
+
+    def append(self, entry: TranscriptEntry) -> None: ...
+    def entries_for(self, call_id: str) -> list[TranscriptEntry]: ...
+    def prune_before(self, cutoff: float) -> int: ...
+
+
 class AuditDecision(Enum):
     REQUESTED = "requested"
     ALLOWED = "allowed"
@@ -117,6 +213,7 @@ class AuditLog(Protocol):
 
     def record(self, event: AuditEvent) -> None: ...
     def list_all(self) -> list[AuditEvent]: ...
+    def prune_before(self, cutoff: float) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -127,6 +224,10 @@ class CallSummary:
     ended_at: float
     outcome: CallOutcome
     turn_count: int
+    caller_name: str | None = None
+    handoff_destination_id: str | None = None
+    message_id: str | None = None
+    failure_category: str | None = None
 
 
 class CallRepository(Protocol):
@@ -135,3 +236,6 @@ class CallRepository(Protocol):
     def save(self, summary: CallSummary) -> None: ...
     def get(self, call_id: str) -> CallSummary | None: ...
     def list_all(self) -> list[CallSummary]: ...
+    def find_by_caller(self, caller_id: str) -> list[CallSummary]: ...
+    def find_in_range(self, start: float, end: float) -> list[CallSummary]: ...
+    def prune_before(self, cutoff: float) -> int: ...

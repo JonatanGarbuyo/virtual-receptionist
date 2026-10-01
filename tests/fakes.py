@@ -14,6 +14,7 @@ from receptionist.boundaries import (
     VoiceListener,
     VoiceSession,
 )
+from receptionist.persistence import InMemoryMessageRepository
 
 
 class FakeClock:
@@ -130,6 +131,18 @@ class FakeVoiceBackend:
         return session
 
 
+class FakeCallIds:
+    """Deterministic call id generator for tests: call-1, call-2, ..."""
+
+    def __init__(self) -> None:
+        self._next = 1
+
+    def next_id(self) -> str:
+        call_id = f"call-{self._next}"
+        self._next += 1
+        return call_id
+
+
 class FakePolicy:
     """Admission policy stand-in. Records every decision."""
 
@@ -140,3 +153,21 @@ class FakePolicy:
     def should_answer(self, caller_id: str) -> bool:
         self.decisions.append(caller_id)
         return self._allow
+
+
+class FailingMessageRepository(InMemoryMessageRepository):
+    """Message store with scriptable failures for persistence semantics tests."""
+
+    def __init__(self, clock) -> None:
+        super().__init__(clock=clock)
+        self.fail_script: list[Exception] = []
+        self.saves = 0
+        self.on_save = None
+
+    def save(self, draft):
+        self.saves += 1
+        if self.on_save is not None:
+            self.on_save()
+        if self.fail_script:
+            raise self.fail_script.pop(0)
+        return super().save(draft)

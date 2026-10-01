@@ -18,11 +18,16 @@ from receptionist.boundaries import (
 from receptionist.call_session import ActiveMode, CallState
 from receptionist.config import ConfigService, InMemoryConfigRepository
 from receptionist.core import ReceptionistCore
-from receptionist.health import HealthStatus
-from receptionist.persistence import InMemoryAuditLog, InMemoryCallRepository
-from receptionist.policy import Destination, Limits, PolicyEngine
+from receptionist.persistence import (
+    InMemoryAuditLog,
+    InMemoryCallRepository,
+    InMemoryMessageRepository,
+    InMemoryTranscriptStore,
+    RuntimeStorage,
+)
+from receptionist.policy import Destination, Limits, PolicyEngine, RetentionPolicy
 
-from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
+from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 
 
 GREETING = "Bienvenido, ¿en qué puedo ayudarle?"
@@ -65,10 +70,16 @@ def make_transfer_core(
         voice=voice,
         config_service=ConfigService(InMemoryConfigRepository(dict(values))),
         policy=FakePolicy(),
-        calls=calls,
         clock=clock,
         policy_engine=engine,
-        audit=audit,
+        runtime=RuntimeStorage(
+            calls=calls,
+            messages=InMemoryMessageRepository(clock=clock),
+            transcripts=InMemoryTranscriptStore(),
+            audit=audit,
+        ),
+        retention=RetentionPolicy(),
+        call_ids=FakeCallIds(),
     )
     return core, telephony, voice, clock, calls, audit, engine
 
