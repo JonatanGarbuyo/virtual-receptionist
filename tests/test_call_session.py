@@ -13,8 +13,8 @@ from receptionist.call_session import ActiveMode, CallSession, CallState
 from receptionist.config import ConfigService, InMemoryConfigRepository
 from receptionist.core import ReceptionistCore
 from receptionist.health import HealthStatus
-from receptionist.persistence import InMemoryAuditLog, InMemoryCallRepository
-from receptionist.policy import Limits, PolicyEngine
+from receptionist.persistence import InMemoryAuditLog, InMemoryCallRepository, RuntimeStorage
+from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
 
 from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 
@@ -38,11 +38,11 @@ def make_core(
         voice=voice,
         config_service=ConfigService(InMemoryConfigRepository(dict(values))),
         policy=policy or FakePolicy(),
-        calls=calls,
         clock=clock,
         # No transfers in this suite: empty engine, audit discarded.
         policy_engine=PolicyEngine(destinations={}, fallback_id="none", limits=Limits()),
-        audit=InMemoryAuditLog(),
+        runtime=RuntimeStorage(calls=calls, audit=InMemoryAuditLog()),
+        retention=RetentionPolicy(),
     )
     return core, telephony, voice, clock, calls
 

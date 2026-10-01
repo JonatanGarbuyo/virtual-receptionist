@@ -16,8 +16,8 @@ sys.path.insert(0, "tests")
 from fakes import FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
 from receptionist.config import ConfigService, InMemoryConfigRepository
 from receptionist.core import ReceptionistCore
-from receptionist.persistence import InMemoryAuditLog, InMemoryCallRepository
-from receptionist.policy import Limits, PolicyEngine
+from receptionist.persistence import InMemoryCallRepository, RuntimeStorage
+from receptionist.policy import Limits, PolicyEngine, RetentionPolicy
 
 
 def log(step: str, session) -> None:
@@ -39,10 +39,10 @@ def main() -> None:
             )
         ),
         policy=FakePolicy(),
-        calls=calls,
         clock=clock,
         policy_engine=PolicyEngine(destinations={}, fallback_id="none", limits=Limits()),
-        audit=InMemoryAuditLog(),
+        runtime=RuntimeStorage(calls=calls),
+        retention=RetentionPolicy(),
     )
     core.start()
     print(f"health: {core.health.status.value} ({core.health.detail})")

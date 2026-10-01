@@ -11,6 +11,7 @@ from receptionist.boundaries import ConfigRepository
 
 GREETING_KEY = "greeting"
 LANGUAGE_KEY = "language"
+TRANSCRIPTS_ENABLED_KEY = "transcripts_enabled"
 
 REQUIRED_KEYS = (GREETING_KEY, LANGUAGE_KEY)
 
@@ -36,6 +37,10 @@ class ConfigService:
 
     def get_language(self) -> str | None:
         return self._repository.get(LANGUAGE_KEY)
+
+    def transcripts_enabled(self) -> bool:
+        """Persistent full transcripts. Off unless explicitly enabled."""
+        return (self._repository.get(TRANSCRIPTS_ENABLED_KEY) or "").strip().lower() == "true"
 
     def missing_required(self) -> list[str]:
         """Required keys that are absent or blank."""

@@ -32,6 +32,17 @@ class Limits:
     max_transfer_attempts: int = 3
     max_turns: int = 30
     message_capture_seconds: float = 90.0
+    message_persist_max_retries: int = 1
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Bounded retention defaults from the spec; all configurable."""
+
+    messages_days: int = 365
+    history_days: int = 180
+    transcripts_days: int = 7
+    audit_days: int = 30
 
 
 class DestinationStatus(Enum):

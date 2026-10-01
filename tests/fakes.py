@@ -14,6 +14,7 @@ from receptionist.boundaries import (
     VoiceListener,
     VoiceSession,
 )
+from receptionist.persistence import InMemoryMessageRepository
 
 
 class FakeClock:
@@ -140,3 +141,21 @@ class FakePolicy:
     def should_answer(self, caller_id: str) -> bool:
         self.decisions.append(caller_id)
         return self._allow
+
+
+class FailingMessageRepository(InMemoryMessageRepository):
+    """Message store with scriptable failures for persistence semantics tests."""
+
+    def __init__(self, clock=None) -> None:
+        super().__init__(clock=clock)
+        self.fail_script: list[Exception] = []
+        self.saves = 0
+        self.on_save = None
+
+    def save(self, draft):
+        self.saves += 1
+        if self.on_save is not None:
+            self.on_save()
+        if self.fail_script:
+            raise self.fail_script.pop(0)
+        return super().save(draft)
