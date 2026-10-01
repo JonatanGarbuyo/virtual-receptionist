@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from receptionist.boundaries import (
     TelephonyListener,
+    TransferResult,
     VoiceListener,
     VoiceSession,
 )
@@ -42,6 +43,7 @@ class FakeTelephony:
         self.answered: list[str] = []
         self.rejected: list[str] = []
         self.hung_up: list[str] = []
+        self.transfers: list[tuple[str, str]] = []
 
     def set_listener(self, listener: TelephonyListener) -> None:
         self._listener = listener
@@ -72,6 +74,15 @@ class FakeTelephony:
         assert self._listener is not None
         self._listener.on_caller_hangup(call_id)
 
+    def blind_transfer(self, call_id: str, pbx_target: str) -> None:
+        """Record a transfer. The test completes it via :meth:`complete_transfer`."""
+        self.transfers.append((call_id, pbx_target))
+
+    def complete_transfer(self, call_id: str, result: TransferResult) -> None:
+        """Test driver: the PBX answers the transfer with a normalized result."""
+        assert self._listener is not None
+        self._listener.on_transfer_result(call_id, result)
+
 
 class FakeVoiceSession(VoiceSession):
     """Per-call voice stand-in. Records spoken audio, delivers scripted events."""
@@ -101,6 +112,10 @@ class FakeVoiceSession(VoiceSession):
     def finish_playback(self, turn_id: int) -> None:
         """Test driver: playout of a spoken turn completes."""
         self._listener.on_playback_finished(turn_id)
+
+    def deliver_action_request(self, action: object) -> None:
+        """Test driver: the backend emits a typed model action request."""
+        self._listener.on_action_request(action)
 
 
 class FakeVoiceBackend:
