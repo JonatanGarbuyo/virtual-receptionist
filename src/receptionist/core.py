@@ -7,6 +7,9 @@ from collections.abc import Callable
 from receptionist.boundaries import (
     CallIdGenerator,
     Clock,
+    KnowledgeQuery,
+    KnowledgeResult,
+    KnowledgeService,
     Policy,
     TelephonyAdapter,
     TransferResult,
@@ -34,6 +37,7 @@ class ReceptionistCore:
         runtime: RuntimeStorage,
         retention: RetentionPolicy,
         call_ids: CallIdGenerator,
+        knowledge: KnowledgeService | None = None,
     ) -> None:
         self._telephony = telephony
         self._voice = voice
@@ -44,6 +48,7 @@ class ReceptionistCore:
         self._runtime = runtime
         self._retention = retention
         self._call_ids = call_ids
+        self._knowledge = knowledge
         self.health = ServiceHealth()
         self._sessions: dict[str, CallSession] = {}
         self._last_prune: float | None = None
@@ -121,6 +126,20 @@ class ReceptionistCore:
     def prune_expired(self) -> dict[str, int]:
         """Run bounded-retention cleanup over runtime storage. Idempotent."""
         return self._runtime.prune_expired(self._retention, self._clock.now())
+
+    def query_knowledge(self, text: str) -> KnowledgeResult:
+        """Deterministic knowledge seam for the conversational path.
+
+        Returns informational chunks with provenance, an explicit NO_RESULT
+        when nothing relevant exists, or a normalized FAILURE when the
+        service is down. Without a configured service the answer is
+        NO_RESULT (no company knowledge), never a failure. Retrieved text
+        is never parsed into actions: transfers still require a typed
+        TransferRequest resolved by PolicyEngine.
+        """
+        if self._knowledge is None:
+            return KnowledgeResult.no_result()
+        return self._knowledge.query(KnowledgeQuery(text=text))
 
     # -- TelephonyListener (called by the telephony adapter) -----------------
 

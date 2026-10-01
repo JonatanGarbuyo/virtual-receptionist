@@ -26,6 +26,9 @@ from receptionist.boundaries import (
     CallOutcome,
     CallSummary,
     Clock,
+    FaqEntry,
+    KnowledgeChunk,
+    KnowledgeError,
     MessageDraft,
     MessageRecord,
     StoreUnavailableError,
@@ -388,3 +391,71 @@ def _decode_audit(row: tuple) -> AuditEvent:
         result=TransferResult(row[5]) if row[5] is not None else None,
         detail=row[6],
     )
+
+
+class SQLiteFaqSource:
+    """Structured FAQ knowledge in SQLite. Operator-written config data:
+    ``save`` is an explicit operator write (replace by id), while reads
+    serve enabled entries only as provenance-preserving chunks.
+
+    Lives in a knowledge/config-side database file chosen by the operator
+    (e.g. knowledge.db or config.db), never in runtime.db: caller history
+    and retention pruning must not touch knowledge. Chunks carry
+    question + answer so retrieval matches either; the question is also
+    the chunk title. Failures raise KnowledgeError, never raw sqlite3.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS faq("
+                    "id TEXT PRIMARY KEY, question TEXT NOT NULL, "
+                    "answer TEXT NOT NULL, keywords TEXT NOT NULL DEFAULT '', "
+                    "enabled INTEGER NOT NULL DEFAULT 1)"
+                )
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"faq store unavailable: {error}") from error
+
+    def save(self, entry: FaqEntry) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO faq(id, question, answer, keywords, "
+                    "enabled) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        entry.id,
+                        entry.question,
+                        entry.answer,
+                        entry.keywords,
+                        1 if entry.enabled else 0,
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"faq store unavailable: {error}") from error
+
+    def chunks(self) -> list[KnowledgeChunk]:
+        try:
+            rows = self._conn.execute(
+                "SELECT id, question, answer, keywords FROM faq WHERE enabled != 0"
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"faq store unavailable: {error}") from error
+        return [
+            KnowledgeChunk(
+                source_id="faq",
+                chunk_id=f"faq:{row[0]}",
+                text=f"{row[1]}\n{row[2]}\n{row[3]}",
+                title=row[1],
+                origin=f"faq:{row[0]}",
+            )
+            for row in rows
+        ]
+
+    @property
+    def source_id(self) -> str:
+        return "faq"
+
+    def close(self) -> None:
+        self._conn.close()
