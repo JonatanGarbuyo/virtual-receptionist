@@ -7,6 +7,7 @@ SQLite in a later ticket) stays behind the boundary.
 
 from __future__ import annotations
 
+from receptionist.alerting import AlertConfigRepository, AlertSettings
 from receptionist.boundaries import (
     ConfigRepository,
     KnowledgeSourceDeclaration,
@@ -35,16 +36,19 @@ class ConfigService:
 
     Knowledge source declarations ride along when a config-side
     :class:`KnowledgeSourceRepository` is provided (same config.db);
-    without one no knowledge source is declared.
+    without one no knowledge source is declared. Alert settings ride
+    along the same way through an alert repository.
     """
 
     def __init__(
         self,
         repository: ConfigRepository,
         knowledge_sources: KnowledgeSourceRepository | None = None,
+        alerts: AlertConfigRepository | None = None,
     ) -> None:
         self._repository = repository
         self._knowledge_sources = knowledge_sources
+        self._alerts = alerts
 
     def get_greeting(self) -> str | None:
         return self._repository.get(GREETING_KEY)
@@ -72,3 +76,10 @@ class ConfigService:
         if self._knowledge_sources is None:
             return []
         return self._knowledge_sources.list_all()
+
+    def alert_settings(self) -> AlertSettings:
+        """Operator alert settings from config.db. All channels disabled
+        when no alert repository is wired."""
+        if self._alerts is None:
+            return AlertSettings()
+        return self._alerts.load()

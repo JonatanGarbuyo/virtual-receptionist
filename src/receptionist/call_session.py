@@ -33,6 +33,13 @@ from receptionist.boundaries import (
     VoiceBackend,
     VoiceSession,
 )
+from receptionist.alerting import (
+    CODE_AUDIT_UNAVAILABLE,
+    CODE_HISTORY_UNAVAILABLE,
+    CODE_TRANSCRIPT_UNAVAILABLE,
+    HealthComponent,
+    HealthMonitor,
+)
 from receptionist.persistence import RuntimeStorage
 from receptionist.policy import DestinationStatus, PolicyEngine
 from receptionist.resilience import CircuitBreaker, ResilienceConfig, RetryPolicy
@@ -128,6 +135,7 @@ class CallSession:
         transcripts_enabled: bool = False,
         resilience: ResilienceConfig | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: HealthMonitor | None = None,
     ) -> None:
         self.call_id = call_id
         self.caller_id = caller_id
@@ -145,6 +153,7 @@ class CallSession:
         self._resilience = resilience if resilience is not None else ResilienceConfig()
         self._retry_policy = RetryPolicy(self._resilience.provider_retries)
         self._breaker = breaker
+        self._monitor = monitor
         self._voice_epoch = -1
         self._attempts_made = 0
         self._turn_started_at = clock.now()
@@ -213,6 +222,14 @@ class CallSession:
         self._state = state
         self._history.append(state)
 
+    def _report_unhealthy(self, component: HealthComponent, code: str, detail: str) -> None:
+        if self._monitor is not None:
+            self._monitor.report_unhealthy(component, code, detail)
+
+    def _report_recovered(self, component: HealthComponent, code: str) -> None:
+        if self._monitor is not None:
+            self._monitor.report_recovered(component, code)
+
     def _speak(self, text: str, turn_id: int) -> None:
         """Play assistant audio; record it as observational text when enabled.
 
@@ -236,6 +253,15 @@ class CallSession:
                 )
             except Exception:
                 self._transcript_failed = True
+                self._report_unhealthy(
+                    HealthComponent.TRANSCRIPT,
+                    CODE_TRANSCRIPT_UNAVAILABLE,
+                    "transcript sidecar write failed",
+                )
+            else:
+                self._report_recovered(
+                    HealthComponent.TRANSCRIPT, CODE_TRANSCRIPT_UNAVAILABLE
+                )
 
     def _open_voice_attempt(self) -> None:
         """Close the previous attempt (cancelling it) and open a fresh
@@ -397,6 +423,15 @@ class CallSession:
                 )
             except Exception:
                 self._transcript_failed = True
+                self._report_unhealthy(
+                    HealthComponent.TRANSCRIPT,
+                    CODE_TRANSCRIPT_UNAVAILABLE,
+                    "transcript sidecar write failed",
+                )
+            else:
+                self._report_recovered(
+                    HealthComponent.TRANSCRIPT, CODE_TRANSCRIPT_UNAVAILABLE
+                )
         if self._terminate_if_over_limit():
             return
         if self._mode is ActiveMode.MESSAGE_CAPTURE:
@@ -744,6 +779,13 @@ class CallSession:
             )
         except (StoreUnavailableError, TransientStoreError):
             self._audit_failed = True
+            self._report_unhealthy(
+                HealthComponent.RUNTIME,
+                CODE_AUDIT_UNAVAILABLE,
+                "audit write failed",
+            )
+        else:
+            self._report_recovered(HealthComponent.RUNTIME, CODE_AUDIT_UNAVAILABLE)
 
     # -- local actions -----------------------------------------------------
 
@@ -782,3 +824,12 @@ class CallSession:
             # History is observability: a store write failure is flagged
             # for degradation, never allowed to break call teardown.
             self._history_failed = True
+            self._report_unhealthy(
+                HealthComponent.RUNTIME,
+                CODE_HISTORY_UNAVAILABLE,
+                "call history write failed",
+            )
+        else:
+            self._report_recovered(
+                HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE
+            )
