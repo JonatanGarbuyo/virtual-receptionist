@@ -20,6 +20,13 @@ from __future__ import annotations
 
 import sqlite3
 
+from receptionist.alerting import (
+    AlertError,
+    AlertSettings,
+    EmailSettings,
+    TelegramSettings,
+    WebhookSettings,
+)
 from receptionist.boundaries import (
     AuditDecision,
     AuditEvent,
@@ -525,3 +532,170 @@ class SQLiteKnowledgeSourceRepository:
             raise KnowledgeError(f"knowledge source config unavailable: {error}") from error
         except ValueError as error:
             raise KnowledgeError(f"knowledge source config malformed: {error}") from error
+
+
+class SQLiteAlertRepository:
+    """Canonical alerting configuration in config.db, behind ConfigService.
+
+    One explicit table per concern (channels, global options); operator
+    writes replace by channel. The endpoint column holds the SMTP host or
+    the webhook URL depending on channel; secrets (SMTP password, webhook
+    token, Telegram bot token) rest in the protected local database and
+    are handed to transports only — they never enter events, logs, or
+    diagnostics. No environment variables, no second canonical source.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS alert_channels("
+                    "channel TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, "
+                    "endpoint TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, "
+                    "use_tls INTEGER NOT NULL DEFAULT 0, username TEXT NOT NULL DEFAULT '', "
+                    "secret TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', "
+                    "targets TEXT NOT NULL DEFAULT '', timeout_seconds REAL NOT NULL DEFAULT 10.0)"
+                )
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS alert_options("
+                    "id INTEGER PRIMARY KEY CHECK (id = 1), "
+                    "notify_recovery INTEGER NOT NULL DEFAULT 1)"
+                )
+        except sqlite3.Error as error:
+            raise AlertError(f"alert config unavailable: {error}") from error
+
+    def save_email(self, settings: EmailSettings) -> None:
+        self._save(
+            "email",
+            settings.enabled,
+            endpoint=settings.host,
+            port=settings.port,
+            use_tls=settings.use_tls,
+            username=settings.username,
+            secret=settings.password,
+            sender=settings.sender,
+            targets=",".join(settings.recipients),
+            timeout_seconds=settings.timeout_seconds,
+        )
+
+    def save_webhook(self, settings: WebhookSettings) -> None:
+        self._save(
+            "webhook",
+            settings.enabled,
+            endpoint=settings.url,
+            port=0,
+            use_tls=False,
+            username="",
+            secret=settings.auth_token,
+            sender=settings.auth_scheme,
+            targets="",
+            timeout_seconds=settings.timeout_seconds,
+        )
+
+    def save_telegram(self, settings: TelegramSettings) -> None:
+        self._save(
+            "telegram",
+            settings.enabled,
+            endpoint="",
+            port=0,
+            use_tls=False,
+            username="",
+            secret=settings.bot_token,
+            sender="",
+            targets=settings.chat_id,
+            timeout_seconds=settings.timeout_seconds,
+        )
+
+    def save_notify_recovery(self, notify: bool) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO alert_options(id, notify_recovery) "
+                    "VALUES (1, ?)",
+                    (1 if notify else 0,),
+                )
+        except sqlite3.Error as error:
+            raise AlertError(f"alert config unavailable: {error}") from error
+
+    def load(self) -> AlertSettings:
+        try:
+            rows = {
+                row[0]: row[1:]
+                for row in self._conn.execute(
+                    "SELECT channel, enabled, endpoint, port, use_tls, "
+                    "username, secret, sender, targets, timeout_seconds "
+                    "FROM alert_channels"
+                ).fetchall()
+            }
+            options = self._conn.execute(
+                "SELECT notify_recovery FROM alert_options WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise AlertError(f"alert config unavailable: {error}") from error
+        email = rows.get("email", (0, "", 587, 1, "", "", "", "", 10.0))
+        webhook = rows.get("webhook", (0, "", 0, 0, "", "", "", "", 10.0))
+        telegram = rows.get("telegram", (0, "", 0, 0, "", "", "", "", 10.0))
+        return AlertSettings(
+            email=EmailSettings(
+                enabled=email[0] != 0,
+                host=email[1],
+                port=email[2],
+                use_tls=email[3] != 0,
+                username=email[4],
+                password=email[5],
+                sender=email[6],
+                recipients=tuple(t for t in email[7].split(",") if t),
+                timeout_seconds=email[8],
+            ),
+            webhook=WebhookSettings(
+                enabled=webhook[0] != 0,
+                url=webhook[1],
+                auth_scheme=webhook[6] or "Bearer",
+                auth_token=webhook[5],
+                timeout_seconds=webhook[8],
+            ),
+            telegram=TelegramSettings(
+                enabled=telegram[0] != 0,
+                bot_token=telegram[5],
+                chat_id=telegram[7],
+                timeout_seconds=telegram[8],
+            ),
+            notify_recovery=options is None or options[0] != 0,
+        )
+
+    def _save(
+        self,
+        channel: str,
+        enabled: bool,
+        endpoint: str,
+        port: int,
+        use_tls: bool,
+        username: str,
+        secret: str,
+        sender: str,
+        targets: str,
+        timeout_seconds: float,
+    ) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO alert_channels(channel, enabled, "
+                    "endpoint, port, use_tls, username, secret, sender, "
+                    "targets, timeout_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        channel,
+                        1 if enabled else 0,
+                        endpoint,
+                        port,
+                        1 if use_tls else 0,
+                        username,
+                        secret,
+                        sender,
+                        targets,
+                        timeout_seconds,
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise AlertError(f"alert config unavailable: {error}") from error

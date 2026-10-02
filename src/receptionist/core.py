@@ -15,6 +15,14 @@ from receptionist.boundaries import (
     TransferResult,
     VoiceBackend,
 )
+from receptionist.alerting import (
+    CODE_CAPACITY_SATURATED,
+    CODE_CIRCUIT_OPEN,
+    CODE_CONFIG_INCOMPLETE,
+    CODE_CONFIG_UNAVAILABLE,
+    HealthComponent,
+    HealthMonitor,
+)
 from receptionist.call_session import CallSession, CallState
 from receptionist.config import ConfigService
 from receptionist.health import HealthStatus, ServiceHealth
@@ -54,6 +62,7 @@ class ReceptionistCore:
         call_ids: CallIdGenerator,
         knowledge: KnowledgeService | None = None,
         resilience: ResilienceConfig | None = None,
+        monitor: HealthMonitor | None = None,
     ) -> None:
         self._telephony = telephony
         self._voice = voice
@@ -73,6 +82,9 @@ class ReceptionistCore:
         )
         self.capacity = CapacityLimiter(max_sessions=self._resilience.max_ai_sessions)
         self.health = ServiceHealth()
+        # Structured alerting is always available: with no sinks the
+        # monitor keeps the local transition record only.
+        self.monitor = monitor if monitor is not None else HealthMonitor(clock=clock)
         self._sessions: dict[str, CallSession] = {}
         self._ai_permits: set[str] = set()
         self._last_prune: float | None = None
@@ -82,17 +94,35 @@ class ReceptionistCore:
         """Validate required configuration, then expose readiness.
 
         An unreadable config authority fails startup to NOT_READY; no
-        session is admitted until configuration trust returns.
+        session is admitted until configuration trust returns. Startup
+        transitions alert once per condition; a clean STARTING -> READY
+        emits no recovery (no prior outage existed).
         """
         try:
             missing = self._config.missing_required()
-        except Exception as error:
-            self.health.mark_not_ready(f"configuration authority unavailable: {error}")
+        except Exception:
+            self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
+            self.monitor.report_unhealthy(
+                HealthComponent.CONFIGURATION,
+                CODE_CONFIG_UNAVAILABLE,
+                "configuration authority unreadable",
+            )
             return self.health
         if missing:
             self.health.mark_not_ready(f"missing required configuration: {', '.join(missing)}")
+            self.monitor.report_unhealthy(
+                HealthComponent.CONFIGURATION,
+                CODE_CONFIG_INCOMPLETE,
+                "required configuration missing",
+            )
         else:
             self.health.mark_ready("configuration loaded")
+            self.monitor.report_recovered(
+                HealthComponent.CONFIGURATION, CODE_CONFIG_INCOMPLETE
+            )
+            self.monitor.report_recovered(
+                HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
+            )
         return self.health
 
     def report_degraded(self, detail: str) -> None:
@@ -124,11 +154,19 @@ class ReceptionistCore:
             transcripts_enabled = False
             config_trusted = False
             self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
+            self.monitor.report_unhealthy(
+                HealthComponent.CONFIGURATION,
+                CODE_CONFIG_UNAVAILABLE,
+                "configuration authority unreadable",
+            )
         if config_trusted and (
             self.health.status is HealthStatus.NOT_READY
             and self.health.detail == _CONFIG_DOWN_DETAIL
         ):
             self.health.mark_ready("configuration loaded")
+            self.monitor.report_recovered(
+                HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
+            )
         session = CallSession(
             call_id=call_id,
             caller_id=caller_id,
@@ -142,6 +180,7 @@ class ReceptionistCore:
             transcripts_enabled=transcripts_enabled,
             resilience=self._resilience,
             breaker=self.breaker,
+            monitor=self.monitor,
         )
         self._sessions[call_id] = session
         # No AI session may start while STARTING/NOT_READY. Refusing here
@@ -154,8 +193,16 @@ class ReceptionistCore:
                 session.begin_fallback_only("provider_unavailable")
             elif not self._acquire_ai_slot(call_id):
                 session.begin_fallback_only("capacity_saturated")
+                self.monitor.report_unhealthy(
+                    HealthComponent.CAPACITY,
+                    CODE_CAPACITY_SATURATED,
+                    "ai capacity saturated",
+                )
             else:
                 session.request_answer()
+                self.monitor.report_recovered(
+                    HealthComponent.CAPACITY, CODE_CAPACITY_SATURATED
+                )
         else:
             session.reject()
             del self._sessions[call_id]
@@ -186,6 +233,12 @@ class ReceptionistCore:
         still admits calls; they route to PBX fallback at admission."""
         if self.breaker.is_open and self.health.status is HealthStatus.READY:
             self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
+        if self.breaker.is_open:
+            self.monitor.report_unhealthy(
+                HealthComponent.PROVIDER,
+                CODE_CIRCUIT_OPEN,
+                "failure threshold reached",
+            )
 
     def report_provider_probe(self, success: bool) -> bool:
         """Project-owned recovery seam for a future backend health check.
@@ -197,6 +250,10 @@ class ReceptionistCore:
         """
         if not self.breaker.record_probe(success):
             return False
+        if success:
+            self.monitor.report_recovered(
+                HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN
+            )
         if (
             self.health.status is HealthStatus.DEGRADED
             and self.health.detail == _CIRCUIT_DEGRADED_DETAIL
