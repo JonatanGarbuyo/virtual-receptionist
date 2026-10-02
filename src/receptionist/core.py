@@ -31,6 +31,11 @@ from receptionist.resilience import (
 #: degradation is lifted by a successful recovery probe.
 _CIRCUIT_DEGRADED_DETAIL = "conversational provider circuit open"
 
+#: Health detail marking lost configuration authority. Set when admission
+#: detects an unreadable config authority mid-run (mirroring startup);
+#: lifted when a later admission reads configuration trustworthily again.
+_CONFIG_DOWN_DETAIL = "configuration authority unavailable"
+
 
 class ReceptionistCore:
     """Owns the call lifecycle across sessions; one instance per service."""
@@ -118,6 +123,12 @@ class ReceptionistCore:
             greeting = ""
             transcripts_enabled = False
             config_trusted = False
+            self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
+        if config_trusted and (
+            self.health.status is HealthStatus.NOT_READY
+            and self.health.detail == _CONFIG_DOWN_DETAIL
+        ):
+            self.health.mark_ready("configuration loaded")
         session = CallSession(
             call_id=call_id,
             caller_id=caller_id,
@@ -242,9 +253,12 @@ class ReceptionistCore:
     def _dispatch(self, call_id: str, handler: Callable[..., None], *args: object) -> None:
         """Route a telephony event; evict the session once it ends.
 
-        Eviction releases the AI capacity slot, records a clean call
-        (no terminal provider failure) against the breaker streak, and
-        surfaces observability degradation without touching routing.
+        Eviction releases the AI capacity slot, records positive
+        provider evidence (real provider output in the live generation)
+        against the breaker streak, and surfaces observability
+        degradation without touching routing. Neutral completions
+        (hangup, fallback-only, no provider output) record nothing, so
+        they never wipe failure evidence.
         """
         session = self._sessions.get(call_id)
         if session is None:
@@ -257,7 +271,7 @@ class ReceptionistCore:
             # nested event (e.g. auto-confirmed hangup) and evicted already.
             self._sessions.pop(call_id, None)
             self._release_ai_slot(call_id)
-            if not session.provider_terminal_failure:
+            if session.provider_success_evidence and not session.provider_terminal_failure:
                 self.breaker.record_success()
 
     def on_answered(self, call_id: str) -> None:

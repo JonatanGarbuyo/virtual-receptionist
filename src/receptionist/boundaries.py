@@ -127,6 +127,10 @@ class ProviderFailure:
     category: ProviderFailureCategory
     detail: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.category, ProviderFailureCategory):
+            raise ValueError(f"provider failure needs a category, got {self.category!r}")
+
 
 class VoiceSession(Protocol):
     """One backend voice stream for one call."""

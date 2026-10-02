@@ -94,8 +94,11 @@ class FakeVoiceSession(VoiceSession):
         self._listener = listener
         self.spoken: list[tuple[str, int]] = []
         self.closed = False
+        self.fail_speak: Exception | None = None
 
     def speak(self, text: str, turn_id: int) -> None:
+        if self.fail_speak is not None:
+            raise self.fail_speak
         self.spoken.append((text, turn_id))
 
     def close(self) -> None:

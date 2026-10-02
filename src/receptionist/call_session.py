@@ -151,6 +151,7 @@ class CallSession:
         self._last_input_at: float | None = None
         self._no_input_warned = False
         self._provider_terminal_failure = False
+        self._provider_evidence = False
         self._history_failed = False
         self._audit_failed = False
         self._transcript_failed = False
@@ -191,6 +192,18 @@ class CallSession:
         return self._provider_terminal_failure
 
     @property
+    def provider_success_evidence(self) -> bool:
+        """Whether the provider completed real work in the live generation
+        (response text or a typed action while ACTIVE). Only this resets
+        the breaker streak: mere call completion, hangup, or fallback-only
+        admission is neutral and preserves failure evidence."""
+        return self._provider_evidence
+
+    def _note_provider_evidence(self) -> None:
+        if self._state is CallState.ACTIVE:
+            self._provider_evidence = True
+
+    @property
     def observability_failed(self) -> bool:
         """Whether a history/audit/transcript write failed. Observability
         only: it never changes authorization or routing decisions."""
@@ -209,6 +222,9 @@ class CallSession:
         assert self._voice_session is not None  # opened in request_answer
         self._voice_session.speak(text, turn_id)
         if self._transcripts_enabled:
+            # The transcript boundary declares no error type, so any sidecar
+            # failure is contained here: audio already played, the call
+            # continues, degradation is flagged, nothing is swallowed blindly.
             try:
                 self._runtime.transcripts.append(
                     TranscriptEntry(
@@ -369,6 +385,7 @@ class CallSession:
         if self._state is not CallState.ACTIVE:
             return
         if self._transcripts_enabled:
+            # Same containment as assistant-side transcripts (see _speak).
             try:
                 self._runtime.transcripts.append(
                     TranscriptEntry(
@@ -407,6 +424,7 @@ class CallSession:
             return  # late event from an obsolete turn: ignore
         if self._terminate_if_over_limit():
             return
+        self._note_provider_evidence()
         self._mode = ActiveMode.SPEAKING
         self._speak(text, turn_id)
 
@@ -426,18 +444,23 @@ class CallSession:
         self._last_input_at = self._clock.now()
         self._no_input_warned = False
         if isinstance(action, TransferRequest):
+            self._note_provider_evidence()
             self._request_transfer(action.destination_id)
             return
         if isinstance(action, StartMessageCapture):
+            self._note_provider_evidence()
             self._start_capture()
             return
         if isinstance(action, MessageTextFinal):
+            self._note_provider_evidence()
             self._capture_text(action.text)
             return
         if isinstance(action, MessageConfirmed):
+            self._note_provider_evidence()
             self._confirm_capture()
             return
         if isinstance(action, MessageRejected):
+            self._note_provider_evidence()
             self._reject_capture()
             return
         # Privileged actions arrive only as typed objects. Spoken text,
@@ -445,21 +468,41 @@ class CallSession:
         self._audit_action("", AuditDecision.DENIED, detail=f"malformed action: {type(action).__name__}")
 
     def _on_provider_failure(self, turn_id: int, failure: ProviderFailure) -> None:
-        """Handle one normalized provider failure for the current attempt.
+        """Handle one provider failure for the current attempt, phase-aware.
 
-        Only an outstanding inference (INFERENCE mode, current turn) can
-        be retried or failed: anything else has no provider operation in
-        flight and the event is ignored. CANCELLED never retries and never
-        feeds the breaker. A retry opens a fresh attempt in the same
-        logical turn without resetting its deadline; exhaustion (budget,
-        call limit, or turn deadline) routes once to PBX fallback.
+        CANCELLED (app-owned) never retries and never feeds the breaker.
+        INFERENCE failures retry bounded under the turn deadline, else go
+        terminal. Failures in GREETING, SPEAKING, or LISTENING cannot be
+        safely retried mid-phase (no playback resume, no backend
+        switching), so a real one is terminal for the AI path toward PBX
+        fallback. In MESSAGE_CAPTURE a failure means no usable final text
+        can arrive: the draft is discarded with no save and no ACK, and
+        the call routes to fallback. Stale generations never reach here.
         """
-        if self._state is not CallState.ACTIVE or self._mode is not ActiveMode.INFERENCE:
+        if not isinstance(failure.category, ProviderFailureCategory):
+            return  # not a normalized failure: never reason about it
+        if self._state is not CallState.ACTIVE:
             return
         if turn_id != self._turn:
-            return
+            return  # late event from an obsolete turn: ignore
         if failure.category is ProviderFailureCategory.CANCELLED:
             return
+        if self._mode is ActiveMode.INFERENCE:
+            self._handle_inference_failure(failure)
+            return
+        if self._mode is ActiveMode.MESSAGE_CAPTURE:
+            self._message_draft = None
+            self._capture_started_at = None
+        if self._mode in (
+            ActiveMode.GREETING,
+            ActiveMode.SPEAKING,
+            ActiveMode.LISTENING,
+            ActiveMode.MESSAGE_CAPTURE,
+        ):
+            self._fail_provider_path("provider_failed")
+
+    def _handle_inference_failure(self, failure: ProviderFailure) -> None:
+        """Bounded retry of one outstanding inference, else terminal routing."""
         if (
             self._retry_policy.allows(failure.category, self._attempts_made)
             and not self._over_call_limit()
@@ -469,10 +512,15 @@ class CallSession:
             self._attempts_made += 1
             self._open_voice_attempt()
             return
+        self._fail_provider_path("provider_failed")
+
+    def _fail_provider_path(self, failure_category: str) -> None:
+        """Record one terminal conversational failure and leave the AI
+        path exactly once, toward PBX fallback or a safe exit."""
         self._provider_terminal_failure = True
         if self._breaker is not None:
             self._breaker.record_failure()
-        self._failure_category = "provider_failed"
+        self._failure_category = failure_category
         if not self._attempt_fallback("provider failed"):
             self._exit_after_failed_handoff()
 
@@ -653,9 +701,18 @@ class CallSession:
         return True
 
     def _exit_after_failed_handoff(self) -> None:
-        """Single deterministic exit: one brief apology, then terminate."""
+        """Single deterministic exit: one brief apology, then terminate.
+
+        The apology is best-effort: when the voice path just failed
+        terminally, speech may be unavailable, but termination never
+        depends on the broken component. TERMINATING -> ENDED happens
+        exactly once either way.
+        """
         if self._voice_session is not None:
-            self._speak(EXIT_APOLOGY, self._turn)
+            try:
+                self._speak(EXIT_APOLOGY, self._turn)
+            except Exception:
+                pass  # apology unavailable; terminate anyway, unconditionally
         self._pending_outcome = CallOutcome.COMPLETED
         self._transition(CallState.TERMINATING)
         self._telephony.hangup(self.call_id)
@@ -670,8 +727,8 @@ class CallSession:
         result: TransferResult | None = None,
         detail: str = "",
     ) -> None:
-        """Record a privileged-action audit event. An audit write failure
-        is contained and flagged: the audit trail is observability, never
+        """Record a privileged-action audit event. A store failure is
+        contained and flagged: the audit trail is observability, never
         authority, so it cannot change the policy decision just made."""
         try:
             self._runtime.audit.record(
@@ -685,7 +742,7 @@ class CallSession:
                     detail=detail,
                 )
             )
-        except Exception:
+        except (StoreUnavailableError, TransientStoreError):
             self._audit_failed = True
 
     # -- local actions -----------------------------------------------------
@@ -721,7 +778,7 @@ class CallSession:
                     failure_category=self._failure_category,
                 )
             )
-        except Exception:
-            # History is observability: a write failure is flagged for
-            # degradation, never allowed to break call teardown.
+        except (StoreUnavailableError, TransientStoreError):
+            # History is observability: a store write failure is flagged
+            # for degradation, never allowed to break call teardown.
             self._history_failed = True

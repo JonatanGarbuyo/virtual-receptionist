@@ -67,6 +67,7 @@ def make_core(
     audit=None,
     transcripts=None,
     auto_confirm: bool = True,
+    knowledge=None,
 ):
     telephony = FakeTelephony(auto_confirm=auto_confirm)
     voice = FakeVoiceBackend()
@@ -93,6 +94,7 @@ def make_core(
         retention=RetentionPolicy(),
         call_ids=FakeCallIds(),
         resilience=resilience,
+        knowledge=knowledge,
     )
     core.start()
     return core, telephony, voice, clock, engine
@@ -291,21 +293,80 @@ class CircuitAdmissionTest(unittest.TestCase):
         session = core.incoming_call("+34910000005")
         self.assertNotIn(session.call_id, voice.sessions)
 
-    def test_clean_call_resets_failure_streak(self) -> None:
+    def test_hangup_without_provider_output_keeps_streak(self) -> None:
         core, telephony, voice, _, _ = make_core(
             resilience=ResilienceConfig(provider_retries=0, breaker_threshold=2)
         )
-        failing = core.incoming_call("+34910000001")
-        turn = open_turn(failing, voice.sessions[failing.call_id])
-        fail(voice.sessions[failing.call_id], turn, ProviderFailureCategory.TIMEOUT)
-        telephony.complete_transfer(failing.call_id, TransferResult.ACCEPTED_BY_PBX)
-        clean = core.incoming_call("+34910000002")
-        telephony.simulate_caller_hangup(clean.call_id)
-        failing2 = core.incoming_call("+34910000003")
-        turn2 = open_turn(failing2, voice.sessions[failing2.call_id])
-        fail(voice.sessions[failing2.call_id], turn2, ProviderFailureCategory.TIMEOUT)
-        telephony.complete_transfer(failing2.call_id, TransferResult.ACCEPTED_BY_PBX)
+        failed_a = core.incoming_call("+34910000001")
+        turn = open_turn(failed_a, voice.sessions[failed_a.call_id])
+        fail(voice.sessions[failed_a.call_id], turn, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_a.call_id, TransferResult.ACCEPTED_BY_PBX)
+        # B hangs up before any provider output: neutral, not success.
+        neutral = core.incoming_call("+34910000002")
+        telephony.simulate_caller_hangup(neutral.call_id)
+        failed_c = core.incoming_call("+34910000003")
+        turn_c = open_turn(failed_c, voice.sessions[failed_c.call_id])
+        fail(voice.sessions[failed_c.call_id], turn_c, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_c.call_id, TransferResult.ACCEPTED_BY_PBX)
+        self.assertTrue(core.breaker.is_open)
+
+    def test_fallback_only_completion_keeps_streak(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0, breaker_threshold=2)
+        )
+        failed_a = core.incoming_call("+34910000001")
+        turn = open_turn(failed_a, voice.sessions[failed_a.call_id])
+        fail(voice.sessions[failed_a.call_id], turn, ProviderFailureCategory.TIMEOUT)
+        # A waits on its fallback transfer, still holding the AI slot.
+        saturated = core.incoming_call("+34910000002")
+        self.assertNotIn(saturated.call_id, voice.sessions)
+        # B never opens the provider at all: neutral, not success.
+        telephony.complete_transfer(saturated.call_id, TransferResult.ACCEPTED_BY_PBX)
+        telephony.complete_transfer(failed_a.call_id, TransferResult.ACCEPTED_BY_PBX)
+        failed_c = core.incoming_call("+34910000003")
+        turn_c = open_turn(failed_c, voice.sessions[failed_c.call_id])
+        fail(voice.sessions[failed_c.call_id], turn_c, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_c.call_id, TransferResult.ACCEPTED_BY_PBX)
+        self.assertTrue(core.breaker.is_open)
+
+    def test_provider_output_then_clean_end_resets_streak(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0, breaker_threshold=2)
+        )
+        failed_a = core.incoming_call("+34910000001")
+        turn = open_turn(failed_a, voice.sessions[failed_a.call_id])
+        fail(voice.sessions[failed_a.call_id], turn, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_a.call_id, TransferResult.ACCEPTED_BY_PBX)
+        # B produces real provider output and ends cleanly: success evidence.
+        healthy = core.incoming_call("+34910000002")
+        healthy_voice = voice.sessions[healthy.call_id]
+        turn_b = open_turn(healthy, healthy_voice)
+        healthy_voice.deliver_response("información útil", turn_b)
+        telephony.simulate_caller_hangup(healthy.call_id)
+        failed_c = core.incoming_call("+34910000003")
+        turn_c = open_turn(failed_c, voice.sessions[failed_c.call_id])
+        fail(voice.sessions[failed_c.call_id], turn_c, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_c.call_id, TransferResult.ACCEPTED_BY_PBX)
         self.assertFalse(core.breaker.is_open)
+
+    def test_concurrent_neutral_end_keeps_streak(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(
+                provider_retries=0, breaker_threshold=2, max_ai_sessions=2
+            )
+        )
+        concurrent = core.incoming_call("+34910000009")
+        failed_a = core.incoming_call("+34910000001")
+        turn = open_turn(failed_a, voice.sessions[failed_a.call_id])
+        fail(voice.sessions[failed_a.call_id], turn, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_a.call_id, TransferResult.ACCEPTED_BY_PBX)
+        # The concurrent call ends with no provider output: neutral.
+        telephony.simulate_caller_hangup(concurrent.call_id)
+        failed_c = core.incoming_call("+34910000003")
+        turn_c = open_turn(failed_c, voice.sessions[failed_c.call_id])
+        fail(voice.sessions[failed_c.call_id], turn_c, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(failed_c.call_id, TransferResult.ACCEPTED_BY_PBX)
+        self.assertTrue(core.breaker.is_open)
 
     def test_non_provider_trouble_never_feeds_the_breaker(self) -> None:
         core, telephony, voice, _, _ = make_core(
@@ -455,6 +516,14 @@ class ConfigTrustTest(unittest.TestCase):
         queued = core.incoming_call("+34910000002")
         self.assertNotIn(queued.call_id, voice.sessions)
         self.assertEqual(telephony.rejected, [queued.call_id])
+        # Health mirrors the outage instead of silently staying READY.
+        self.assertEqual(core.health.status, HealthStatus.NOT_READY)
+        # Trust restored on a later admission lifts exactly this outage.
+        telephony.simulate_caller_hangup(live.call_id)
+        repository.broken = False
+        revived = core.incoming_call("+34910000003")
+        self.assertIn(revived.call_id, voice.sessions)
+        self.assertEqual(core.health.status, HealthStatus.READY)
 
 
 class ObservabilityDegradationTest(unittest.TestCase):
@@ -475,7 +544,7 @@ class ObservabilityDegradationTest(unittest.TestCase):
 
     def test_audit_write_failure_changes_no_policy_decision(self) -> None:
         failing_audit = FailingAuditLog()
-        failing_audit.fail_record = RuntimeError("audit disk full")
+        failing_audit.fail_record = StoreUnavailableError("audit disk full")
         core, telephony, voice, _, _ = make_core(audit=failing_audit)
         session = core.incoming_call("+34910000001")
         session_voice = voice.sessions[session.call_id]
@@ -524,8 +593,7 @@ class KnowledgeAndMessageIsolationTest(unittest.TestCase):
                 ],
                 retriever=KeywordRetriever(),
             )
-            core, telephony, voice, _, _ = make_core()
-            core._knowledge = knowledge
+            core, telephony, voice, _, _ = make_core(knowledge=knowledge)
             result = core.query_knowledge("¿Cuál es el horario?")
             from receptionist.boundaries import KnowledgeStatus
 
@@ -537,8 +605,8 @@ class KnowledgeAndMessageIsolationTest(unittest.TestCase):
             session_voice.deliver_action_request(TransferRequest(destination_id="ventas"))
             self.assertEqual(telephony.transfers, [(session.call_id, "SIP/201")])
 
-    def test_provider_failure_during_capture_is_ignored(self) -> None:
-        core, _, voice, _, _ = make_core()
+    def test_provider_failure_during_capture_aborts_without_save_or_ack(self) -> None:
+        core, telephony, voice, _, _ = make_core()
         session = core.incoming_call("+34910000001")
         session_voice = voice.sessions[session.call_id]
         session_voice.finish_playback(session.current_turn)
@@ -547,14 +615,13 @@ class KnowledgeAndMessageIsolationTest(unittest.TestCase):
         session_voice.deliver_failure(
             session.current_turn, ProviderFailure(ProviderFailureCategory.TIMEOUT)
         )
-        # No inference is outstanding: capture continues to a real ACK.
-        session_voice.deliver_action_request(MessageTextFinal(text="Llámeme mañana."))
-        session_voice.deliver_action_request(MessageConfirmed())
+        # No usable final text can arrive: no save, no ACK, PBX fallback.
         from receptionist.call_session import MESSAGE_SAVED_ACK
 
         spoken = [text for text, _ in session_voice.spoken]
-        self.assertIn(MESSAGE_SAVED_ACK, spoken)
-        self.assertFalse(core.breaker.is_open)
+        self.assertNotIn(MESSAGE_SAVED_ACK, spoken)
+        self.assertEqual(telephony.transfers, [(session.call_id, "SIP/100")])
+        self.assertTrue(session.provider_terminal_failure)
 
     def test_policy_engine_alone_maps_destinations_during_recovery(self) -> None:
         # Invariant G: even mid-retry, a typed request resolves through
@@ -567,6 +634,122 @@ class KnowledgeAndMessageIsolationTest(unittest.TestCase):
         second = voice.sessions[session.call_id]
         second.deliver_action_request(TransferRequest(destination_id="ventas"))
         self.assertEqual(telephony.transfers, [(session.call_id, "SIP/201")])
+
+
+class PhaseAwareFailureTest(unittest.TestCase):
+    """Provider failures outside INFERENCE are terminal for the AI path,
+    never dead air: GREETING/SPEAKING/LISTENING fall back, CAPTURE aborts
+    without save or ACK. CANCELLED stays neutral; stale stays inert."""
+
+    def test_failure_during_greeting_falls_back(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0)
+        )
+        session = core.incoming_call("+34910000001")
+        self.assertEqual(session.mode, ActiveMode.GREETING)
+        voice.sessions[session.call_id].deliver_failure(
+            session.current_turn, ProviderFailure(ProviderFailureCategory.UNAVAILABLE)
+        )
+        self.assertEqual(telephony.transfers, [(session.call_id, "SIP/100")])
+        self.assertTrue(session.provider_terminal_failure)
+
+    def test_failure_during_speaking_falls_back(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0)
+        )
+        session = core.incoming_call("+34910000001")
+        session_voice = voice.sessions[session.call_id]
+        turn = open_turn(session, session_voice)
+        session_voice.deliver_response("respuesta", turn)
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        session_voice.deliver_failure(
+            turn, ProviderFailure(ProviderFailureCategory.TIMEOUT)
+        )
+        self.assertEqual(telephony.transfers, [(session.call_id, "SIP/100")])
+        self.assertTrue(session.provider_terminal_failure)
+
+    def test_failure_during_listening_falls_back(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0)
+        )
+        session = core.incoming_call("+34910000001")
+        session_voice = voice.sessions[session.call_id]
+        turn = open_turn(session, session_voice)
+        session_voice.deliver_response("respuesta", turn)
+        session_voice.finish_playback(turn)
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+        session_voice.deliver_failure(
+            turn, ProviderFailure(ProviderFailureCategory.INTERNAL)
+        )
+        self.assertEqual(telephony.transfers, [(session.call_id, "SIP/100")])
+
+    def test_cancelled_outside_inference_stays_neutral(self) -> None:
+        core, telephony, voice, _, _ = make_core()
+        session = core.incoming_call("+34910000001")
+        session_voice = voice.sessions[session.call_id]
+        turn = open_turn(session, session_voice)
+        session_voice.deliver_response("respuesta", turn)
+        session_voice.deliver_failure(
+            turn, ProviderFailure(ProviderFailureCategory.CANCELLED)
+        )
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        self.assertEqual(session.state, CallState.ACTIVE)
+        self.assertEqual(telephony.transfers, [])
+        self.assertFalse(core.breaker.is_open)
+
+    def test_stale_failure_outside_inference_stays_inert(self) -> None:
+        core, telephony, voice, _, _ = make_core()
+        session = core.incoming_call("+34910000001")
+        old = voice.sessions[session.call_id]
+        turn = open_turn(session, old)
+        fail(old, turn, ProviderFailureCategory.TIMEOUT)
+        new = voice.sessions[session.call_id]
+        new.deliver_response("respuesta", turn)
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        old.deliver_failure(turn, ProviderFailure(ProviderFailureCategory.TIMEOUT))
+        self.assertEqual(telephony.transfers, [])
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+
+
+class BrokenVoiceTerminationTest(unittest.TestCase):
+    def test_failed_apology_still_terminates_exactly_once(self) -> None:
+        core, telephony, voice, _, _ = make_core(
+            resilience=ResilienceConfig(provider_retries=0)
+        )
+        session = core.incoming_call("+34910000001")
+        session_voice = voice.sessions[session.call_id]
+        turn = open_turn(session, session_voice)
+        session_voice.fail_speak = RuntimeError("tts backend dead")
+        fail(session_voice, turn, ProviderFailureCategory.TIMEOUT)
+        telephony.complete_transfer(session.call_id, TransferResult.REJECTED)
+        telephony.complete_transfer(session.call_id, TransferResult.TIMEOUT)
+        # Termination never depends on the broken voice path.
+        self.assertEqual(telephony.hung_up, [session.call_id])
+        self.assertEqual(session.state, CallState.ENDED)
+
+
+class ProviderFailureContractTest(unittest.TestCase):
+    def test_raw_category_rejected_at_construction(self) -> None:
+        with self.assertRaises(ValueError):
+            ProviderFailure(category="timeout")  # type: ignore[arg-type]
+
+    def test_unnormalized_failure_never_reaches_retry_or_breaker(self) -> None:
+        core, telephony, voice, _, _ = make_core()
+        session = core.incoming_call("+34910000001")
+        session_voice = voice.sessions[session.call_id]
+        turn = open_turn(session, session_voice)
+        session_voice.deliver_failure(turn, _Unnormalized(category="timeout"))
+        self.assertEqual(len(voice.all_sessions), 1)
+        self.assertEqual(telephony.transfers, [])
+        self.assertFalse(session.provider_terminal_failure)
+        self.assertFalse(core.breaker.is_open)
+
+
+class _Unnormalized:
+    """Backend-shaped garbage: not a ProviderFailure at all."""
+
+    def __init__(self, category: str) -> None:
+        self.category = category
 
 
 class TimingInteractionTest(unittest.TestCase):

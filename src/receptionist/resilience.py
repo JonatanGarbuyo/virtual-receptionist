@@ -163,13 +163,16 @@ class CircuitBreaker:
     def record_probe(self, success: bool) -> bool:
         """Honor one health-probe outcome. Returns False when no probe
         was due (closed circuit or cooldown). A successful due probe
-        closes the circuit; a failed one keeps it OPEN."""
+        closes the circuit; a failed one keeps it OPEN and rearms the
+        cooldown, so recovery needs a success spaced after failures."""
         if not self.probe_allowed():
             return False
         if success:
             self._state = CircuitState.CLOSED
             self._consecutive_failures = 0
             self._opened_at = None
+        else:
+            self._opened_at = self._now()
         return True
 
 

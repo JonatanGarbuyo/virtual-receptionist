@@ -109,15 +109,20 @@ class CircuitBreakerTest(unittest.TestCase):
         self.assertTrue(breaker.record_probe(True))
         self.assertFalse(breaker.is_open)
 
-    def test_failed_probe_keeps_open(self) -> None:
+    def test_failed_probe_rearms_cooldown(self) -> None:
         clock = FakeClock()
         breaker = CircuitBreaker(
-            failure_threshold=1, probe_cooldown_seconds=10.0, clock=clock
+            failure_threshold=1, probe_cooldown_seconds=60.0, clock=clock
         )
         breaker.record_failure()
-        clock.advance(10.0)
+        clock.advance(60.0)
         self.assertTrue(breaker.record_probe(False))
         self.assertTrue(breaker.is_open)
+        # Cooldown rearmed: an immediate second probe is not due.
+        self.assertFalse(breaker.record_probe(True))
+        clock.advance(60.0)
+        self.assertTrue(breaker.record_probe(True))
+        self.assertFalse(breaker.is_open)
 
     def test_probe_when_closed_is_rejected(self) -> None:
         breaker = CircuitBreaker(failure_threshold=2, clock=FakeClock())
@@ -164,8 +169,8 @@ class ResilienceConfigTest(unittest.TestCase):
         self.assertEqual(config.provider_retries, 1)
         self.assertEqual(config.breaker_threshold, 3)
         self.assertEqual(config.max_ai_sessions, 1)
-        self.assertGreater(config.turn_deadline_seconds, 0)
-        self.assertGreater(config.no_input_seconds, 0)
+        self.assertEqual(config.turn_deadline_seconds, 60.0)
+        self.assertEqual(config.no_input_seconds, 30.0)
 
     def test_invalid_values_rejected(self) -> None:
         with self.assertRaises(ValueError):
