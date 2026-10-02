@@ -227,7 +227,12 @@ def assemble_knowledge_sources(
                 )
             )
         elif declaration.kind is KnowledgeSourceKind.FAQ:
-            sources.append(SQLiteFaqSource(sqlite3.connect(declaration.locator)))
+            sources.append(
+                SQLiteFaqSource(
+                    sqlite3.connect(declaration.locator),
+                    source_id=declaration.source_id,
+                )
+            )
         else:
             raise KnowledgeError(
                 f"unknown knowledge source kind: {declaration.kind!r}"

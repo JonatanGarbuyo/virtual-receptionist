@@ -741,5 +741,103 @@ class RetrieverReplaceabilityTest(unittest.TestCase):
             tmp.cleanup()
 
 
+class DeclaredFaqIdentityTest(unittest.TestCase):
+    """A declared FAQ source_id survives assembly into chunk provenance,
+    so several SQLite FAQ sources coexist with distinct identities."""
+
+    VENTAS = FaqEntry(
+        id="horario",
+        question="¿Cuál es el horario de ventas?",
+        answer="Ventas atiende de 9 a 18.",
+        keywords="horario ventas",
+    )
+    SOPORTE = FaqEntry(
+        id="garantia",
+        question="¿Qué cubre la garantía de soporte?",
+        answer="Soporte cubre dos años de garantía.",
+        keywords="garantía soporte",
+    )
+
+    def seed(self, path: str, entry: FaqEntry) -> None:
+        source = SQLiteFaqSource(sqlite3.connect(path))
+        source.save(entry)
+        source.close()
+
+    def test_declared_faq_id_reaches_chunk_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            faq_path = os.path.join(tmp, "ventas.db")
+            self.seed(faq_path, self.VENTAS)
+            (source,) = assemble_knowledge_sources(
+                [
+                    KnowledgeSourceDeclaration(
+                        source_id="faq-ventas",
+                        kind=KnowledgeSourceKind.FAQ,
+                        locator=faq_path,
+                    )
+                ]
+            )
+            self.assertEqual(source.source_id, "faq-ventas")
+            result = make_service(source).query(KnowledgeQuery(text="horario ventas"))
+            self.assertEqual(result.status, KnowledgeStatus.FOUND)
+            chunk = result.chunks[0]
+            self.assertEqual(chunk.source_id, "faq-ventas")
+            self.assertIn("faq-ventas", chunk.chunk_id)
+            self.assertIn("faq-ventas", chunk.origin)
+
+    def test_two_faq_sources_coexist_with_distinct_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ventas_path = os.path.join(tmp, "ventas.db")
+            soporte_path = os.path.join(tmp, "soporte.db")
+            self.seed(ventas_path, self.VENTAS)
+            self.seed(soporte_path, self.SOPORTE)
+            service = make_service(
+                *assemble_knowledge_sources(
+                    [
+                        KnowledgeSourceDeclaration(
+                            source_id="faq-ventas",
+                            kind=KnowledgeSourceKind.FAQ,
+                            locator=ventas_path,
+                        ),
+                        KnowledgeSourceDeclaration(
+                            source_id="faq-soporte",
+                            kind=KnowledgeSourceKind.FAQ,
+                            locator=soporte_path,
+                        ),
+                    ]
+                )
+            )
+            # A query matching only the second FAQ returns its chunk.
+            result = service.query(KnowledgeQuery(text="garantía soporte cubre"))
+            self.assertEqual(result.status, KnowledgeStatus.FOUND)
+            self.assertEqual(result.chunks[0].source_id, "faq-soporte")
+            self.assertIn("dos años", result.chunks[0].text)
+            # And the first source still answers its own questions.
+            other = service.query(KnowledgeQuery(text="horario ventas atiende"))
+            self.assertEqual(other.status, KnowledgeStatus.FOUND)
+            self.assertEqual(other.chunks[0].source_id, "faq-ventas")
+
+    def test_truly_duplicate_faq_declarations_still_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            faq_path = os.path.join(tmp, "ventas.db")
+            self.seed(faq_path, self.VENTAS)
+            with self.assertRaises(KnowledgeError):
+                make_service(
+                    *assemble_knowledge_sources(
+                        [
+                            KnowledgeSourceDeclaration(
+                                source_id="faq-ventas",
+                                kind=KnowledgeSourceKind.FAQ,
+                                locator=faq_path,
+                            ),
+                            KnowledgeSourceDeclaration(
+                                source_id="faq-ventas",
+                                kind=KnowledgeSourceKind.FAQ,
+                                locator=faq_path,
+                            ),
+                        ]
+                    )
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

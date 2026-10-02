@@ -402,14 +402,18 @@ class SQLiteFaqSource:
 
     Lives in a knowledge/config-side database file chosen by the operator
     (e.g. knowledge.db or config.db), never in runtime.db: caller history
-    and retention pruning must not touch knowledge. Chunks serve question
-    + answer as authoritative content; keywords stay in ``search_text``
-    as match-only terms so they are never presented as content.
+    and retention pruning must not touch knowledge. The source id is the
+    declared operator id (``faq`` unless configured otherwise) and flows
+    into chunk identity and provenance, so several FAQ stores coexist
+    with distinct identities. Chunks serve question + answer as
+    authoritative content; keywords stay in ``search_text`` as match-only
+    terms so they are never presented as content.
     Failures raise KnowledgeError, never raw sqlite3.
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, source_id: str = "faq") -> None:
         self._conn = conn
+        self._source_id = source_id
         try:
             with self._conn:
                 self._conn.execute(
@@ -447,11 +451,11 @@ class SQLiteFaqSource:
             raise KnowledgeError(f"faq store unavailable: {error}") from error
         return [
             KnowledgeChunk(
-                source_id="faq",
-                chunk_id=f"faq:{row[0]}",
+                source_id=self._source_id,
+                chunk_id=f"{self._source_id}:{row[0]}",
                 text=f"{row[1]}\n{row[2]}",
                 title=row[1],
-                origin=f"faq:{row[0]}",
+                origin=f"{self._source_id}:{row[0]}",
                 search_text=f"{row[2]}\n{row[3]}",
             )
             for row in rows
@@ -459,7 +463,7 @@ class SQLiteFaqSource:
 
     @property
     def source_id(self) -> str:
-        return "faq"
+        return self._source_id
 
     def close(self) -> None:
         self._conn.close()
