@@ -239,3 +239,139 @@ class CallRepository(Protocol):
     def find_by_caller(self, caller_id: str) -> list[CallSummary]: ...
     def find_in_range(self, start: float, end: float) -> list[CallSummary]: ...
     def prune_before(self, cutoff: float) -> int: ...
+
+
+class KnowledgeError(Exception):
+    """Normalized knowledge failure. Raw sqlite3/filesystem errors never
+    cross the knowledge boundary; sources wrap them in this type."""
+
+
+@dataclass(frozen=True)
+class KnowledgeQuery:
+    """Untrusted question text from the caller/conversation. Never authority,
+    never a filesystem path, never configuration."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class KnowledgeChunk:
+    """One retrievable unit with stable provenance. Informational context
+    only: carrying text here never authorizes a privileged action.
+
+    ``text`` is the servable authoritative content. ``search_text`` holds
+    optional match-only terms (e.g. FAQ keywords) consulted by retrievers
+    but never presented as content; empty means match against ``text``.
+    """
+
+    source_id: str
+    chunk_id: str
+    text: str
+    title: str = ""
+    origin: str = ""
+    search_text: str = ""
+
+
+@dataclass(frozen=True)
+class FaqEntry:
+    """One operator-authored structured entry. Disabled entries are stored
+    but never served."""
+
+    id: str
+    question: str
+    answer: str
+    keywords: str = ""
+    enabled: bool = True
+
+
+class KnowledgeStatus(Enum):
+    """FOUND: relevant chunks. NO_RESULT: normal empty outcome, not a
+    failure. FAILURE: normalized service failure, details in error."""
+
+    FOUND = "found"
+    NO_RESULT = "no_result"
+    FAILURE = "failure"
+
+
+@dataclass(frozen=True)
+class KnowledgeResult:
+    """The only shape a knowledge lookup returns. No-result and failure
+    are values, never exceptions."""
+
+    status: KnowledgeStatus
+    chunks: tuple[KnowledgeChunk, ...] = ()
+    error: str = ""
+
+    @classmethod
+    def found(cls, chunks: tuple[KnowledgeChunk, ...]) -> KnowledgeResult:
+        return cls(status=KnowledgeStatus.FOUND, chunks=tuple(chunks))
+
+    @classmethod
+    def no_result(cls) -> KnowledgeResult:
+        return cls(status=KnowledgeStatus.NO_RESULT)
+
+    @classmethod
+    def failure(cls, error: str) -> KnowledgeResult:
+        return cls(status=KnowledgeStatus.FAILURE, error=error)
+
+
+class KnowledgeSource(Protocol):
+    """Where chunks come from. Implementations read local data only;
+    the source list always comes from trusted configuration, never from
+    caller or model input."""
+
+    @property
+    def source_id(self) -> str: ...
+
+    def chunks(self) -> list[KnowledgeChunk]:
+        """All servable chunks. Raises KnowledgeError when unreadable."""
+        ...
+
+
+class KnowledgeRetriever(Protocol):
+    """How relevant chunks are selected. Deterministic, local only: no
+    embeddings, no vector DB, no network. Replaceable by semantic RAG
+    later behind this same protocol."""
+
+    def retrieve(
+        self, query: str, chunks: list[KnowledgeChunk], limit: int
+    ) -> list[KnowledgeChunk]: ...
+
+
+class KnowledgeService(Protocol):
+    """Stable application-facing knowledge contract. The core depends
+    only on this, never on SQLite, files, or retriever details. Returns
+    informational context with provenance; never acts, transfers,
+    resolves destinations, or touches configuration."""
+
+    def query(self, query: KnowledgeQuery) -> KnowledgeResult: ...
+
+
+class KnowledgeSourceKind(Enum):
+    """The closed set of v0.1 source implementations."""
+
+    FAQ = "faq"
+    FILE = "file"
+
+
+@dataclass(frozen=True)
+class KnowledgeSourceDeclaration:
+    """One operator-declared knowledge source: the canonical config
+    record. The query/caller never controls these values; only trusted
+    configuration does. ``locator`` is the FAQ database path (FAQ kind)
+    or the document path (FILE kind). Disabled declarations are stored
+    but never built into live sources."""
+
+    source_id: str
+    kind: KnowledgeSourceKind
+    enabled: bool = True
+    locator: str = ""
+
+
+class KnowledgeSourceRepository(Protocol):
+    """Configuration-side persistence boundary for source declarations.
+    Lives in config.db, behind ConfigService, like every other config
+    domain. Stores declarations/enablement only, never document content."""
+
+    def save(self, declaration: KnowledgeSourceDeclaration) -> None: ...
+    def list_all(self) -> list[KnowledgeSourceDeclaration]: ...
