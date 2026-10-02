@@ -9,6 +9,7 @@ boundaries (telephony, voice backend, clock, policy) defined in
 from __future__ import annotations
 
 from receptionist.boundaries import (
+    ProviderFailure,
     TelephonyListener,
     TransferResult,
     VoiceListener,
@@ -118,16 +119,26 @@ class FakeVoiceSession(VoiceSession):
         """Test driver: the backend emits a typed model action request."""
         self._listener.on_action_request(action)
 
+    def deliver_failure(self, turn_id: int, failure: ProviderFailure) -> None:
+        """Test driver: the provider operation for a turn fails.
+
+        Called on the voice-session object that owned the attempt, so a
+        superseded session delivers a stale generation automatically.
+        """
+        self._listener.on_provider_failure(turn_id, failure)
+
 
 class FakeVoiceBackend:
     """Opens one deterministic voice session per call."""
 
     def __init__(self) -> None:
         self.sessions: dict[str, FakeVoiceSession] = {}
+        self.all_sessions: list[FakeVoiceSession] = []
 
     def open_session(self, call_id: str, listener: VoiceListener) -> FakeVoiceSession:
         session = FakeVoiceSession(call_id, listener)
         self.sessions[call_id] = session
+        self.all_sessions.append(session)
         return session
 
 
@@ -171,3 +182,86 @@ class FailingMessageRepository(InMemoryMessageRepository):
         if self.fail_script:
             raise self.fail_script.pop(0)
         return super().save(draft)
+
+
+class FailingCallRepository:
+    """Call history with a scriptable save failure. Reads stay healthy so
+    only the write path degrades."""
+
+    def __init__(self, delegate=None) -> None:
+        from receptionist.persistence import InMemoryCallRepository
+
+        self._delegate = delegate or InMemoryCallRepository()
+        self.fail_save: Exception | None = None
+
+    def save(self, summary) -> None:
+        if self.fail_save is not None:
+            raise self.fail_save
+        self._delegate.save(summary)
+
+    def get(self, call_id: str):
+        return self._delegate.get(call_id)
+
+    def list_all(self):
+        return self._delegate.list_all()
+
+    def find_by_caller(self, caller_id: str):
+        return self._delegate.find_by_caller(caller_id)
+
+    def find_in_range(self, start: float, end: float):
+        return self._delegate.find_in_range(start, end)
+
+    def prune_before(self, cutoff: float) -> int:
+        return self._delegate.prune_before(cutoff)
+
+
+class FailingAuditLog:
+    """Audit log with a scriptable record failure."""
+
+    def __init__(self, delegate=None) -> None:
+        from receptionist.persistence import InMemoryAuditLog
+
+        self._delegate = delegate or InMemoryAuditLog()
+        self.fail_record: Exception | None = None
+
+    def record(self, event) -> None:
+        if self.fail_record is not None:
+            raise self.fail_record
+        self._delegate.record(event)
+
+    def list_all(self):
+        return self._delegate.list_all()
+
+    def prune_before(self, cutoff: float) -> int:
+        return self._delegate.prune_before(cutoff)
+
+
+class FailingTranscriptStore:
+    """Transcript sidecar with a scriptable append failure."""
+
+    def __init__(self, delegate=None) -> None:
+        from receptionist.persistence import InMemoryTranscriptStore
+
+        self._delegate = delegate or InMemoryTranscriptStore()
+        self.fail_append: Exception | None = None
+
+    def append(self, entry) -> None:
+        if self.fail_append is not None:
+            raise self.fail_append
+        self._delegate.append(entry)
+
+    def entries_for(self, call_id: str):
+        return self._delegate.entries_for(call_id)
+
+    def prune_before(self, cutoff: float) -> int:
+        return self._delegate.prune_before(cutoff)
+
+
+class RaisingConfigRepository:
+    """Config authority that is suddenly unavailable: every read raises."""
+
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    def get(self, key: str):
+        raise self._error

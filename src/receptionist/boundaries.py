@@ -86,12 +86,46 @@ class MessageRejected:
 
 
 class VoiceListener(Protocol):
-    """Events flowing from the voice backend into one call session."""
+    """Events flowing from the voice backend into one call session.
+
+    Attempt identity travels separately: the session hands the backend a
+    per-attempt listener, so late events from a superseded attempt never
+    reach these methods as current. `on_provider_failure` carries the
+    normalized taxonomy below, never vendor exceptions or strings.
+    """
 
     def on_transcript(self, text: str) -> None: ...
     def on_response(self, turn_id: int, text: str) -> None: ...
     def on_playback_finished(self, turn_id: int) -> None: ...
     def on_action_request(self, action: object) -> None: ...
+    def on_provider_failure(self, turn_id: int, failure: ProviderFailure) -> None: ...
+
+
+class ProviderFailureCategory(Enum):
+    """Project-owned failure taxonomy for conversational providers.
+
+    Future adapters (whisper.cpp, llama.cpp, sherpa, HTTP backends)
+    translate their errors into exactly these categories. The core only
+    ever reasons about these values, never vendor exceptions, payloads,
+    or strings.
+    """
+
+    TIMEOUT = "timeout"
+    UNAVAILABLE = "unavailable"
+    INVALID_OUTPUT = "invalid_output"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+    CANCELLED = "cancelled"
+    INTERNAL = "internal"
+
+
+@dataclass(frozen=True)
+class ProviderFailure:
+    """One normalized provider failure. Carries only the category plus a
+    short safe detail string: never prompts, transcripts, audio, secrets,
+    auth headers, or provider payloads."""
+
+    category: ProviderFailureCategory
+    detail: str = ""
 
 
 class VoiceSession(Protocol):
