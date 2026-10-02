@@ -133,13 +133,18 @@ class ReceptionistCore:
         Returns informational chunks with provenance, an explicit NO_RESULT
         when nothing relevant exists, or a normalized FAILURE when the
         service is down. Without a configured service the answer is
-        NO_RESULT (no company knowledge), never a failure. Retrieved text
-        is never parsed into actions: transfers still require a typed
-        TransferRequest resolved by PolicyEngine.
+        NO_RESULT (no company knowledge), never a failure. A service
+        implementation that raises instead of returning FAILURE is
+        contained here, so knowledge can never break the call path.
+        Retrieved text is never parsed into actions: transfers still
+        require a typed TransferRequest resolved by PolicyEngine.
         """
         if self._knowledge is None:
             return KnowledgeResult.no_result()
-        return self._knowledge.query(KnowledgeQuery(text=text))
+        try:
+            return self._knowledge.query(KnowledgeQuery(text=text))
+        except Exception as error:  # rogue service: contain, don't propagate
+            return KnowledgeResult.failure(f"knowledge service failed: {error}")
 
     # -- TelephonyListener (called by the telephony adapter) -----------------
 

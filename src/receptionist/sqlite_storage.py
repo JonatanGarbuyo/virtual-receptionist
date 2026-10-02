@@ -29,6 +29,8 @@ from receptionist.boundaries import (
     FaqEntry,
     KnowledgeChunk,
     KnowledgeError,
+    KnowledgeSourceDeclaration,
+    KnowledgeSourceKind,
     MessageDraft,
     MessageRecord,
     StoreUnavailableError,
@@ -400,9 +402,10 @@ class SQLiteFaqSource:
 
     Lives in a knowledge/config-side database file chosen by the operator
     (e.g. knowledge.db or config.db), never in runtime.db: caller history
-    and retention pruning must not touch knowledge. Chunks carry
-    question + answer so retrieval matches either; the question is also
-    the chunk title. Failures raise KnowledgeError, never raw sqlite3.
+    and retention pruning must not touch knowledge. Chunks serve question
+    + answer as authoritative content; keywords stay in ``search_text``
+    as match-only terms so they are never presented as content.
+    Failures raise KnowledgeError, never raw sqlite3.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -446,9 +449,10 @@ class SQLiteFaqSource:
             KnowledgeChunk(
                 source_id="faq",
                 chunk_id=f"faq:{row[0]}",
-                text=f"{row[1]}\n{row[2]}\n{row[3]}",
+                text=f"{row[1]}\n{row[2]}",
                 title=row[1],
                 origin=f"faq:{row[0]}",
+                search_text=f"{row[2]}\n{row[3]}",
             )
             for row in rows
         ]
@@ -459,3 +463,61 @@ class SQLiteFaqSource:
 
     def close(self) -> None:
         self._conn.close()
+
+
+class SQLiteKnowledgeSourceRepository:
+    """Canonical knowledge-source declarations in config.db.
+
+    Stores which sources the operator enabled (id, kind, locator), never
+    document content. FAQ entries and document files live where their own
+    sources define; this table is only the trusted declaration list the
+    assembler builds live sources from. Operator writes replace by id.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS knowledge_sources("
+                    "source_id TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+                    "enabled INTEGER NOT NULL DEFAULT 1, "
+                    "locator TEXT NOT NULL DEFAULT '')"
+                )
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"knowledge source config unavailable: {error}") from error
+
+    def save(self, declaration: KnowledgeSourceDeclaration) -> None:
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO knowledge_sources(source_id, kind, "
+                    "enabled, locator) VALUES (?, ?, ?, ?)",
+                    (
+                        declaration.source_id,
+                        declaration.kind.value,
+                        1 if declaration.enabled else 0,
+                        declaration.locator,
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"knowledge source config unavailable: {error}") from error
+
+    def list_all(self) -> list[KnowledgeSourceDeclaration]:
+        try:
+            rows = self._conn.execute(
+                "SELECT source_id, kind, enabled, locator FROM knowledge_sources"
+            ).fetchall()
+            return [
+                KnowledgeSourceDeclaration(
+                    source_id=row[0],
+                    kind=KnowledgeSourceKind(row[1]),
+                    enabled=row[2] != 0,
+                    locator=row[3],
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as error:
+            raise KnowledgeError(f"knowledge source config unavailable: {error}") from error
+        except ValueError as error:
+            raise KnowledgeError(f"knowledge source config malformed: {error}") from error

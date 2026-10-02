@@ -7,7 +7,11 @@ SQLite in a later ticket) stays behind the boundary.
 
 from __future__ import annotations
 
-from receptionist.boundaries import ConfigRepository
+from receptionist.boundaries import (
+    ConfigRepository,
+    KnowledgeSourceDeclaration,
+    KnowledgeSourceRepository,
+)
 
 GREETING_KEY = "greeting"
 LANGUAGE_KEY = "language"
@@ -27,10 +31,20 @@ class InMemoryConfigRepository:
 
 
 class ConfigService:
-    """Typed reads over a :class:`ConfigRepository`."""
+    """Typed reads over a :class:`ConfigRepository`.
 
-    def __init__(self, repository: ConfigRepository) -> None:
+    Knowledge source declarations ride along when a config-side
+    :class:`KnowledgeSourceRepository` is provided (same config.db);
+    without one no knowledge source is declared.
+    """
+
+    def __init__(
+        self,
+        repository: ConfigRepository,
+        knowledge_sources: KnowledgeSourceRepository | None = None,
+    ) -> None:
         self._repository = repository
+        self._knowledge_sources = knowledge_sources
 
     def get_greeting(self) -> str | None:
         return self._repository.get(GREETING_KEY)
@@ -50,3 +64,11 @@ class ConfigService:
             if value is None or not value.strip():
                 missing.append(key)
         return missing
+
+    def knowledge_source_declarations(self) -> list[KnowledgeSourceDeclaration]:
+        """Operator-declared knowledge sources from config.db. Empty when
+        no knowledge repository is wired; the assembler builds live
+        sources only from these trusted declarations."""
+        if self._knowledge_sources is None:
+            return []
+        return self._knowledge_sources.list_all()

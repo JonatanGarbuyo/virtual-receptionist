@@ -257,13 +257,19 @@ class KnowledgeQuery:
 @dataclass(frozen=True)
 class KnowledgeChunk:
     """One retrievable unit with stable provenance. Informational context
-    only: carrying text here never authorizes a privileged action."""
+    only: carrying text here never authorizes a privileged action.
+
+    ``text`` is the servable authoritative content. ``search_text`` holds
+    optional match-only terms (e.g. FAQ keywords) consulted by retrievers
+    but never presented as content; empty means match against ``text``.
+    """
 
     source_id: str
     chunk_id: str
     text: str
     title: str = ""
     origin: str = ""
+    search_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -339,3 +345,33 @@ class KnowledgeService(Protocol):
     resolves destinations, or touches configuration."""
 
     def query(self, query: KnowledgeQuery) -> KnowledgeResult: ...
+
+
+class KnowledgeSourceKind(Enum):
+    """The closed set of v0.1 source implementations."""
+
+    FAQ = "faq"
+    FILE = "file"
+
+
+@dataclass(frozen=True)
+class KnowledgeSourceDeclaration:
+    """One operator-declared knowledge source: the canonical config
+    record. The query/caller never controls these values; only trusted
+    configuration does. ``locator`` is the FAQ database path (FAQ kind)
+    or the document path (FILE kind). Disabled declarations are stored
+    but never built into live sources."""
+
+    source_id: str
+    kind: KnowledgeSourceKind
+    enabled: bool = True
+    locator: str = ""
+
+
+class KnowledgeSourceRepository(Protocol):
+    """Configuration-side persistence boundary for source declarations.
+    Lives in config.db, behind ConfigService, like every other config
+    domain. Stores declarations/enablement only, never document content."""
+
+    def save(self, declaration: KnowledgeSourceDeclaration) -> None: ...
+    def list_all(self) -> list[KnowledgeSourceDeclaration]: ...

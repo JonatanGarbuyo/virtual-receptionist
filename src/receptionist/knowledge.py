@@ -26,6 +26,8 @@ from receptionist.boundaries import (
     KnowledgeRetriever,
     KnowledgeService,
     KnowledgeSource,
+    KnowledgeSourceDeclaration,
+    KnowledgeSourceKind,
 )
 
 
@@ -78,7 +80,11 @@ class KeywordRetriever:
             return []
         scored: list[tuple[int, str, str, KnowledgeChunk]] = []
         for chunk in chunks:
-            chunk_tokens = normalize_tokens(f"{chunk.title} {chunk.text}")
+            # Match title plus search terms; search_text holds match-only
+            # metadata (e.g. FAQ keywords) that must never be served as
+            # content, and falls back to text when a source sets none.
+            haystack = f"{chunk.title} {chunk.search_text or chunk.text}"
+            chunk_tokens = normalize_tokens(haystack)
             score = sum(
                 1
                 for query_token in query_tokens
@@ -95,11 +101,25 @@ class LocalKnowledgeService:
     """Combines configured sources through one retriever. The caller never
     learns which source produced a chunk; duplicates by (source, chunk)
     identity are served once. Any source or retriever failure becomes a
-    FAILURE result; an empty match is an explicit NO_RESULT."""
+    FAILURE result; an empty match is an explicit NO_RESULT.
+
+    Source ids must be unique: two sources sharing one id would produce
+    indistinguishable chunk identities, so construction fails explicitly
+    instead of silently dropping one source's content.
+    """
 
     sources: list[KnowledgeSource]
     retriever: KnowledgeRetriever
     max_chunks: int = 3
+
+    def __post_init__(self) -> None:
+        seen: set[str] = set()
+        for source in self.sources:
+            if source.source_id in seen:
+                raise KnowledgeError(
+                    f"duplicate knowledge source id: {source.source_id}"
+                )
+            seen.add(source.source_id)
 
     def query(self, query: KnowledgeQuery) -> KnowledgeResult:
         if not query.text.strip():
@@ -167,3 +187,49 @@ class FileKnowledgeSource:
                 )
             )
         return result
+
+
+def assemble_knowledge_sources(
+    declarations: list[KnowledgeSourceDeclaration],
+) -> list[KnowledgeSource]:
+    """Build live sources from trusted operator declarations only.
+
+    Disabled declarations are never built. The query/caller has no input
+    here: every locator comes from configuration, so conversation text can
+    never steer which files or databases are opened. Duplicate or blank
+    source ids, unknown kinds, and missing locators fail explicitly with
+    KnowledgeError instead of serving silently incomplete knowledge.
+    """
+    import sqlite3
+
+    from receptionist.sqlite_storage import SQLiteFaqSource
+
+    sources: list[KnowledgeSource] = []
+    seen: set[str] = set()
+    for declaration in declarations:
+        if not declaration.enabled:
+            continue
+        if not declaration.source_id or not declaration.source_id.strip():
+            raise KnowledgeError("knowledge source without id")
+        if declaration.source_id in seen:
+            raise KnowledgeError(
+                f"duplicate knowledge source id: {declaration.source_id}"
+            )
+        seen.add(declaration.source_id)
+        if not declaration.locator:
+            raise KnowledgeError(
+                f"knowledge source without locator: {declaration.source_id}"
+            )
+        if declaration.kind is KnowledgeSourceKind.FILE:
+            sources.append(
+                FileKnowledgeSource(
+                    source_id=declaration.source_id, path=declaration.locator
+                )
+            )
+        elif declaration.kind is KnowledgeSourceKind.FAQ:
+            sources.append(SQLiteFaqSource(sqlite3.connect(declaration.locator)))
+        else:
+            raise KnowledgeError(
+                f"unknown knowledge source kind: {declaration.kind!r}"
+            )
+    return sources
