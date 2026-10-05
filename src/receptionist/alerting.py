@@ -17,6 +17,10 @@ threads, no queues, no network except inside the stdlib transports.
 
 from __future__ import annotations
 
+import json
+import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -37,6 +41,19 @@ CODE_AUDIT_UNAVAILABLE = "runtime.audit_unavailable"
 CODE_TRANSCRIPT_UNAVAILABLE = "transcript.unavailable"
 CODE_CAPACITY_SATURATED = "capacity.saturated"
 
+#: Project-owned safe phrases, one per code. Transition detail comes
+#: only from this registry, never from caller text, exception strings,
+#: paths, URLs, or credentials: unsanitized detail is unrepresentable.
+DETAIL_BY_CODE = {
+    CODE_CIRCUIT_OPEN: "failure threshold reached",
+    CODE_CONFIG_UNAVAILABLE: "configuration authority unreadable",
+    CODE_CONFIG_INCOMPLETE: "required configuration missing",
+    CODE_HISTORY_UNAVAILABLE: "call history write failed",
+    CODE_AUDIT_UNAVAILABLE: "audit write failed",
+    CODE_TRANSCRIPT_UNAVAILABLE: "transcript sidecar write failed",
+    CODE_CAPACITY_SATURATED: "ai capacity saturated",
+}
+
 
 class HealthComponent(Enum):
     """What is affected, as a stable identity (never parsed from text)."""
@@ -55,10 +72,11 @@ class TransitionKind(Enum):
 
 @dataclass(frozen=True)
 class HealthTransition:
-    """One edge-triggered health change. Sanitized at creation: short
-    stable codes plus a safe detail string. Never carries Caller-ID,
-    transcripts, message text, knowledge, prompts, model output, audio,
-    credentials, tokens, headers, secrets, or raw exception text."""
+    """One edge-triggered health change. Sanitized by construction: the
+    stable (component, code) identity plus a project-owned registry
+    phrase. Never carries Caller-ID, transcripts, message text,
+    knowledge, prompts, model output, audio, credentials, tokens,
+    headers, secrets, or raw exception text — free text cannot enter."""
 
     timestamp: float
     component: HealthComponent
@@ -81,10 +99,12 @@ class ActiveCondition:
 
 @dataclass(frozen=True)
 class DeliveryDiagnostic:
-    """Local-only record of a failed sink delivery. Carries the sink name
-    and the exception type name only: never exception strings (they may
-    embed secrets), never payloads. Never fanned out, so delivery
-    failures cannot recurse into more external alerts."""
+    """Local-only record of a failed sink delivery. Sinks are identified
+    by position (\"sink-0\", ...) so a hostile sink name can never inject
+    secrets into diagnostics. The error is the exception type name only:
+    never exception strings (they may embed secrets), never payloads.
+    Never fanned out, so delivery failures cannot recurse into more
+    external alerts."""
 
     timestamp: float
     sink_name: str
@@ -102,17 +122,62 @@ class AlertSink(Protocol):
     def send(self, transition: HealthTransition) -> None: ...
 
 
+#: Upper bound on concurrent in-flight deliveries. Beyond it, transitions
+#: are still recorded locally but external fan-out for the excess is
+#: skipped with a local diagnostic: saturation never blocks reporters.
+MAX_PENDING_DELIVERIES = 32
+
+_LOGGER = logging.getLogger("virtual-receptionist.health")
+
+
+def _log_transition(transition: HealthTransition) -> None:
+    _LOGGER.info(
+        "health_transition %s",
+        json.dumps(
+            {
+                "service": transition.service,
+                "schema_version": transition.schema_version,
+                "timestamp": transition.timestamp,
+                "component": transition.component.value,
+                "code": transition.code,
+                "status": transition.kind.value,
+                "detail": transition.detail,
+            }
+        ),
+    )
+
+
+def _log_diagnostic(diagnostic: DeliveryDiagnostic) -> None:
+    _LOGGER.warning(
+        "alert_delivery_failed %s",
+        json.dumps(
+            {
+                "service": SERVICE_NAME,
+                "timestamp": diagnostic.timestamp,
+                "sink": diagnostic.sink_name,
+                "error": diagnostic.error_kind,
+            }
+        ),
+    )
+
+
 @dataclass
 class HealthMonitor:
-    """Edge-triggered transition detection plus isolated fan-out.
+    """Edge-triggered transition detection plus decoupled fan-out.
 
     The single place that turns subsystem reports into transitions:
     first report of a (component, code) emits UNHEALTHY, repeats are
     silent, recovery emits RECOVERED once (externally only when
-    notify_recovery is set; locally always). Every emitted transition
-    is recorded locally before any sink runs, so the structured record
-    exists even when all sinks fail. Sink exceptions are contained per
-    sink and diagnosed locally without recursion.
+    notify_recovery is set; locally always). Every emitted transition is
+    recorded locally and emitted as a structured log line before any
+    sink runs, so the local record exists even when all sinks fail.
+
+    External delivery never blocks reporters: each emitted transition is
+    fanned out on a bounded daemon thread with per-sink isolation, so a
+    slow endpoint cannot stall call admission. Use drain() in tests and
+    close() at shutdown for explicit lifecycle. Sink exceptions (and
+    hostile sink objects) are contained per sink and diagnosed locally
+    without recursion.
     """
 
     clock: Clock
@@ -120,9 +185,12 @@ class HealthMonitor:
     notify_recovery: bool = True
 
     def __post_init__(self) -> None:
+        self.sinks = [sink for sink in self.sinks if sink is not None]
         self._active: dict[tuple[HealthComponent, str], ActiveCondition] = {}
         self._history: list[HealthTransition] = []
         self._diagnostics: list[DeliveryDiagnostic] = []
+        self._pending: list[threading.Thread] = []
+        self._closed = False
 
     def active_conditions(self) -> tuple[ActiveCondition, ...]:
         """Currently-unhealthy conditions, with stable identities."""
@@ -136,29 +204,51 @@ class HealthMonitor:
         """Local-only delivery failure records. Never fanned out."""
         return tuple(self._diagnostics)
 
+    def drain(self, timeout: float = 5.0) -> None:
+        """Wait (bounded) for in-flight deliveries. Deterministic tests
+        call this before asserting what sinks received."""
+        deadline = time.monotonic() + timeout
+        for thread in list(self._pending):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        self._pending = [t for t in self._pending if t.is_alive()]
+
+    def close(self) -> None:
+        """Shutdown: no further external deliveries; drain what is flying."""
+        self._closed = True
+        self.drain()
+
+    def _now(self) -> float:
+        try:
+            return self.clock.now()
+        except Exception:
+            return 0.0
+
     def report_unhealthy(
-        self, component: HealthComponent, code: str, detail: str = ""
+        self, component: HealthComponent, code: str
     ) -> HealthTransition | None:
         """Report a subsystem problem. Returns the emitted transition, or
-        None when this (component, code) is already active (no re-alert,
-        however the detail text differs)."""
+        None when this (component, code) is already active (no re-alert).
+        Detail comes from the project-owned registry, never arguments."""
         key = (component, code)
         if key in self._active:
             return None
-        condition = ActiveCondition(
+        now = self._now()
+        self._active[key] = ActiveCondition(
             component=component,
             code=code,
-            detail=detail,
-            first_seen=self.clock.now(),
+            detail=DETAIL_BY_CODE.get(code, ""),
+            first_seen=now,
         )
-        self._active[key] = condition
         return self._emit(
             HealthTransition(
-                timestamp=condition.first_seen,
+                timestamp=now,
                 component=component,
                 code=code,
                 kind=TransitionKind.UNHEALTHY,
-                detail=detail,
+                detail=DETAIL_BY_CODE.get(code, ""),
             )
         )
 
@@ -172,38 +262,66 @@ class HealthMonitor:
             return None
         del self._active[key]
         transition = HealthTransition(
-            timestamp=self.clock.now(),
+            timestamp=self._now(),
             component=component,
             code=code,
             kind=TransitionKind.RECOVERED,
         )
         self._history.append(transition)
+        _log_transition(transition)
         if self.notify_recovery:
-            self._fan_out(transition)
+            self._fan_out_async(transition)
         return transition
 
     def _emit(self, transition: HealthTransition) -> HealthTransition:
         self._history.append(transition)
-        self._fan_out(transition)
+        _log_transition(transition)
+        self._fan_out_async(transition)
         return transition
 
-    def _fan_out(self, transition: HealthTransition) -> None:
-        for sink in self.sinks:
+    def _fan_out_async(self, transition: HealthTransition) -> None:
+        if self._closed or not self.sinks:
+            return
+        self._pending = [t for t in self._pending if t.is_alive()]
+        if len(self._pending) >= MAX_PENDING_DELIVERIES:
+            diagnostic = DeliveryDiagnostic(
+                timestamp=self._now(),
+                sink_name="dispatcher",
+                error_kind="QueueSaturated",
+            )
+            self._diagnostics.append(diagnostic)
+            _log_diagnostic(diagnostic)
+            return
+        thread = threading.Thread(
+            target=self._deliver, args=(transition,), daemon=True
+        )
+        self._pending.append(thread)
+        thread.start()
+
+    def _deliver(self, transition: HealthTransition) -> None:
+        for index, sink in enumerate(self.sinks):
             try:
                 sink.send(transition)
             except Exception as error:
-                self._diagnostics.append(
-                    DeliveryDiagnostic(
-                        timestamp=self.clock.now(),
-                        sink_name=sink.name,
-                        error_kind=type(error).__name__,
-                    )
+                # The whole per-sink body is guarded: send, hostile
+                # objects, and anything else ends here as one safe record.
+                diagnostic = DeliveryDiagnostic(
+                    timestamp=self._now(),
+                    sink_name=f"sink-{index}",
+                    error_kind=type(error).__name__,
                 )
+                self._diagnostics.append(diagnostic)
+                _log_diagnostic(diagnostic)
 
 
 class AlertError(Exception):
     """Invalid alerting configuration. Raised at assembly, never during
     call handling or delivery (delivery failures are diagnosed locally)."""
+
+
+class TransportError(Exception):
+    """Normalized transport failure. Carries a status summary only, never
+    URLs, headers, payloads, or raw library error text."""
 
 
 class SmtpTransport(Protocol):
@@ -232,14 +350,15 @@ class HttpTransport(Protocol):
 @dataclass(frozen=True)
 class EmailSettings:
     """Independent email channel configuration. Credentials live here for
-    transport use only; they are never rendered into any alert body."""
+    transport use only; they are never rendered into any alert body, and
+    repr/str redact them so config dumps cannot leak."""
 
     enabled: bool = False
     host: str = ""
     port: int = 587
     use_tls: bool = True
     username: str = ""
-    password: str = ""
+    password: str = field(default="", repr=False)
     sender: str = ""
     recipients: tuple[str, ...] = ()
     timeout_seconds: float = 10.0
@@ -248,22 +367,24 @@ class EmailSettings:
 @dataclass(frozen=True)
 class WebhookSettings:
     """Independent generic-webhook configuration. The URL comes only from
-    trusted configuration; events and callers can never steer it."""
+    trusted configuration; events and callers can never steer it. The
+    token is transport-only and redacted from repr/str."""
 
     enabled: bool = False
     url: str = ""
     auth_scheme: str = "Bearer"
-    auth_token: str = ""
+    auth_token: str = field(default="", repr=False)
     timeout_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
 class TelegramSettings:
     """Independent Telegram Bot API configuration. The token addresses
-    the transport only and is never rendered anywhere."""
+    the transport only, is never rendered anywhere, and is redacted from
+    repr/str."""
 
     enabled: bool = False
-    bot_token: str = ""
+    bot_token: str = field(default="", repr=False)
     chat_id: str = ""
     timeout_seconds: float = 10.0
 
@@ -272,12 +393,24 @@ class TelegramSettings:
 class AlertSettings:
     """All alerting configuration plus recovery policy. Recovery
     transitions are always recorded locally; they reach external sinks
-    only when notify_recovery is set."""
+    only when notify_recovery is set. Repr reports channels and flags
+    only, never nested secrets."""
 
     email: EmailSettings = field(default_factory=EmailSettings)
     webhook: WebhookSettings = field(default_factory=WebhookSettings)
     telegram: TelegramSettings = field(default_factory=TelegramSettings)
     notify_recovery: bool = True
+
+    def __repr__(self) -> str:
+        channels = (
+            f"email(enabled={self.email.enabled})",
+            f"webhook(enabled={self.webhook.enabled})",
+            f"telegram(enabled={self.telegram.enabled})",
+        )
+        return (
+            f"AlertSettings({', '.join(channels)}, "
+            f"notify_recovery={self.notify_recovery})"
+        )
 
 
 def _render_subject(transition: HealthTransition) -> str:
@@ -419,12 +552,26 @@ class SmtplibTransport:
 
 class UrllibTransport:
     """Real outbound HTTPS posts over the standard library. Bounded by
-    timeout; failures raise for local diagnosis by type name only."""
+    timeout; failures raise for local diagnosis by type name only.
+
+    Redirects are never followed: the configured trusted URL is the only
+    destination, so a redirect response can never carry the Authorization
+    header (or the alert body) to an untrusted host. A redirecting
+    endpoint surfaces as a delivery error instead.
+    """
+
+    def __init__(self) -> None:
+        import urllib.request
+
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPHandler, urllib.request.HTTPSHandler
+        )
 
     def post(
         self, url: str, payload: dict, headers: dict, timeout_seconds: float
     ) -> None:
         import json
+        import urllib.error
         import urllib.request
 
         request = urllib.request.Request(
@@ -433,8 +580,10 @@ class UrllibTransport:
             headers={"Content-Type": "application/json", **headers},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=timeout_seconds):
-            pass
+        try:
+            self._opener.open(request, timeout=timeout_seconds)
+        except urllib.error.HTTPError as error:
+            raise TransportError(f"http status {error.code}") from error
 
 
 class AlertConfigRepository(Protocol):
@@ -443,20 +592,31 @@ class AlertConfigRepository(Protocol):
 
     def load(self) -> AlertSettings: ...
 
+def _require_timeout(timeout_seconds: float, channel: str) -> None:
+    if not isinstance(timeout_seconds, (int, float)) or timeout_seconds <= 0:
+        raise AlertError(f"{channel} channel needs a positive timeout")
 
-def build_alert_sinks(    settings: AlertSettings,
+
+def build_alert_sinks(
+    settings: AlertSettings,
     smtp_transport: SmtpTransport | None = None,
     http_transport: HttpTransport | None = None,
 ) -> list[AlertSink]:
     """Deterministic factory: only enabled, complete channels become
-    sinks. Enabled-but-incomplete channels fail closed with AlertError
-    instead of silently alerting nowhere. Transports default to the
-    stdlib implementations; tests inject fakes (no real network)."""
+    sinks. Enabled-but-incomplete (or out-of-range) channels fail closed
+    with AlertError instead of silently alerting nowhere. Transports
+    default to the stdlib implementations; tests inject fakes (no real
+    network)."""
     sinks: list[AlertSink] = []
     email = settings.email
     if email.enabled:
-        if not email.host or not email.sender or not email.recipients:
+        if not email.host.strip() or not email.sender.strip() or not [
+            r for r in email.recipients if r.strip()
+        ]:
             raise AlertError("email channel enabled without host/sender/recipients")
+        if not 1 <= email.port <= 65535:
+            raise AlertError("email channel needs a port in 1..65535")
+        _require_timeout(email.timeout_seconds, "email")
         sinks.append(
             EmailSink(
                 transport=smtp_transport
@@ -468,8 +628,11 @@ def build_alert_sinks(    settings: AlertSettings,
         )
     webhook = settings.webhook
     if webhook.enabled:
-        if not webhook.url:
-            raise AlertError("webhook channel enabled without url")
+        if not webhook.url.strip() or not (
+            webhook.url.startswith("https://") or webhook.url.startswith("http://")
+        ):
+            raise AlertError("webhook channel enabled without an http(s) url")
+        _require_timeout(webhook.timeout_seconds, "webhook")
         sinks.append(
             WebhookSink(
                 transport=http_transport or UrllibTransport(), settings=webhook
@@ -477,11 +640,32 @@ def build_alert_sinks(    settings: AlertSettings,
         )
     telegram = settings.telegram
     if telegram.enabled:
-        if not telegram.bot_token or not telegram.chat_id:
+        if not telegram.bot_token or not telegram.chat_id.strip():
             raise AlertError("telegram channel enabled without bot token/chat id")
+        _require_timeout(telegram.timeout_seconds, "telegram")
         sinks.append(
             TelegramSink(
                 transport=http_transport or UrllibTransport(), settings=telegram
             )
         )
     return sinks
+
+
+def build_monitor(
+    settings: AlertSettings,
+    clock: Clock,
+    smtp_transport: SmtpTransport | None = None,
+    http_transport: HttpTransport | None = None,
+) -> HealthMonitor:
+    """Productive composition seam: settings (canonically from
+    config.db via ConfigService.alert_settings()) become live sinks on
+    one monitor, honoring the persisted notify_recovery flag. This is the
+    chain production assembly calls; no packaging, UI, or threads beyond
+    the monitor's own bounded delivery."""
+    return HealthMonitor(
+        clock=clock,
+        sinks=build_alert_sinks(
+            settings, smtp_transport=smtp_transport, http_transport=http_transport
+        ),
+        notify_recovery=settings.notify_recovery,
+    )

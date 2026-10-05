@@ -16,10 +16,13 @@ from receptionist.boundaries import (
     VoiceBackend,
 )
 from receptionist.alerting import (
+    CODE_AUDIT_UNAVAILABLE,
     CODE_CAPACITY_SATURATED,
     CODE_CIRCUIT_OPEN,
     CODE_CONFIG_INCOMPLETE,
     CODE_CONFIG_UNAVAILABLE,
+    CODE_HISTORY_UNAVAILABLE,
+    CODE_TRANSCRIPT_UNAVAILABLE,
     HealthComponent,
     HealthMonitor,
 )
@@ -100,20 +103,21 @@ class ReceptionistCore:
         """
         try:
             missing = self._config.missing_required()
+            config_trusted = True
         except Exception:
+            missing = []
+            config_trusted = False
+        if not config_trusted:
             self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
             self.monitor.report_unhealthy(
                 HealthComponent.CONFIGURATION,
                 CODE_CONFIG_UNAVAILABLE,
-                "configuration authority unreadable",
             )
-            return self.health
-        if missing:
+        elif missing:
             self.health.mark_not_ready(f"missing required configuration: {', '.join(missing)}")
             self.monitor.report_unhealthy(
                 HealthComponent.CONFIGURATION,
                 CODE_CONFIG_INCOMPLETE,
-                "required configuration missing",
             )
         else:
             self.health.mark_ready("configuration loaded")
@@ -123,6 +127,7 @@ class ReceptionistCore:
             self.monitor.report_recovered(
                 HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
             )
+        self._reconcile_health()
         return self.health
 
     def report_degraded(self, detail: str) -> None:
@@ -148,25 +153,34 @@ class ReceptionistCore:
         try:
             greeting = self._config.get_greeting() or ""
             transcripts_enabled = self._config.transcripts_enabled()
+            missing = self._config.missing_required()
             config_trusted = True
         except Exception:
             greeting = ""
             transcripts_enabled = False
+            missing = ["unreadable"]
             config_trusted = False
-            self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
+        if not config_trusted:
             self.monitor.report_unhealthy(
                 HealthComponent.CONFIGURATION,
                 CODE_CONFIG_UNAVAILABLE,
-                "configuration authority unreadable",
             )
-        if config_trusted and (
-            self.health.status is HealthStatus.NOT_READY
-            and self.health.detail == _CONFIG_DOWN_DETAIL
-        ):
-            self.health.mark_ready("configuration loaded")
+        elif missing:
             self.monitor.report_recovered(
                 HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
             )
+            self.monitor.report_unhealthy(
+                HealthComponent.CONFIGURATION,
+                CODE_CONFIG_INCOMPLETE,
+            )
+        else:
+            self.monitor.report_recovered(
+                HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
+            )
+            self.monitor.report_recovered(
+                HealthComponent.CONFIGURATION, CODE_CONFIG_INCOMPLETE
+            )
+        self._reconcile_health()
         session = CallSession(
             call_id=call_id,
             caller_id=caller_id,
@@ -187,7 +201,12 @@ class ReceptionistCore:
         # acquires no voice resources (lazy open in request_answer); exact
         # real-adapter fallback behavior belongs to a later ticket.
         admitted = self.health.status not in (HealthStatus.STARTING, HealthStatus.NOT_READY)
-        if admitted and config_trusted and self._policy.should_answer(caller_id):
+        if (
+            admitted
+            and config_trusted
+            and not missing
+            and self._policy.should_answer(caller_id)
+        ):
             self._sync_breaker_health()
             if self.breaker.is_open:
                 session.begin_fallback_only("provider_unavailable")
@@ -196,7 +215,6 @@ class ReceptionistCore:
                 self.monitor.report_unhealthy(
                     HealthComponent.CAPACITY,
                     CODE_CAPACITY_SATURATED,
-                    "ai capacity saturated",
                 )
             else:
                 session.request_answer()
@@ -206,6 +224,7 @@ class ReceptionistCore:
         else:
             session.reject()
             del self._sessions[call_id]
+        self._reconcile_health()
         return session
 
     def get_session(self, call_id: str) -> CallSession | None:
@@ -223,22 +242,55 @@ class ReceptionistCore:
         """Return the AI slot exactly once per held permit, however the
         session ended (normal end, handoff, hangup, failure, fallback).
         Sessions that never held one (rejected, fallback-only) release
-        nothing, so permits never leak and never go negative."""
+        nothing, so permits never leak and never go negative. A freed
+        slot recovers the saturation condition immediately instead of
+        waiting for new traffic."""
         if call_id in self._ai_permits:
             self._ai_permits.discard(call_id)
             self.capacity.release()
+            if not self.capacity.saturated:
+                self.monitor.report_recovered(
+                    HealthComponent.CAPACITY, CODE_CAPACITY_SATURATED
+                )
+
+    def _reconcile_health(self) -> None:
+        """Derive aggregate health from active monitor conditions: the one
+        authoritative mapping. Config states win over degradation; any
+        other active condition degrades; READY requires no remaining cause.
+        Capacity saturation alerts but never changes the aggregate (it is
+        expected-load routing, not sickness). Never touches STARTING."""
+        if self.health.status is HealthStatus.STARTING:
+            return
+        active = {(c.component, c.code) for c in self.monitor.active_conditions()}
+        if (HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE) in active:
+            self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
+        elif (HealthComponent.CONFIGURATION, CODE_CONFIG_INCOMPLETE) in active:
+            self.health.mark_not_ready("required configuration missing")
+        elif (HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN) in active:
+            self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
+        elif (HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE) in active or (
+            HealthComponent.RUNTIME,
+            CODE_AUDIT_UNAVAILABLE,
+        ) in active:
+            self.health.mark_degraded("runtime observability degraded")
+        elif (HealthComponent.TRANSCRIPT, CODE_TRANSCRIPT_UNAVAILABLE) in active:
+            self.health.mark_degraded("transcript sidecar degraded")
+        else:
+            self.health.mark_ready("configuration loaded")
+
+    def close(self) -> None:
+        """Shutdown: drain pending alert deliveries (bounded)."""
+        self.monitor.close()
 
     def _sync_breaker_health(self) -> None:
-        """Reflect an open provider circuit in service health. DEGRADED
-        still admits calls; they route to PBX fallback at admission."""
-        if self.breaker.is_open and self.health.status is HealthStatus.READY:
-            self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
+        """Report an open provider circuit. Aggregate follows via reconcile:
+        DEGRADED still admits calls; they route to PBX fallback at admission."""
         if self.breaker.is_open:
             self.monitor.report_unhealthy(
                 HealthComponent.PROVIDER,
                 CODE_CIRCUIT_OPEN,
-                "failure threshold reached",
             )
+        self._reconcile_health()
 
     def report_provider_probe(self, success: bool) -> bool:
         """Project-owned recovery seam for a future backend health check.
@@ -254,11 +306,7 @@ class ReceptionistCore:
             self.monitor.report_recovered(
                 HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN
             )
-        if (
-            self.health.status is HealthStatus.DEGRADED
-            and self.health.detail == _CIRCUIT_DEGRADED_DETAIL
-        ):
-            self.health.recover("conversational provider recovered")
+        self._reconcile_health()
         return True
 
     def tick(self) -> None:
@@ -321,8 +369,7 @@ class ReceptionistCore:
         if session is None:
             return
         handler(session, *args)
-        if session.observability_failed:
-            self.report_degraded("runtime observability degraded")
+        self._reconcile_health()
         if session.state is CallState.ENDED:
             # pop: the handler may have completed synchronously through a
             # nested event (e.g. auto-confirmed hangup) and evicted already.

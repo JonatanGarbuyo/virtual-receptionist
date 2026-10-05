@@ -555,6 +555,7 @@ class SQLiteAlertRepository:
                     "endpoint TEXT NOT NULL DEFAULT '', port INTEGER NOT NULL DEFAULT 0, "
                     "use_tls INTEGER NOT NULL DEFAULT 0, username TEXT NOT NULL DEFAULT '', "
                     "secret TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', "
+                    "auth_scheme TEXT NOT NULL DEFAULT 'Bearer', "
                     "targets TEXT NOT NULL DEFAULT '', timeout_seconds REAL NOT NULL DEFAULT 10.0)"
                 )
                 self._conn.execute(
@@ -575,6 +576,7 @@ class SQLiteAlertRepository:
             username=settings.username,
             secret=settings.password,
             sender=settings.sender,
+            auth_scheme="",
             targets=",".join(settings.recipients),
             timeout_seconds=settings.timeout_seconds,
         )
@@ -588,7 +590,8 @@ class SQLiteAlertRepository:
             use_tls=False,
             username="",
             secret=settings.auth_token,
-            sender=settings.auth_scheme,
+            sender="",
+            auth_scheme=settings.auth_scheme,
             targets="",
             timeout_seconds=settings.timeout_seconds,
         )
@@ -603,6 +606,7 @@ class SQLiteAlertRepository:
             username="",
             secret=settings.bot_token,
             sender="",
+            auth_scheme="",
             targets=settings.chat_id,
             timeout_seconds=settings.timeout_seconds,
         )
@@ -624,8 +628,8 @@ class SQLiteAlertRepository:
                 row[0]: row[1:]
                 for row in self._conn.execute(
                     "SELECT channel, enabled, endpoint, port, use_tls, "
-                    "username, secret, sender, targets, timeout_seconds "
-                    "FROM alert_channels"
+                    "username, secret, sender, auth_scheme, targets, "
+                    "timeout_seconds FROM alert_channels"
                 ).fetchall()
             }
             options = self._conn.execute(
@@ -633,9 +637,9 @@ class SQLiteAlertRepository:
             ).fetchone()
         except sqlite3.Error as error:
             raise AlertError(f"alert config unavailable: {error}") from error
-        email = rows.get("email", (0, "", 587, 1, "", "", "", "", 10.0))
-        webhook = rows.get("webhook", (0, "", 0, 0, "", "", "", "", 10.0))
-        telegram = rows.get("telegram", (0, "", 0, 0, "", "", "", "", 10.0))
+        email = rows.get("email", (0, "", 587, 1, "", "", "", "", "", 10.0))
+        webhook = rows.get("webhook", (0, "", 0, 0, "", "", "", "Bearer", "", 10.0))
+        telegram = rows.get("telegram", (0, "", 0, 0, "", "", "", "", "", 10.0))
         return AlertSettings(
             email=EmailSettings(
                 enabled=email[0] != 0,
@@ -645,21 +649,21 @@ class SQLiteAlertRepository:
                 username=email[4],
                 password=email[5],
                 sender=email[6],
-                recipients=tuple(t for t in email[7].split(",") if t),
-                timeout_seconds=email[8],
+                recipients=tuple(t for t in email[8].split(",") if t),
+                timeout_seconds=email[9],
             ),
             webhook=WebhookSettings(
                 enabled=webhook[0] != 0,
                 url=webhook[1],
-                auth_scheme=webhook[6] or "Bearer",
+                auth_scheme=webhook[7] or "Bearer",
                 auth_token=webhook[5],
-                timeout_seconds=webhook[8],
+                timeout_seconds=webhook[9],
             ),
             telegram=TelegramSettings(
                 enabled=telegram[0] != 0,
                 bot_token=telegram[5],
-                chat_id=telegram[7],
-                timeout_seconds=telegram[8],
+                chat_id=telegram[8],
+                timeout_seconds=telegram[9],
             ),
             notify_recovery=options is None or options[0] != 0,
         )
@@ -674,6 +678,7 @@ class SQLiteAlertRepository:
         username: str,
         secret: str,
         sender: str,
+        auth_scheme: str,
         targets: str,
         timeout_seconds: float,
     ) -> None:
@@ -682,8 +687,8 @@ class SQLiteAlertRepository:
                 self._conn.execute(
                     "INSERT OR REPLACE INTO alert_channels(channel, enabled, "
                     "endpoint, port, use_tls, username, secret, sender, "
-                    "targets, timeout_seconds) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "auth_scheme, targets, timeout_seconds) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         channel,
                         1 if enabled else 0,
@@ -693,6 +698,7 @@ class SQLiteAlertRepository:
                         username,
                         secret,
                         sender,
+                        auth_scheme,
                         targets,
                         timeout_seconds,
                     ),

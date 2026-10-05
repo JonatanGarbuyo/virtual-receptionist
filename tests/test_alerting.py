@@ -58,42 +58,60 @@ class EdgeTriggeringTest(unittest.TestCase):
         sink = RecordingSink()
         monitor = make_monitor(sink)
         first = monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "threshold reached"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
         self.assertIsNotNone(first)
         self.assertEqual(first.kind, TransitionKind.UNHEALTHY)
+        # Detail is project-owned registry text, never caller input.
+        self.assertEqual(first.detail, "failure threshold reached")
+        monitor.drain()
         self.assertEqual(len(sink.received), 1)
 
     def test_repeated_same_condition_never_reemits(self) -> None:
         sink = RecordingSink()
         monitor = make_monitor(sink)
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "threshold reached"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
-        for detail in ("still open", "open with other words", "OPEN!!!", ""):
+        for _ in range(20):
             repeated = monitor.report_unhealthy(
-                HealthComponent.PROVIDER, "provider.circuit_open", detail
+                HealthComponent.PROVIDER, "provider.circuit_open"
             )
             self.assertIsNone(repeated)
-        # Detail text is never the identity: still exactly one alert.
+        monitor.drain()
         self.assertEqual(len(sink.received), 1)
         self.assertEqual(len(monitor.history()), 1)
+
+    def test_free_text_cannot_enter_a_transition(self) -> None:
+        sink = RecordingSink()
+        monitor = make_monitor(sink)
+        with self.assertRaises(TypeError):
+            monitor.report_unhealthy(
+                HealthComponent.PROVIDER,
+                "provider.circuit_open",
+                "password=hunter2 caller=+54911SECRET",  # type: ignore[call-arg]
+            )
+        self.assertEqual(monitor.history(), ())
+        monitor.drain()
+        self.assertEqual(sink.received, [])
 
     def test_recovery_emits_once_then_silence(self) -> None:
         sink = RecordingSink()
         monitor = make_monitor(sink)
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
         recovered = monitor.report_recovered(
             HealthComponent.PROVIDER, "provider.circuit_open"
         )
         self.assertIsNotNone(recovered)
         self.assertEqual(recovered.kind, TransitionKind.RECOVERED)
+        monitor.drain()
         self.assertEqual(len(sink.received), 2)
         self.assertIsNone(
             monitor.report_recovered(HealthComponent.PROVIDER, "provider.circuit_open")
         )
+        monitor.drain()
         self.assertEqual(len(sink.received), 2)
 
     def test_recovery_without_prior_unhealthy_emits_nothing(self) -> None:
@@ -109,24 +127,26 @@ class EdgeTriggeringTest(unittest.TestCase):
         sink = RecordingSink()
         monitor = make_monitor(sink, notify_recovery=False)
         monitor.report_unhealthy(
-            HealthComponent.RUNTIME, "runtime.history_unavailable", "disk full"
+            HealthComponent.RUNTIME, "runtime.history_unavailable"
         )
+        monitor.drain()
         self.assertEqual(len(sink.received), 1)
         recovered = monitor.report_recovered(
             HealthComponent.RUNTIME, "runtime.history_unavailable"
         )
         self.assertIsNotNone(recovered)
         # Local record exists; the external sink is not notified.
+        monitor.drain()
         self.assertEqual(len(sink.received), 1)
         self.assertEqual(len(monitor.history()), 2)
 
     def test_conditions_are_tracked_per_component_and_code(self) -> None:
         monitor = make_monitor()
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
         monitor.report_unhealthy(
-            HealthComponent.RUNTIME, "runtime.history_unavailable", "down"
+            HealthComponent.RUNTIME, "runtime.history_unavailable"
         )
         active = {(c.component, c.code) for c in monitor.active_conditions()}
         self.assertEqual(
@@ -143,18 +163,34 @@ class EdgeTriggeringTest(unittest.TestCase):
         )
 
     def test_transition_carries_stable_identity_and_timestamp(self) -> None:
+        from receptionist.alerting import SERVICE_NAME, TRANSITION_SCHEMA_VERSION
+
         clock = FakeClock(start=1234.5)
         monitor = HealthMonitor(clock=clock, sinks=[])
         transition = monitor.report_unhealthy(
-            HealthComponent.CONFIGURATION, "config.unavailable", "db locked"
+            HealthComponent.CONFIGURATION, "config.unavailable"
         )
         assert transition is not None
         self.assertEqual(transition.timestamp, 1234.5)
         self.assertEqual(transition.component, HealthComponent.CONFIGURATION)
         self.assertEqual(transition.code, "config.unavailable")
-        self.assertEqual(transition.detail, "db locked")
-        self.assertTrue(transition.service)
-        self.assertGreaterEqual(transition.schema_version, 1)
+        self.assertEqual(transition.detail, "configuration authority unreadable")
+        self.assertEqual(transition.service, SERVICE_NAME)
+        self.assertEqual(transition.schema_version, TRANSITION_SCHEMA_VERSION)
+
+    def test_transitions_are_emitted_as_structured_logs(self) -> None:
+        import json
+
+        monitor = make_monitor()
+        with self.assertLogs("virtual-receptionist.health", level="INFO") as logs:
+            monitor.report_unhealthy(
+                HealthComponent.CAPACITY, "capacity.saturated"
+            )
+        (line,) = [r for r in logs.output if "health_transition" in r]
+        payload = json.loads(line.split("health_transition ", 1)[1])
+        self.assertEqual(payload["component"], "capacity")
+        self.assertEqual(payload["code"], "capacity.saturated")
+        self.assertEqual(payload["status"], "unhealthy")
 
 
 class FanOutIsolationTest(unittest.TestCase):
@@ -164,8 +200,9 @@ class FanOutIsolationTest(unittest.TestCase):
         third = RecordingSink("c")
         monitor = make_monitor(first, failing, third)
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
+        monitor.drain()
         self.assertEqual(len(first.received), 1)
         self.assertEqual(failing.attempts, 1)
         self.assertEqual(len(third.received), 1)
@@ -175,12 +212,13 @@ class FanOutIsolationTest(unittest.TestCase):
         failing = RaisingSink("b")
         monitor = make_monitor(first, failing)
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
-        # The failure is recorded locally exactly once...
+        monitor.drain()
+        # The failure is recorded locally exactly once, by position...
         diagnostics = monitor.delivery_diagnostics()
         self.assertEqual(len(diagnostics), 1)
-        self.assertEqual(diagnostics[0].sink_name, "b")
+        self.assertEqual(diagnostics[0].sink_name, "sink-1")
         # ...and never fanned out as a second external alert.
         self.assertEqual(len(first.received), 1)
         # No recursion: a failing sink never triggers further delivery.
@@ -188,27 +226,63 @@ class FanOutIsolationTest(unittest.TestCase):
 
     def test_diagnostic_never_carries_exception_strings(self) -> None:
         class LeakySink:
-            name = "leaky"
-
             def send(self, transition: HealthTransition) -> None:
                 raise RuntimeError("auth failed for SUPER_SECRET_123")
 
         monitor = make_monitor(RecordingSink(), LeakySink())
         monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
+        monitor.drain()
         diagnostics = monitor.delivery_diagnostics()
         self.assertEqual(len(diagnostics), 1)
         self.assertNotIn("SUPER_SECRET_123", repr(diagnostics[0]))
-        self.assertNotIn("SUPER_SECRET_123", diagnostics[0].error_kind)
+
+    def test_hostile_sink_name_never_reaches_diagnostics(self) -> None:
+        class HostileName:
+            @property
+            def name(self):  # noqa: D102 (intentionally hostile)
+                return "hook SMTP_SECRET_ABC"
+
+            def send(self, transition: HealthTransition) -> None:
+                raise RuntimeError("down")
+
+        monitor = make_monitor(RecordingSink(), HostileName())
+        monitor.report_unhealthy(
+            HealthComponent.PROVIDER, "provider.circuit_open"
+        )
+        monitor.drain()
+        diagnostics = monitor.delivery_diagnostics()
+        self.assertEqual(len(diagnostics), 1)
+        blob = repr(diagnostics) + repr(monitor.history())
+        self.assertNotIn("SMTP_SECRET_ABC", blob)
+
+    def test_broken_clock_none_sink_and_missing_send_are_contained(self) -> None:
+        class BrokenClock:
+            def now(self) -> float:
+                raise RuntimeError("clock broken")
+
+        class NoSend:
+            name = "nosend"
+
+        monitor = HealthMonitor(clock=BrokenClock(), sinks=[RecordingSink(), None, NoSend()])  # type: ignore[list-item]
+        transition = monitor.report_unhealthy(
+            HealthComponent.CAPACITY, "capacity.saturated"
+        )
+        assert transition is not None
+        self.assertEqual(transition.timestamp, 0.0)
+        monitor.drain()
+        # None filtered, missing send diagnosed, recorder still served.
+        self.assertEqual(len(monitor.delivery_diagnostics()), 1)
 
     def test_local_record_exists_even_when_every_sink_fails(self) -> None:
         monitor = make_monitor(RaisingSink("a"), RaisingSink("b"))
         transition = monitor.report_unhealthy(
-            HealthComponent.CONFIGURATION, "config.unavailable", "down"
+            HealthComponent.CONFIGURATION, "config.unavailable"
         )
         self.assertIsNotNone(transition)
         self.assertEqual(len(monitor.history()), 1)
+        monitor.drain()
         self.assertEqual(len(monitor.delivery_diagnostics()), 2)
 
     def test_sink_order_is_stable(self) -> None:
@@ -223,9 +297,29 @@ class FanOutIsolationTest(unittest.TestCase):
 
         monitor = make_monitor(OrderedSink("one"), OrderedSink("two"), OrderedSink("three"))
         monitor.report_unhealthy(
-            HealthComponent.CAPACITY, "capacity.saturated", "full"
+            HealthComponent.CAPACITY, "capacity.saturated"
         )
+        monitor.drain()
         self.assertEqual(order, ["one", "two", "three"])
+
+    def test_slow_sinks_never_block_the_reporter(self) -> None:
+        import time
+
+        class SlowSink:
+            name = "slow"
+
+            def send(self, transition: HealthTransition) -> None:
+                time.sleep(0.3)
+
+        monitor = make_monitor(SlowSink(), SlowSink())
+        started = time.monotonic()
+        monitor.report_unhealthy(
+            HealthComponent.PROVIDER, "provider.circuit_open"
+        )
+        elapsed = time.monotonic() - started
+        # Two 0.3 s deliveries would stall a synchronous reporter ≥ 0.6 s.
+        self.assertLess(elapsed, 0.3)
+        monitor.drain()
 
 
 class FakeSmtpTransport:
@@ -299,7 +393,6 @@ class EmailSinkTest(unittest.TestCase):
                 timeout_seconds=7.0,
             ),
         )
-        self.assertEqual(sink.name, "email")
         sink.send(unhealthy_transition())
         (sent,) = transport.sent
         self.assertEqual(sent["sender"], "recepcionista@example.com")
@@ -345,7 +438,6 @@ class WebhookSinkTest(unittest.TestCase):
                 timeout_seconds=5.0,
             ),
         )
-        self.assertEqual(sink.name, "webhook")
         sink.send(unhealthy_transition())
         (post,) = transport.posts
         # The URL comes only from trusted configuration, never the event.
@@ -379,12 +471,73 @@ class WebhookSinkTest(unittest.TestCase):
                 component=HealthComponent.RUNTIME,
                 code="runtime.audit_unavailable",
                 kind=TransitionKind.UNHEALTHY,
-                detail="write failed",
+                detail="audit write failed",
             )
         )
         (post,) = transport.posts
         self.assertEqual(post["url"], "https://ops.example.com/hooks/x")
         self.assertNotIn("+34910000001", repr(post["payload"]))
+
+    def test_redirect_never_carries_authorization_off_host(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from receptionist.alerting import UrllibTransport
+
+        seen: list[dict] = []
+
+        class Target(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                seen.append(dict(self.headers))
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        class Redirector(BaseHTTPRequestHandler):
+            target = ""
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                self.send_response(302)
+                self.send_header("Location", self.target)
+                self.end_headers()
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        target_server = HTTPServer(("127.0.0.1", 0), Target)
+        redirect_server = HTTPServer(("127.0.0.1", 0), Redirector)
+        Redirector.target = (
+            f"http://127.0.0.1:{target_server.server_port}/stolen"
+        )
+        for server in (target_server, redirect_server):
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+        try:
+            transport = UrllibTransport()
+            sink = WebhookSink(
+                transport=transport,
+                settings=WebhookSettings(
+                    enabled=True,
+                    url=f"http://127.0.0.1:{redirect_server.server_port}/hook",
+                    auth_token="SUPER_SECRET_123",
+                ),
+            )
+            with self.assertRaises(Exception):
+                sink.send(unhealthy_transition())
+            # The redirect target never receives the request at all.
+            self.assertEqual(seen, [])
+        finally:
+            target_server.shutdown()
+            redirect_server.shutdown()
 
 
 class TelegramSinkTest(unittest.TestCase):
@@ -399,7 +552,6 @@ class TelegramSinkTest(unittest.TestCase):
                 timeout_seconds=5.0,
             ),
         )
-        self.assertEqual(sink.name, "telegram")
         sink.send(unhealthy_transition())
         (post,) = transport.posts
         # Token is transport addressing only, never rendered content.
@@ -411,6 +563,86 @@ class TelegramSinkTest(unittest.TestCase):
         self.assertIn("provider.circuit_open", text)
         self.assertNotIn("+34910000001", text)
         self.assertLessEqual(len(text), 400)
+
+
+class SettingsReprTest(unittest.TestCase):
+    def test_secrets_redacted_from_repr_and_str(self) -> None:
+        from receptionist.alerting import AlertSettings
+
+        settings = AlertSettings(
+            email=EmailSettings(password="SMTP_SECRET_ABC"),
+            webhook=WebhookSettings(
+                url="https://h/x", auth_token="WEBHOOK_SECRET_DEF"
+            ),
+            telegram=TelegramSettings(bot_token="TELEGRAM_SECRET_GHI", chat_id="1"),
+        )
+        for text in (repr(settings), str(settings)):
+            self.assertNotIn("SMTP_SECRET_ABC", text)
+            self.assertNotIn("WEBHOOK_SECRET_DEF", text)
+            self.assertNotIn("TELEGRAM_SECRET_GHI", text)
+        for piece in (
+            repr(settings.email),
+            str(settings.email),
+            repr(settings.webhook),
+            str(settings.webhook),
+            repr(settings.telegram),
+            str(settings.telegram),
+        ):
+            self.assertNotIn("SECRET", piece)
+        # Channels and flags stay visible for operations.
+        self.assertIn("email(enabled=False)", repr(settings))
+        self.assertIn("notify_recovery=True", repr(settings))
+
+    def test_channel_validation_ranges(self) -> None:
+        from receptionist.alerting import AlertError, AlertSettings
+
+        smtp = FakeSmtpTransport()
+        http = FakeHttpTransport()
+        bad = [
+            AlertSettings(
+                email=EmailSettings(
+                    enabled=True, host="h", sender="s", recipients=("r",), port=0
+                )
+            ),
+            AlertSettings(
+                email=EmailSettings(
+                    enabled=True, host="h", sender="s", recipients=("r",), port=70000
+                )
+            ),
+            AlertSettings(
+                email=EmailSettings(
+                    enabled=True, host="h", sender="s", recipients=("  ",),
+                    timeout_seconds=0,
+                )
+            ),
+            AlertSettings(webhook=WebhookSettings(enabled=True, url="ftp://x/y")),
+            AlertSettings(
+                telegram=TelegramSettings(enabled=True, bot_token="t", chat_id="  ")
+            ),
+        ]
+        for settings in bad:
+            with self.assertRaises(AlertError):
+                build_alert_sinks(settings, smtp_transport=smtp, http_transport=http)
+
+    def test_build_monitor_wires_settings_end_to_end(self) -> None:
+        from receptionist.alerting import AlertSettings, build_monitor
+
+        http = FakeHttpTransport()
+        monitor = build_monitor(
+            AlertSettings(
+                webhook=WebhookSettings(enabled=True, url="https://ops.example.com/h"),
+                notify_recovery=False,
+            ),
+            FakeClock(),
+            http_transport=http,
+        )
+        self.assertFalse(monitor.notify_recovery)
+        monitor.report_unhealthy(HealthComponent.PROVIDER, "provider.circuit_open")
+        monitor.drain()
+        self.assertEqual(len(http.posts), 1)
+        monitor.report_recovered(HealthComponent.PROVIDER, "provider.circuit_open")
+        monitor.drain()
+        self.assertEqual(len(http.posts), 1)
 
 
 class AlertConfigTest(unittest.TestCase):
@@ -524,10 +756,9 @@ class CoreAlertIntegrationTest(unittest.TestCase):
     """The core reports subsystem transitions; edge-triggering, fan-out,
     and sanitization hold end to end. Deterministic via FakeClock."""
 
-    def make_core(self, sinks=None, resilience=None, **kwargs):
+    def make_core(self, sinks=None, resilience=None, config_repo=None, **kwargs):
         from receptionist.config import ConfigService, InMemoryConfigRepository
         from receptionist.core import ReceptionistCore
-        from receptionist.health import HealthStatus as _H  # noqa: F401
         from receptionist.persistence import (
             InMemoryAuditLog,
             InMemoryCallRepository,
@@ -559,7 +790,8 @@ class CoreAlertIntegrationTest(unittest.TestCase):
             telephony=telephony,
             voice=voice,
             config_service=ConfigService(
-                InMemoryConfigRepository(
+                config_repo
+                or InMemoryConfigRepository(
                     {
                         "greeting": "Bienvenido",
                         "language": "es",
@@ -584,12 +816,12 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         core.start()
         return core, telephony, voice, clock, monitor
 
-    def open_breaker(self, core, telephony, voice):
+    def open_breaker(self, core, telephony, voice, calls=2):
         from receptionist.boundaries import ProviderFailure, ProviderFailureCategory
         from receptionist.boundaries import TransferResult
 
-        for caller in ("+34910000001", "+34910000002"):
-            session = core.incoming_call(caller)
+        for n in range(calls):
+            session = core.incoming_call(f"+3491000000{n}")
             current = voice.sessions[session.call_id]
             current.finish_playback(session.current_turn)
             current.deliver_caller_speech("hola")
@@ -598,22 +830,6 @@ class CoreAlertIntegrationTest(unittest.TestCase):
                 turn, ProviderFailure(category=ProviderFailureCategory.TIMEOUT)
             )
             telephony.complete_transfer(session.call_id, TransferResult.ACCEPTED_BY_PBX)
-        assert core.breaker.is_open
-
-    def open_breaker_once(self, core, telephony, voice):
-        """Single terminal failure; for breakers with threshold 1."""
-        from receptionist.boundaries import ProviderFailure, ProviderFailureCategory
-        from receptionist.boundaries import TransferResult
-
-        session = core.incoming_call("+34910000001")
-        current = voice.sessions[session.call_id]
-        current.finish_playback(session.current_turn)
-        current.deliver_caller_speech("hola")
-        turn = session.current_turn
-        current.deliver_failure(
-            turn, ProviderFailure(category=ProviderFailureCategory.TIMEOUT)
-        )
-        telephony.complete_transfer(session.call_id, TransferResult.ACCEPTED_BY_PBX)
         assert core.breaker.is_open
 
     def test_breaker_alerts_once_then_recovery(self) -> None:
@@ -636,6 +852,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
             turn, ProviderFailure(category=ProviderFailureCategory.TIMEOUT)
         )
         telephony.complete_transfer(first.call_id, TransferResult.ACCEPTED_BY_PBX)
+        monitor.drain()
         self.assertEqual(sink.received, [])
         # Threshold opens: exactly one provider transition...
         second = core.incoming_call("+34910000002")
@@ -648,6 +865,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         )
         telephony.complete_transfer(second.call_id, TransferResult.ACCEPTED_BY_PBX)
         core.tick()
+        monitor.drain()
         provider_alerts = [
             t for t in sink.received if t.code == "provider.circuit_open"
         ]
@@ -658,12 +876,14 @@ class CoreAlertIntegrationTest(unittest.TestCase):
             telephony.complete_transfer(
                 bypassed.call_id, TransferResult.ACCEPTED_BY_PBX
             )
+        monitor.drain()
         self.assertEqual(
             len([t for t in sink.received if t.code == "provider.circuit_open"]), 1
         )
         # Successful probe: exactly one recovery.
         clock.advance(60.0)
         self.assertTrue(core.report_provider_probe(True))
+        monitor.drain()
         recoveries = [
             t
             for t in sink.received
@@ -690,11 +910,12 @@ class CoreAlertIntegrationTest(unittest.TestCase):
             ),
             calls=failing_calls,
         )
-        self.open_breaker_once(core, telephony, voice)
+        self.open_breaker(core, telephony, voice, calls=1)
         core.tick()
         # Runtime outage on top of the open provider.
         failing = core.incoming_call("+34910000009")
         telephony.complete_transfer(failing.call_id, TransferResult.ACCEPTED_BY_PBX)
+        monitor.drain()
         codes = {(t.component, t.code, t.kind) for t in sink.received}
         self.assertIn(
             (HealthComponent.PROVIDER, "provider.circuit_open", TransitionKind.UNHEALTHY),
@@ -712,6 +933,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         # and no global READY recovery is fabricated.
         clock.advance(60.0)
         self.assertTrue(core.report_provider_probe(True))
+        monitor.drain()
         kinds = {
             (t.code, t.kind)
             for t in sink.received
@@ -731,14 +953,27 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         from receptionist.config import ConfigService
         from receptionist.health import HealthStatus
 
-        from fakes import RaisingConfigRepository
-
         sink = RecordingSink()
-        core, telephony, voice, clock, monitor = self.make_core(sinks=[sink])
+
+        class MutableConfigRepository:
+            def __init__(self) -> None:
+                self.broken = False
+                self.values = {"greeting": "Bienvenido", "language": "es"}
+
+            def get(self, key: str):
+                if self.broken:
+                    raise RuntimeError("config.db lost")
+                return self.values.get(key)
+
+        repository = MutableConfigRepository()
+        core, telephony, voice, clock, monitor = self.make_core(
+            sinks=[sink], config_repo=repository
+        )
         live = core.incoming_call("+34910000001")
-        core._config = ConfigService(RaisingConfigRepository(RuntimeError("down")))
+        repository.broken = True
         refused = core.incoming_call("+34910000002")
         self.assertIn(refused.call_id, telephony.rejected)
+        monitor.drain()
         config_alerts = [
             t for t in sink.received if t.code == "config.unavailable"
         ]
@@ -746,16 +981,14 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         # Repeated refusals while still down: no more alerts.
         for _ in range(5):
             core.incoming_call("+34910000003")
+        monitor.drain()
         self.assertEqual(
             len([t for t in sink.received if t.code == "config.unavailable"]), 1
         )
         # Restore: exactly one recovery.
-        from receptionist.config import InMemoryConfigRepository
-
-        core._config = ConfigService(
-            InMemoryConfigRepository({"greeting": "Bienvenido", "language": "es"})
-        )
+        repository.broken = False
         core.incoming_call("+34910000004")
+        monitor.drain()
         recoveries = [
             t
             for t in sink.received
@@ -764,6 +997,47 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         self.assertEqual(len(recoveries), 1)
         self.assertEqual(core.health.status, HealthStatus.READY)
         telephony.simulate_caller_hangup(live.call_id)
+
+    def test_config_cross_transitions(self) -> None:
+        """unavailable -> available+incomplete -> complete, and back."""
+        from receptionist.health import HealthStatus
+
+        sink = RecordingSink()
+
+        class MutableConfigRepository:
+            def __init__(self) -> None:
+                self.broken = False
+                self.values = {"greeting": "Bienvenido", "language": "es"}
+
+            def get(self, key: str):
+                if self.broken:
+                    raise RuntimeError("config.db lost")
+                return self.values.get(key)
+
+        repository = MutableConfigRepository()
+        core, telephony, voice, clock, monitor = self.make_core(
+            sinks=[sink], config_repo=repository
+        )
+        # DB back but a required key gone: available yet incomplete.
+        repository.broken = True
+        core.incoming_call("+34910000001")
+        repository.broken = False
+        repository.values.pop("language")
+        refused = core.incoming_call("+34910000002")
+        monitor.drain()
+        self.assertIn(refused.call_id, telephony.rejected)
+        self.assertEqual(core.health.status, HealthStatus.NOT_READY)
+        self.assertNotIn(refused.call_id, voice.sessions)
+        codes = {(t.code, t.kind) for t in sink.received}
+        self.assertIn(("config.unavailable", TransitionKind.RECOVERED), codes)
+        self.assertIn(("config.missing_required", TransitionKind.UNHEALTHY), codes)
+        # Operator fixes config at runtime: recovery, no hung alert.
+        repository.values["language"] = "es"
+        revived = core.incoming_call("+34910000003")
+        monitor.drain()
+        self.assertIn(revived.call_id, voice.sessions)
+        codes = {(t.code, t.kind) for t in sink.received}
+        self.assertIn(("config.missing_required", TransitionKind.RECOVERED), codes)
 
     def test_runtime_outage_alerts_once_and_recovers_on_success(self) -> None:
         from receptionist.boundaries import StoreUnavailableError
@@ -780,6 +1054,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         for caller in ("+34910000001", "+34910000002"):
             session = core.incoming_call(caller)
             telephony.simulate_caller_hangup(session.call_id)
+        monitor.drain()
         history_alerts = [
             t for t in sink.received if t.code == "runtime.history_unavailable"
         ]
@@ -788,6 +1063,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         failing_calls.fail_save = None
         healed = core.incoming_call("+34910000003")
         telephony.simulate_caller_hangup(healed.call_id)
+        monitor.drain()
         recoveries = [
             t
             for t in sink.received
@@ -810,6 +1086,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         session = core.incoming_call("+34910000001")
         current = voice.sessions[session.call_id]
         self.assertTrue(current.spoken)
+        monitor.drain()
         transcript_alerts = [
             t for t in sink.received if t.code == "transcript.unavailable"
         ]
@@ -818,6 +1095,7 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         failing_transcripts.fail_append = None
         current.finish_playback(session.current_turn)
         current.deliver_caller_speech("hola")
+        monitor.drain()
         recoveries = [
             t
             for t in sink.received
@@ -866,10 +1144,13 @@ class CoreAlertIntegrationTest(unittest.TestCase):
 
         failing = FailingCallRepository()
         failing.fail_save = StoreUnavailableError("history disk full")
-        core._runtime.calls = failing
-        doomed = core.incoming_call("+34910000003")
-        telephony.simulate_caller_hangup(doomed.call_id)
-        self.assertTrue(monitor.delivery_diagnostics())
+        failing_core, failing_telephony, _, _, failing_monitor = self.make_core(
+            sinks=[RaisingSink("dead-a"), RaisingSink("dead-b")], calls=failing
+        )
+        doomed = failing_core.incoming_call("+34910000003")
+        failing_telephony.simulate_caller_hangup(doomed.call_id)
+        failing_monitor.drain()
+        self.assertTrue(failing_monitor.delivery_diagnostics())
         from receptionist.call_session import CallState
 
         self.assertEqual(doomed.state, CallState.ENDED)
@@ -959,27 +1240,176 @@ class CoreAlertIntegrationTest(unittest.TestCase):
         first = core.incoming_call("+34910000001")
         saturated = core.incoming_call("+34910000002")
         self.assertEqual(saturated.state, CallState.FALLBACK_HANDOFF)
+        monitor.drain()
         capacity_alerts = [
             t for t in sink.received if t.code == "capacity.saturated"
         ]
         self.assertEqual(len(capacity_alerts), 1)
-        telephony.complete_transfer(saturated.call_id, TransferResult.ACCEPTED_BY_PBX)
+        # Recovery fires when the slot frees, not on later traffic.
         telephony.simulate_caller_hangup(first.call_id)
-        third = core.incoming_call("+34910000003")
-        self.assertIn(third.call_id, voice.sessions)
+        monitor.drain()
         recoveries = [
             t
             for t in sink.received
             if t.code == "capacity.saturated" and t.kind == TransitionKind.RECOVERED
         ]
         self.assertEqual(len(recoveries), 1)
+        telephony.complete_transfer(saturated.call_id, TransferResult.ACCEPTED_BY_PBX)
+        third = core.incoming_call("+34910000003")
+        self.assertIn(third.call_id, voice.sessions)
+        monitor.drain()
+        self.assertEqual(
+            len([t for t in sink.received if t.code == "capacity.saturated"]), 2
+        )
+
+    def test_aggregate_agrees_with_monitor_provider_then_runtime(self) -> None:
+        """Order A→B→recover A: no RECOVERED alert with DEGRADED aggregate,
+        no READY aggregate with an active condition."""
+        from receptionist.boundaries import StoreUnavailableError
+        from receptionist.boundaries import TransferResult
+        from receptionist.health import HealthStatus
+        from receptionist.resilience import ResilienceConfig
+
+        from fakes import FailingCallRepository
+
+        sink = RecordingSink()
+        failing_calls = FailingCallRepository()
+        failing_calls.fail_save = StoreUnavailableError("history disk full")
+        core, telephony, voice, clock, monitor = self.make_core(
+            sinks=[sink],
+            resilience=ResilienceConfig(
+                provider_retries=0, breaker_threshold=1,
+                breaker_probe_cooldown_seconds=60.0,
+            ),
+            calls=failing_calls,
+        )
+        self.open_breaker(core, telephony, voice, calls=1)
+        failing = core.incoming_call("+34910000009")
+        telephony.complete_transfer(failing.call_id, TransferResult.ACCEPTED_BY_PBX)
+        self.assertEqual(core.health.status, HealthStatus.DEGRADED)
+        clock.advance(60.0)
+        self.assertTrue(core.report_provider_probe(True))
+        monitor.drain()
+        # Provider recovery emitted, but the aggregate still degrades on
+        # the active runtime condition: never a false global recovery.
+        self.assertTrue(monitor.active_conditions())
+        self.assertEqual(core.health.status, HealthStatus.DEGRADED)
+        self.assertNotIn(
+            (HealthComponent.RUNTIME, "runtime.history_unavailable", TransitionKind.RECOVERED),
+            {(t.component, t.code, t.kind) for t in sink.received},
+        )
+        # Runtime heals too: empty conditions agree with READY.
+        failing_calls.fail_save = None
+        healed = core.incoming_call("+34910000010")
+        telephony.simulate_caller_hangup(healed.call_id)
+        monitor.drain()
+        self.assertEqual(monitor.active_conditions(), ())
+        self.assertEqual(core.health.status, HealthStatus.READY)
+
+    def test_aggregate_agrees_with_monitor_runtime_then_provider(self) -> None:
+        """Order B→A→recover B: runtime recovery first, provider still open."""
+        from receptionist.boundaries import StoreUnavailableError
+        from receptionist.boundaries import TransferResult
+        from receptionist.health import HealthStatus
+        from receptionist.resilience import ResilienceConfig
+
+        from fakes import FailingCallRepository
+
+        sink = RecordingSink()
+        failing_calls = FailingCallRepository()
+        failing_calls.fail_save = StoreUnavailableError("history disk full")
+        core, telephony, voice, clock, monitor = self.make_core(
+            sinks=[sink],
+            resilience=ResilienceConfig(
+                provider_retries=0, breaker_threshold=1,
+                breaker_probe_cooldown_seconds=60.0,
+            ),
+            calls=failing_calls,
+        )
+        doomed = core.incoming_call("+34910000001")
+        telephony.simulate_caller_hangup(doomed.call_id)
+        self.open_breaker(core, telephony, voice, calls=1)
+        core.tick()
+        self.assertEqual(core.health.status, HealthStatus.DEGRADED)
+        # Runtime heals while the provider stays open: still DEGRADED.
+        failing_calls.fail_save = None
+        healed = core.incoming_call("+34910000002")
+        telephony.simulate_caller_hangup(healed.call_id)
+        monitor.drain()
+        active = {(c.component, c.code) for c in monitor.active_conditions()}
+        self.assertNotIn(
+            (HealthComponent.RUNTIME, "runtime.history_unavailable"), active
+        )
+        self.assertIn((HealthComponent.PROVIDER, "provider.circuit_open"), active)
+        self.assertEqual(core.health.status, HealthStatus.DEGRADED)
+        # Provider heals: empty agrees with READY.
+        clock.advance(60.0)
+        self.assertTrue(core.report_provider_probe(True))
+        monitor.drain()
+        self.assertEqual(monitor.active_conditions(), ())
+        self.assertEqual(core.health.status, HealthStatus.READY)
+
+    def test_hostile_sinks_cannot_break_admission(self) -> None:
+        from receptionist.call_session import CallState
+
+        class BadName:
+            @property
+            def name(self):
+                raise RuntimeError("name exploded")
+
+            def send(self, transition: HealthTransition) -> None:
+                raise RuntimeError("delivery down")
+
+        core, telephony, voice, clock, monitor = self.make_core(
+            sinks=[BadName(), None]
+        )
+        first = core.incoming_call("+34910000001")
+        self.assertIn(first.call_id, voice.sessions)
+        saturated = core.incoming_call("+34910000002")
+        # State transitioned and no exception escaped, despite hostile sinks.
+        self.assertEqual(saturated.state, CallState.FALLBACK_HANDOFF)
+        monitor.drain()
+        self.assertEqual(len(monitor.delivery_diagnostics()), 1)
+
+    def test_productive_wiring_from_config_db_to_sink(self) -> None:
+        import os
+        import sqlite3
+        import tempfile
+
+        from receptionist.alerting import build_monitor
+        from receptionist.config import ConfigService, InMemoryConfigRepository
+        from receptionist.sqlite_storage import SQLiteAlertRepository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = SQLiteAlertRepository(
+                sqlite3.connect(os.path.join(tmp, "config.db"))
+            )
+            repo.save_webhook(
+                WebhookSettings(enabled=True, url="https://ops.example.com/prod")
+            )
+            service = ConfigService(
+                InMemoryConfigRepository({"greeting": "h", "language": "es"}),
+                alerts=repo,
+            )
+            http = FakeHttpTransport()
+            monitor = build_monitor(
+                service.alert_settings(), FakeClock(), http_transport=http
+            )
+            monitor.report_unhealthy(
+                HealthComponent.PROVIDER, "provider.circuit_open"
+            )
+            monitor.drain()
+            (post,) = http.posts
+            self.assertEqual(post["url"], "https://ops.example.com/prod")
+            self.assertEqual(post["payload"]["code"], "provider.circuit_open")
+            monitor.close()
 
     def test_transition_timestamps_follow_fake_clock(self) -> None:
         sink = RecordingSink()
         core, telephony, voice, clock, monitor = self.make_core(sinks=[sink])
         clock.advance(42.0)
         transition = monitor.report_unhealthy(
-            HealthComponent.PROVIDER, "provider.circuit_open", "open"
+            HealthComponent.PROVIDER, "provider.circuit_open"
         )
         assert transition is not None
         self.assertEqual(transition.timestamp, 42.0)
