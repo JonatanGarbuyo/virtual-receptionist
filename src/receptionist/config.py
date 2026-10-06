@@ -30,6 +30,7 @@ VOICE_STT_EXECUTABLE_KEY = "voice.stt_executable"
 VOICE_LLM_EXECUTABLE_KEY = "voice.llm_executable"
 VOICE_TTS_VOICE_KEY = "voice.tts_voice"
 VOICE_TTS_SPEAKER_KEY = "voice.tts_speaker_id"
+VOICE_LLM_THREADS_KEY = "voice.llm_threads"
 VOICE_MAX_CONTEXT_CHARS_KEY = "voice.max_context_chars"
 VOICE_MAX_SPOKEN_CHARS_KEY = "voice.max_spoken_chars"
 
@@ -136,6 +137,7 @@ class ConfigService:
             tts_voice=(get(VOICE_TTS_VOICE_KEY) or "es-female-1").strip()
             or "es-female-1",
             tts_speaker_id=_non_negative_int(VOICE_TTS_SPEAKER_KEY, 0),
+            llm_threads=_positive_int(VOICE_LLM_THREADS_KEY, 4),
             max_context_chars=_positive_int(VOICE_MAX_CONTEXT_CHARS_KEY, 9000),
             max_spoken_chars=_positive_int(VOICE_MAX_SPOKEN_CHARS_KEY, 500),
         )

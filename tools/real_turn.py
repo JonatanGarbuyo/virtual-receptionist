@@ -49,6 +49,7 @@ def main() -> int:
     parser.add_argument("--stt-exe", default="whisper-server")
     parser.add_argument("--llm-exe", default="llama-server")
     parser.add_argument("--tts-voice", default="es-female-1")
+    parser.add_argument("--llm-threads", type=int, default=4)
     parser.add_argument("--profile-id", default="cascaded-cpu-baseline-v1")
     args = parser.parse_args()
 
@@ -84,6 +85,7 @@ def main() -> int:
         stt_executable=args.stt_exe,
         llm_executable=args.llm_exe,
         tts_voice=args.tts_voice,
+        llm_threads=args.llm_threads,
     )
     try:
         backend = build_cascaded_backend(profile)
@@ -148,17 +150,37 @@ def main() -> int:
     drained = session.wait_until_idle(timeout=300.0)
     total_ms = (time.monotonic() - started) * 1000.0
     timings = session.last_timings
+    memory = _measure_tree(backend)
     backend.shutdown()
 
-    def _rusage() -> dict[str, int]:
-        try:
-            import resource
+    def _rss_kb(pid: int | str) -> int:
+    """Resident set size from /proc (Linux-only evidence runner)."""
+    try:
+        with open(f"/proc/{pid}/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
 
-            me = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-            return {"peak_rss_kb_self": me, "peak_rss_kb_children": kids}
-        except Exception:
-            return {"peak_rss_kb_self": -1, "peak_rss_kb_children": -1}
+
+def _measure_tree(backend) -> dict[str, int]:
+    """Composite RSS while every runtime is resident: this Python
+    process (sherpa TTS lives in-process) plus both server processes.
+    Sampled after the turn, servers still warm."""
+    whisper_pid = backend._stt._server.pid
+    llama_pid = backend._llm._server.pid
+    own = _rss_kb("self")
+    whisper = _rss_kb(whisper_pid) if whisper_pid else -1
+    llama = _rss_kb(llama_pid) if llama_pid else -1
+    parts = [value for value in (own, whisper, llama) if value > 0]
+    return {
+        "rss_kb_self": own,
+        "rss_kb_whisper_server": whisper,
+        "rss_kb_llama_server": llama,
+        "rss_kb_total_estimated": sum(parts) if parts else -1,
+    }
 
     try:
         with open("/proc/meminfo") as handle:
@@ -213,7 +235,7 @@ def main() -> int:
         ),
         "total_turn_ms": round(total_ms, 1),
         "latency_band": timings.latency_band() if timings else "unknown",
-        **_rusage(),
+        **memory,
         "failures": events["failures"],
     }
     print(json.dumps(evidence, indent=2))

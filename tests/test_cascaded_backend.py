@@ -1023,8 +1023,8 @@ class ManifestIntegrityTest(unittest.TestCase):
         os.makedirs(os.path.join(root, "stt"), exist_ok=True)
         os.makedirs(os.path.join(root, "llm"), exist_ok=True)
         os.makedirs(os.path.join(root, "tts", "es-female-1"), exist_ok=True)
-        stt = os.path.join(root, "stt", "ggml-model-base.bin")
-        llm = os.path.join(root, "llm", "qwen3-1.7b-q4_k_m.gguf")
+        stt = os.path.join(root, "stt", "ggml-base.bin")
+        llm = os.path.join(root, "llm", "Qwen3-1.7B-Q4_K_M.gguf")
         tts_model = os.path.join(root, "tts", "es-female-1", "model.onnx")
         tts_tokens = os.path.join(root, "tts", "es-female-1", "tokens.txt")
         with open(stt, "wb") as handle:
@@ -1075,7 +1075,7 @@ class ManifestIntegrityTest(unittest.TestCase):
     def test_missing_model_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             document = self.write_pack(root)
-            os.unlink(os.path.join(root, "llm", "qwen3-1.7b-q4_k_m.gguf"))
+            os.unlink(os.path.join(root, "llm", "Qwen3-1.7B-Q4_K_M.gguf"))
             manifest = load_manifest(document)
             problems = verify_manifest(root, manifest)
             self.assertIn(IntegrityProblem("llm", "missing_file"), problems)
@@ -1250,7 +1250,7 @@ class ReadinessTest(unittest.TestCase):
                 tts=FakeTTSAdapter(),
                 clock=FakeClock(),
             )
-            os.unlink(os.path.join(root, "llm", "qwen3-1.7b-q4_k_m.gguf"))
+            os.unlink(os.path.join(root, "llm", "Qwen3-1.7B-Q4_K_M.gguf"))
             problems = backend.verify(manifest, root)
             self.assertIn("llm:missing_file", problems)
             self.assertFalse(backend.ready)
@@ -1583,6 +1583,8 @@ class StubRuntimeServersTest(unittest.TestCase):
         self.assertNotIn(b"output_txt", bodies)
 
     def test_llama_completion_shape_and_truncation(self) -> None:
+        import json
+
         from receptionist.cascaded import AdapterError, CancelToken
         from receptionist.boundaries import ProviderFailureCategory
 
@@ -1597,6 +1599,17 @@ class StubRuntimeServersTest(unittest.TestCase):
             self.assertEqual(len(spawns), 1)
         finally:
             adapter.close()
+        # Constrained decoding: every completion carries the strict
+        # output schema (regression for prompt-only JSON instability).
+        bodies = [body for path, body in self.requests if path == "/completion"]
+        self.assertTrue(bodies)
+        payload = json.loads(bodies[-1].decode("utf-8"))
+        schema = payload.get("json_schema")
+        self.assertIsInstance(schema, dict)
+        self.assertEqual(
+            sorted(schema.get("required", [])), ["action", "spoken_text"]
+        )
+        self.assertFalse(schema.get("additionalProperties", True))
 
     def test_caller_audio_never_touches_the_filesystem(self) -> None:
         import tempfile

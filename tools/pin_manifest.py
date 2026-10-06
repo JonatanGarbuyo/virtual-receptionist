@@ -77,6 +77,18 @@ def main(argv: list[str] | None = None) -> int:
     failed = False
     for component in manifest.components:
         names = list(component.files or (component.filename,))
+        if component.component == "tts" and names:
+            # Every consumed voice file is hashed: extend with the
+            # phonemizer data shipped inside the voice directory.
+            voice_dir = os.path.dirname(
+                resolve_trusted_path(args.model_root, names[0])
+            )
+            data_dir = os.path.join(voice_dir, "espeak-ng-data")
+            if os.path.isdir(data_dir):
+                for base, _dirs, files in os.walk(data_dir):
+                    for leaf in sorted(files):
+                        full = os.path.join(base, leaf)
+                        names.append(os.path.relpath(full, args.model_root))
         hashes = []
         sizes = []
         for name in names:

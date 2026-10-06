@@ -7,7 +7,7 @@
       "runtime": "whisper.cpp",
       "runtime_version": "",
       "model_id": "whisper-base-multilingual",
-      "filename": "stt/ggml-model-base.bin",
+      "filename": "stt/ggml-base.bin",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "size": 0,
       "arch_quant": "base",
@@ -16,7 +16,7 @@
       "source": "https://huggingface.co/ggerganov/whisper.cpp",
       "license": "MIT (OpenAI Whisper model; check upstream terms)",
       "required": true,
-      "files": ["stt/ggml-model-base.bin"],
+      "files": ["stt/ggml-base.bin"],
       "file_hashes": ["0000000000000000000000000000000000000000000000000000000000000000"]
     },
     {
@@ -24,16 +24,16 @@
       "runtime": "llama.cpp",
       "runtime_version": "",
       "model_id": "qwen3-1.7b-q4_k_m",
-      "filename": "llm/qwen3-1.7b-q4_k_m.gguf",
+      "filename": "llm/Qwen3-1.7B-Q4_K_M.gguf",
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "size": 0,
       "arch_quant": "GGUF Q4_K_M",
       "language": "multilingual",
       "voice": "",
-      "source": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF",
+      "source": "https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF",
       "license": "Apache-2.0 (Qwen; check upstream terms)",
       "required": true,
-      "files": ["llm/qwen3-1.7b-q4_k_m.gguf"],
+      "files": ["llm/Qwen3-1.7B-Q4_K_M.gguf"],
       "file_hashes": ["0000000000000000000000000000000000000000000000000000000000000000"]
     },
     {

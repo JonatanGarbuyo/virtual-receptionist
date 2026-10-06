@@ -48,6 +48,7 @@ import uuid
 import wave
 
 from receptionist.cascaded import (
+    MODEL_OUTPUT_SCHEMA,
     AdapterError,
     CancelledError,
     CancelToken,
@@ -521,6 +522,14 @@ class _ServerProcess:
         with self._lock:
             return self._process is not None and self._process.poll() is None
 
+    @property
+    def pid(self) -> int | None:
+        """OS pid of the resident server, for resource accounting."""
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                return None
+            return self._process.pid
+
     def spawn(self, argv: list[str]) -> None:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
@@ -602,16 +611,31 @@ class WhisperServerSTT:
 
     def probe_version(self) -> str:
         """Lightweight runtime identity (no serving): query `--version`
-        and parse the real upstream format. Raises AdapterError when
-        the binary cannot answer or the output is malformed."""
-        raw = query_version(self._executable, name="stt")
-        parsed = parse_whisper_version(raw)
-        if parsed is None:
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
-            )
-        self._version = format_version(parsed)
-        return self._version
+        and parse the real upstream format (`whisper.cpp version:
+        X.Y.Z`). `whisper-server` itself answers no `--version`, so a
+        same-directory `whisper-cli` sibling (same build) is accepted
+        as its identity source. Raises AdapterError when malformed."""
+        for candidate in (self._executable, self._sibling_cli()):
+            if candidate is None:
+                continue
+            try:
+                raw = query_version(candidate, name="stt")
+            except AdapterError:
+                continue
+            parsed = parse_whisper_version(raw)
+            if parsed is not None:
+                self._version = format_version(parsed)
+                return self._version
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
+        )
+
+    def _sibling_cli(self) -> str | None:
+        """Same-build `whisper-cli` next to the server binary, if any."""
+        sibling = os.path.join(os.path.dirname(self._executable), "whisper-cli")
+        if sibling != self._executable and os.path.isfile(sibling):
+            return sibling
+        return None
 
     def start(self) -> None:
         """Spawn the resident server (idempotent). The model loads here,
@@ -695,10 +719,14 @@ class LlamaServerLLM:
 
     Spawned once (`-m model --ctx-size 4096 --reasoning off --offline
     --no-webui -ngl 0 -np 1`); every turn POSTs `/completion`
-    (`prompt`, bounded `n_predict`, `cache_prompt:false`). Non-thinking
-    is enforced server-side by `--reasoning off`, so no prompt marker
-    and no discarded reasoning. CPU-only via `-ngl 0`; `--offline`
-    forbids network access from the runtime itself.
+    (`prompt`, bounded `n_predict`, `cache_prompt:false`) with the
+    strict `MODEL_OUTPUT_SCHEMA` as `json_schema`, so only
+    schema-valid documents can come back (prompt-only JSON proved
+    unstable on the real model). `parse_model_output` still
+    re-validates every document: the parser stays authoritative.
+    Non-thinking is enforced server-side by `--reasoning off`, so no
+    prompt marker and no discarded reasoning. CPU-only via `-ngl 0`;
+    `--offline` forbids network access from the runtime itself.
     """
 
     component = "llm"
@@ -817,6 +845,7 @@ class LlamaServerLLM:
                 "temperature": 0.4,
                 "cache_prompt": False,
                 "stream": False,
+                "json_schema": MODEL_OUTPUT_SCHEMA,
             },
             timeout_seconds=self._timeout,
             cancel=cancel,
@@ -944,6 +973,7 @@ def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
         executable=profile.llm_executable,
         model_path=llm_model,
         host=profile.server_host,
+        threads=profile.llm_threads,
         timeout_seconds=profile.llm_timeout_seconds,
     )
     tts = SherpaOnnxTTS(
@@ -1071,10 +1101,12 @@ class SherpaOnnxTTS:
     def _create_engine(self):
         sherpa_onnx = self._load()
         try:
+            data_dir = os.path.join(self._model_dir, "espeak-ng-data")
             vits = sherpa_onnx.OfflineTtsVitsModelConfig(
                 model=self._voice_file("model.onnx"),
                 lexicon="",
                 tokens=self._voice_file("tokens.txt"),
+                data_dir=data_dir if os.path.isdir(data_dir) else "",
             )
             config = sherpa_onnx.OfflineTtsConfig(
                 model=sherpa_onnx.OfflineTtsModelConfig(
