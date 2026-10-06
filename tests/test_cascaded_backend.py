@@ -2298,6 +2298,75 @@ class ManifestCompositionTest(unittest.TestCase):
                     )
                 )
 
+    def test_unlisted_espeak_dir_never_reaches_runtime(self) -> None:
+        """MAJOR-2: phonemizer data comes exclusively from manifest
+        entries — a physical directory that is not declared is never
+        handed to the runtime, even when it exists on disk."""
+        from receptionist.cascaded import VoiceProfile
+        from receptionist.local_runtimes import build_cascaded_backend
+        from receptionist.voice_manifest import sha256_file
+
+        with tempfile.TemporaryDirectory() as root:
+            document = self.write_custom_pack(root)
+            stray = os.path.join(root, "tts", "es-female-1", "espeak-ng-data")
+            os.makedirs(stray, exist_ok=True)
+            with open(os.path.join(stray, "unlisted.bin"), "wb") as handle:
+                handle.write(b"not-in-manifest")
+            manifest_path = os.path.join(root, "pinned.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            backend = build_cascaded_backend(
+                VoiceProfile(
+                    profile_id="test-pack",
+                    model_root=root,
+                    manifest_path=manifest_path,
+                    stt_executable="/bin/true",
+                    llm_executable="/bin/true",
+                )
+            )
+            try:
+                self.assertEqual(backend._tts._data_dir, "")
+            finally:
+                backend.shutdown()
+
+    def test_listed_espeak_dir_reaches_runtime(self) -> None:
+        from receptionist.cascaded import VoiceProfile
+        from receptionist.local_runtimes import build_cascaded_backend
+        from receptionist.voice_manifest import sha256_file
+
+        with tempfile.TemporaryDirectory() as root:
+            document = self.write_custom_pack(root)
+            listed = os.path.join(
+                root, "tts", "es-female-1", "espeak-ng-data", "phondata"
+            )
+            os.makedirs(os.path.dirname(listed), exist_ok=True)
+            with open(listed, "wb") as handle:
+                handle.write(b"declared-phonemes")
+            digest = sha256_file(listed)
+            tts = next(
+                c for c in document["components"] if c["component"] == "tts"
+            )
+            tts["files"].append("tts/es-female-1/espeak-ng-data/phondata")
+            tts["file_hashes"].append(digest)
+            manifest_path = os.path.join(root, "pinned.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            backend = build_cascaded_backend(
+                VoiceProfile(
+                    profile_id="test-pack",
+                    model_root=root,
+                    manifest_path=manifest_path,
+                    stt_executable="/bin/true",
+                    llm_executable="/bin/true",
+                )
+            )
+            try:
+                self.assertTrue(
+                    backend._tts._data_dir.endswith("tts/es-female-1/espeak-ng-data")
+                )
+            finally:
+                backend.shutdown()
+
 
 class VersionCompatGateTest(unittest.TestCase):
     """MAJOR-5: pinned runtime identity is validated before READY."""
@@ -2661,7 +2730,7 @@ class SingleSlotCancelTest(unittest.TestCase):
             )
         else:
             stt, llm, tts = (
-                FakeSTTAdapter(["primero", "segundo"]),
+                FakeSTTAdapter(["turno-%d" % index for index in range(8)]),
                 self.adapter_at("llm", **kwargs),
                 FakeTTSAdapter(),
             )
@@ -2714,6 +2783,66 @@ class SingleSlotCancelTest(unittest.TestCase):
         self.addCleanup(session.close)
         session.cancel_output(CancelReason.BARGE_IN)
         self.assertEqual(backend._llm._server.restarts, 0)
+
+    def test_recycle_survives_cancelled_finally_race(self) -> None:
+        """MAJOR-1: even when A's worker observes the socket close and
+        runs its `finally` (clearing `_inflight`) before
+        `_abort_runtimes()` runs, the sticky claim still recycles
+        exactly once — correctness never depends on thread ordering."""
+        import time
+
+        backend = self.ready_backend_for("llm")
+        adapter = backend._llm
+        listener = RecordingListener()
+        session = backend.open_session("call-1", listener)
+        self.addCleanup(session.close)
+        self.block_first = True
+        self.count = 0
+        session.push_audio(speech_frame())
+        session.commit_turn(1)  # A blocks the single slot
+        self.assertTrue(self.got_first.wait(timeout=10.0))
+        real_abort = session._abort_runtimes
+
+        def gated_abort() -> None:
+            end = time.monotonic() + 10.0
+            while adapter._inflight != 0 and time.monotonic() < end:
+                time.sleep(0.01)
+            # Forced interleaving: A's finally ran before the abort.
+            self.assertEqual(adapter._inflight, 0)
+            real_abort()
+
+        session._abort_runtimes = gated_abort  # type: ignore[method-assign]
+        try:
+            session.cancel_output(CancelReason.BARGE_IN)
+        finally:
+            session._abort_runtimes = real_abort  # type: ignore[method-assign]
+        session.push_audio(speech_frame())
+        session.commit_turn(2)
+        self.assertTrue(session.wait_until_idle(timeout=20.0))
+        self.assertEqual(adapter._server.restarts, 1)
+        self.assertEqual(len(listener.responses), 1)
+        self.assertEqual(listener.responses[0][0], 2)
+        self.assertEqual(self.count, 2)
+
+    def test_repeated_preemptions_stay_functional(self) -> None:
+        backend = self.ready_backend_for("llm")
+        adapter = backend._llm
+        listener = RecordingListener()
+        session = backend.open_session("call-1", listener)
+        self.addCleanup(session.close)
+        for round in range(1, 4):
+            self.block_first = True
+            self.count = 0
+            self.got_first.clear()
+            session.push_audio(speech_frame())
+            session.commit_turn(round * 2 - 1)
+            self.assertTrue(self.got_first.wait(timeout=10.0))
+            session.cancel_output(CancelReason.BARGE_IN)
+            session.push_audio(speech_frame())
+            session.commit_turn(round * 2)
+            self.assertTrue(session.wait_until_idle(timeout=20.0))
+            self.assertEqual(adapter._server.restarts, round)
+        self.assertEqual(len(listener.responses), 3)
 
 
 if __name__ == "__main__":

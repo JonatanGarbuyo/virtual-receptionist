@@ -388,20 +388,20 @@
   "input_seconds": 2.0,
   "stt_transcript_summary": "5 words / 33 chars",
   "llm_result": "StartMessageCapture",
-  "output_audio_bytes": 37376,
-  "output_audio_frames": 12,
-  "output_audio_seconds": 0.85,
-  "eou_to_first_audio_ms": 4459.9,
+  "output_audio_bytes": 34304,
+  "output_audio_frames": 11,
+  "output_audio_seconds": 0.78,
+  "eou_to_first_audio_ms": 4352.2,
   "stage_ms": {
-    "stt_ms": 995.6,
-    "llm_ms": 3238.0,
-    "tts_to_first_audio_ms": 226.2
+    "stt_ms": 981.3,
+    "llm_ms": 3188.6,
+    "tts_to_first_audio_ms": 182.2
   },
-  "total_turn_ms": 4460.2,
+  "total_turn_ms": 4352.7,
   "latency_band": "unhealthy",
-  "rss_kb_self": 46832,
-  "rss_kb_whisper_server": 266212,
-  "rss_kb_llama_server": 2488656,
-  "rss_kb_total_estimated": 2801700,
+  "rss_kb_self": 46796,
+  "rss_kb_whisper_server": 266232,
+  "rss_kb_llama_server": 2488652,
+  "rss_kb_total_estimated": 2801680,
   "failures": []
 }

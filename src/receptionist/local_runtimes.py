@@ -682,6 +682,7 @@ class WhisperServerSTT:
         self._lock = threading.Lock()
         self._closed = False
         self._inflight = 0
+        self._recycle_needed = False
 
     def version_info(self) -> str:
         return self._version
@@ -689,12 +690,16 @@ class WhisperServerSTT:
     def abort_inflight(self) -> bool:
         """Preempt a request actually in flight by recycling the server
         process (the only reliable cancel for runtimes that keep
-        working after a client disconnect). Returns True when a recycle
-        happened; idle cancels are a no-op returning False. Failures
-        fail closed: the adapter reports UNAVAILABLE afterwards."""
+        working after a client disconnect). The recycle claim is sticky
+        and atomic: entering a request marks it, and only a clean
+        (non-cancelled) finish clears it — a cancelled worker that runs
+        its `finally` before this call cannot erase the server-side
+        tail evidence. Returns True when a recycle happened; idle
+        cancels are a no-op returning False. Failures fail closed: the
+        adapter reports UNAVAILABLE afterwards."""
         with self._lock:
-            active = self._inflight > 0
-        if not active:
+            needs, self._recycle_needed = self._recycle_needed, False
+        if not needs:
             return False
         try:
             self._server.restart(
@@ -702,6 +707,8 @@ class WhisperServerSTT:
                 deadline_seconds=60.0,
             )
         except AdapterError as error:
+            with self._lock:
+                self._recycle_needed = True
             LOG.warning("stt recycle failed: %s", error.category.value)
             raise
         return True
@@ -760,6 +767,7 @@ class WhisperServerSTT:
         wav_bytes = _wav_16k_mono_bytes(pcm)
         with self._lock:
             self._inflight += 1
+            self._recycle_needed = True
         try:
             status, document = http_post_multipart(
                 self.base_url() + "/inference",
@@ -773,6 +781,8 @@ class WhisperServerSTT:
         finally:
             with self._lock:
                 self._inflight -= 1
+                if not cancel.cancelled:
+                    self._recycle_needed = False
         if status != 200:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, "stt inference failed"
@@ -845,6 +855,7 @@ class LlamaServerLLM:
         self._lock = threading.Lock()
         self._closed = False
         self._inflight = 0
+        self._recycle_needed = False
 
     def version_info(self) -> str:
         return self._version
@@ -856,14 +867,16 @@ class LlamaServerLLM:
         queued behind the abandoned tail; the recycle frees the slot
         deterministically. Idle cancels are a no-op returning False."""
         with self._lock:
-            active = self._inflight > 0
-        if not active:
+            needs, self._recycle_needed = self._recycle_needed, False
+        if not needs:
             return False
         try:
             self._server.restart(
                 lambda: self._check_healthy_once(), deadline_seconds=120.0
             )
         except AdapterError as error:
+            with self._lock:
+                self._recycle_needed = True
             LOG.warning("llm recycle failed: %s", error.category.value)
             raise
         return True
@@ -947,6 +960,7 @@ class LlamaServerLLM:
             )
         with self._lock:
             self._inflight += 1
+            self._recycle_needed = True
         try:
             status, document = http_post_json(
                 self.base_url() + "/completion",
@@ -964,6 +978,8 @@ class LlamaServerLLM:
         finally:
             with self._lock:
                 self._inflight -= 1
+                if not cancel.cancelled:
+                    self._recycle_needed = False
         if status != 200:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, "llm completion failed"
@@ -1078,6 +1094,17 @@ def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
         tts_voice_dir = os.path.dirname(resolve_trusted_path(root, tts_models[0]))
         if os.path.dirname(resolve_trusted_path(root, tts_tokens[0])) != tts_voice_dir:
             raise ValueError("tts entry files must share one voice directory")
+        # Phonemizer data comes exclusively from manifest-listed
+        # entries: a physical directory that is not declared is never
+        # handed to the runtime, even if it exists on disk.
+        espeak_prefix = tts_voice_dir + os.sep + "espeak-ng-data" + os.sep
+        espeak_listed = any(
+            resolve_trusted_path(root, name).startswith(espeak_prefix)
+            for name in tts_names
+        )
+        tts_data_dir = (
+            os.path.join(tts_voice_dir, "espeak-ng-data") if espeak_listed else ""
+        )
     except (ValueError, IndexError) as error:
         raise AdapterError(
             ProviderFailureCategory.UNAVAILABLE, "voice manifest invalid entry"
@@ -1103,6 +1130,7 @@ def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
         tokens_file=os.path.basename(
             next(name for name in tts_names if "token" in name.lower())
         ),
+        data_dir=tts_data_dir,
         voice=selected_voice,
         speaker_id=profile.tts_speaker_id,
         timeout_seconds=profile.tts_timeout_seconds,
@@ -1140,87 +1168,6 @@ def split_sentences(text: str, *, max_chars: int = 400) -> list[str]:
             sentences.append(chunk)
     return sentences
 
-
-class SherpaOnnxTTS:
-    """sherpa-onnx TTS via guarded optional import (stable binding).
-
-    A single serial worker thread owns the engine: `generate()` never
-    runs concurrently with another `generate()` on the same engine —
-    no timeout, barge-in, hangup, fallback, or shutdown can leave a
-    previous synthesis running alongside a new one. Synthesis is
-    sentence-chunked: first audio emits after the first sentence (never
-    after the whole utterance), cancel is observed between sentences,
-    and the profile timeout bounds the whole call. A timed-out or
-    cancelled job is marked abandoned and its late result is discarded
-    when the worker finishes it; later jobs queue strictly behind, so
-    abandonment never overlaps and never leaks: `close()` drains and
-    joins the single owned worker. (If a timeout ever required
-    recycling the worker/engine itself, that would be documented here:
-    with the serial design it does not — abandonment is isolation.)
-
-    `sherpa_onnx` is never a hard dependency: without it (or without
-    the voice files) every call fails closed UNAVAILABLE. Voice files
-    resolve only under `<model_root>/tts/<voice>/` as listed in the
-    manifest (`model.onnx`, `tokens.txt`, plus any lexicon/espeak data
-    the concrete voice consumes): `voice` selects the directory,
-    `speaker_id` the voice inside it.
-    """
-
-    component = "tts"
-
-    def __init__(
-        self,
-        *,
-        model_dir: str,
-        model_file: str = "model.onnx",
-        tokens_file: str = "tokens.txt",
-        voice: str = "es-female-1",
-        speaker_id: int = 0,
-        sample_rate: int = 16000,
-        timeout_seconds: float = 60.0,
-    ) -> None:
-        """The executed files come from the verified manifest entry —
-        `model_dir` is only the trusted root they were resolved under.
-        Layouts without exactly these files fail closed in composition,
-        never silently here."""
-        if not model_dir or not os.path.isdir(model_dir):
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
-            )
-        if speaker_id < 0:
-            raise ValueError("speaker_id must be >= 0")
-        self._model_dir = model_dir
-        self._model_file = model_file
-        self._tokens_file = tokens_file
-        self._voice = voice
-        self._speaker_id = speaker_id
-        self._sample_rate = sample_rate
-        self._timeout = timeout_seconds
-        self._lock = threading.Lock()
-        self._closed = False
-        self._child = None
-        self._conn = None
-        self._version = "unknown"
-
-    def version_info(self) -> str:
-        return self._version
-
-    def probe_version(self) -> str:
-        """Lightweight runtime identity (no engine load): package
-        metadata, else the module attribute, else `unknown`.
-        `unknown` never passes the manifest compat gate."""
-        self._version = sherpa_version()
-        self._load()
-        return self._version
-
-    def _load(self):  # guarded import: optional dependency
-        try:
-            import sherpa_onnx  # type: ignore[import-not-found]
-        except Exception as error:
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "tts runtime unavailable"
-            ) from error
-        return sherpa_onnx
 
 def _tts_child_main(conn, model_path: str, tokens_path: str, data_dir: str) -> None:
     """TTS worker subprocess: owns the engine exclusively, serves one
@@ -1308,15 +1255,18 @@ class SherpaOnnxTTS:
         model_dir: str,
         model_file: str = "model.onnx",
         tokens_file: str = "tokens.txt",
+        data_dir: str = "",
         voice: str = "es-female-1",
         speaker_id: int = 0,
         sample_rate: int = 16000,
         timeout_seconds: float = 60.0,
     ) -> None:
         """The executed files come from the verified manifest entry —
-        `model_dir` is only the trusted root they were resolved under.
-        Layouts without exactly these files fail closed in composition,
-        never silently here."""
+        `model_dir` is only the trusted root they were resolved under,
+        and `data_dir` (phonemizer data) is decided by composition from
+        manifest-listed entries only: an unlisted physical directory is
+        never handed to the runtime. Layouts without exactly these
+        files fail closed in composition, never silently here."""
         if not model_dir or not os.path.isdir(model_dir):
             raise AdapterError(
                 ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
@@ -1326,6 +1276,7 @@ class SherpaOnnxTTS:
         self._model_dir = model_dir
         self._model_file = model_file
         self._tokens_file = tokens_file
+        self._data_dir = data_dir
         self._voice = voice
         self._speaker_id = speaker_id
         self._sample_rate = sample_rate
@@ -1363,8 +1314,13 @@ class SherpaOnnxTTS:
     def _child_paths(self) -> tuple[str, str, str]:
         model_path = self._voice_file(self._model_file)
         tokens_path = self._voice_file(self._tokens_file)
-        data_dir = os.path.join(self._model_dir, "espeak-ng-data")
-        return model_path, tokens_path, data_dir if os.path.isdir(data_dir) else ""
+        if self._data_dir and (
+            os.path.isdir(self._data_dir)
+            and os.path.commonpath([self._model_dir, self._data_dir])
+            == self._model_dir
+        ):
+            return model_path, tokens_path, self._data_dir
+        return model_path, tokens_path, ""
 
     def _ensure_child(self) -> None:
         import multiprocessing
