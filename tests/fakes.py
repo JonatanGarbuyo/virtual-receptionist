@@ -164,6 +164,20 @@ class FakeVoiceBackend:
         return session
 
 
+class FakeVoiceBackendWithReadiness(FakeVoiceBackend):
+    """Voice backend with a controllable readiness hook for admission
+    and recovery tests. Mirrors CascadedVoiceBackend.check_ready."""
+
+    def __init__(self, ready: bool = True) -> None:
+        super().__init__()
+        self.backend_ready = ready
+
+    def check_ready(self) -> tuple[bool, str]:
+        if self.backend_ready:
+            return True, "voice backend ready"
+        return False, "voice backend not ready"
+
+
 class FakeCallIds:
     """Deterministic call id generator for tests: call-1, call-2, ..."""
 

@@ -95,6 +95,11 @@ AUDIO_SAMPLE_FORMAT_PCM16 = "pcm16"
 #: before crossing the seam.
 AUDIO_CHANNELS_MONO = 1
 
+#: Hard cap on one AudioFrame's payload: transport chunks are small
+#: (100 ms at 16 kHz is 3.2 KiB); anything larger is a resource bug,
+#: never a legitimate turn fragment.
+MAX_AUDIO_FRAME_BYTES = 1024 * 1024
+
 
 @dataclass(frozen=True)
 class AudioFrame:
@@ -133,6 +138,11 @@ class AudioFrame:
             )
         if len(self.pcm) % 2 != 0:
             raise ValueError("pcm16 audio frame needs an even byte count")
+        if len(self.pcm) > MAX_AUDIO_FRAME_BYTES:
+            raise ValueError(
+                f"audio frame exceeds {MAX_AUDIO_FRAME_BYTES} bytes: "
+                f"{len(self.pcm)}"
+            )
         if self.sequence < 0:
             raise ValueError(f"audio frame sequence must be >= 0, got {self.sequence!r}")
 
@@ -165,9 +175,18 @@ class VoiceListener(Protocol):
     `on_audio` carries assistant PCM (TTS output) as a separate event:
     audio is never hidden inside `on_response`, which stays an optional
     assistant-text sidecar (transcript/debugging/deterministic tests).
+    `on_transcript_sidecar` carries observational caller text (e.g. the
+    primary STT result of a cascaded turn): unlike `on_transcript`, it
+    never opens a turn and never authorizes anything.
+
+    Threading contract: backend worker threads may invoke these methods
+    concurrently with media-input threads. Sessions serialize them
+    internally; listener implementations behind other backends must be
+    thread-safe if their backend is asynchronous.
     """
 
     def on_transcript(self, text: str) -> None: ...
+    def on_transcript_sidecar(self, text: str) -> None: ...
     def on_response(self, turn_id: int, text: str) -> None: ...
     def on_audio(self, turn_id: int, frame: AudioFrame) -> None: ...
     def on_playback_finished(self, turn_id: int) -> None: ...
@@ -215,6 +234,13 @@ class VoiceSession(Protocol):
     undelivered audio; `speak` plays a fixed application text (greeting,
     reprompt, apology) through the same output path; `close` cancels
     all session work, frees buffers/processes, and is idempotent.
+
+    Execution contract: `push_audio`, `commit_turn`, `cancel_output`,
+    `speak`, and `close` are thread-safe. `commit_turn`/`speak` enqueue
+    pipeline work on the session worker and return promptly; listener
+    events arrive asynchronously on that worker. Media input, hangup,
+    and barge-in can therefore be processed while a turn is in flight:
+    inference never blocks a media-adapter thread.
     """
 
     def push_audio(self, frame: AudioFrame) -> None: ...

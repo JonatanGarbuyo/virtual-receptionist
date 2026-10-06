@@ -32,12 +32,16 @@ stay warm — never per turn, never duplicated per call.
 1. Download the three artifacts on any machine (see sources above).
 2. Lay them out under a trusted model root:
    `stt/ggml-model-base.bin`, `llm/qwen3-1.7b-q4_k_m.gguf`,
-   `tts/es-voice.onnx` (+ voice sidecar files for sherpa-onnx).
+   `tts/es-female-1/model.onnx` + `tts/es-female-1/tokens.txt`
+   (plus `lexicon.txt`/`espeak-ng-data` when the voice needs them —
+   extend the manifest `files` list if so: every executed file must be
+   hashed).
 3. Pin the manifest: `python3 tools/pin_manifest.py --model-root
    /var/lib/receptionist/models --template
    models/baseline.manifest.json --out
    /var/lib/receptionist/models/baseline.manifest.json`
-   (fills sha256/size/runtime versions; never edits logical ids).
+   (fills sha256/size/runtime versions; never edits logical ids;
+   exits non-zero while any required artifact is still missing).
 4. Point config.db at the root + manifest
    (`voice.model_root`, `voice.manifest`) and restart: the backend
    validates integrity, warms each runtime, and only then reports

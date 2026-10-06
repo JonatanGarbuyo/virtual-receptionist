@@ -35,29 +35,13 @@ def _reasons() -> list[str]:
 
 @unittest.skipIf(_reasons(), f"real-model gate closed: {'; '.join(_reasons())}")
 class RealModelIntegrityTest(unittest.TestCase):
-    def test_pack_verifies_and_warms(self) -> None:
-        from receptionist.cascaded import (
-            CascadedVoiceBackend,
-            FakeLLMAdapter,
-            FakeSTTAdapter,
-            FakeTTSAdapter,
-            VoiceProfile,
-        )
+    def test_pack_verifies_clean(self) -> None:
         from receptionist.voice_manifest import load_manifest_file, verify_manifest
 
         manifest = load_manifest_file(MANIFEST)
+        # The gate asserts the installed pack only; runtime warmup is
+        # exercised by the turn test below against real servers.
         self.assertEqual(verify_manifest(MODEL_ROOT, manifest), [])
-        # Warmup of the *wiring* (adapters constructible) stays
-        # deterministic; real runtime warmup happens in the turn test.
-        backend = CascadedVoiceBackend(
-            profile=VoiceProfile(profile_id=manifest.profile_id),
-            stt=FakeSTTAdapter(["hola"]),
-            llm=FakeLLMAdapter(),
-            tts=FakeTTSAdapter(),
-        )
-        backend.start()
-        self.assertEqual(backend.warm(), [])
-        backend.shutdown()
 
 
 @unittest.skipIf(
@@ -73,12 +57,8 @@ class RealModelTurnTest(unittest.TestCase):
 
         from receptionist.audio import resample_pcm16, split_pcm  # noqa: E402
         from receptionist.boundaries import ProviderFailure  # noqa: E402
-        from receptionist.cascaded import CascadedVoiceBackend, VoiceProfile  # noqa: E402
-        from receptionist.local_runtimes import (  # noqa: E402
-            LlamaSubprocessLLM,
-            SherpaOnnxTTS,
-            WhisperSubprocessSTT,
-        )
+        from receptionist.cascaded import VoiceProfile  # noqa: E402
+        from receptionist.local_runtimes import build_cascaded_backend  # noqa: E402
         from receptionist.voice_manifest import (  # noqa: E402
             load_manifest_file,
             verify_manifest,
@@ -86,32 +66,22 @@ class RealModelTurnTest(unittest.TestCase):
 
         manifest = load_manifest_file(MANIFEST)
         self.assertEqual(verify_manifest(MODEL_ROOT, manifest), [])
-        by_component = {c.component: c for c in manifest.components}
-        stt = WhisperSubprocessSTT(
-            executable=os.environ.get("STT_EXE", "whisper-cli"),
-            model_path=os.path.join(MODEL_ROOT, by_component["stt"].filename),
+        profile = VoiceProfile(
+            profile_id=manifest.profile_id,
+            model_root=MODEL_ROOT,
+            manifest_path=MANIFEST,
+            stt_executable=os.environ.get("STT_EXE", "whisper-server"),
+            llm_executable=os.environ.get("LLM_EXE", "llama-server"),
+            tts_voice=os.environ.get("TTS_VOICE", "es-female-1"),
         )
-        llm = LlamaSubprocessLLM(
-            executable=os.environ.get("LLM_EXE", "llama-cli"),
-            model_path=os.path.join(MODEL_ROOT, by_component["llm"].filename),
-        )
-        tts = SherpaOnnxTTS(
-            model_dir=os.environ.get(
-                "TTS_VOICE_DIR", os.path.join(MODEL_ROOT, "tts")
-            )
-        )
-        backend = CascadedVoiceBackend(
-            profile=VoiceProfile(profile_id=manifest.profile_id),
-            stt=stt,
-            llm=llm,
-            tts=tts,
-        )
+        backend = build_cascaded_backend(profile)
         backend.start()
         try:
             self.assertEqual(backend.warm(), [])
             self.assertTrue(backend.ready)
 
             events: dict[str, list] = {
+                "sidecars": [],
                 "responses": [],
                 "audios": [],
                 "actions": [],
@@ -121,6 +91,9 @@ class RealModelTurnTest(unittest.TestCase):
             class Listener:
                 def on_transcript(self, text: str) -> None:
                     pass
+
+                def on_transcript_sidecar(self, text: str) -> None:
+                    events["sidecars"].append(text)
 
                 def on_response(self, turn_id: int, text: str) -> None:
                     events["responses"].append(text)
@@ -145,9 +118,11 @@ class RealModelTurnTest(unittest.TestCase):
             for frame in split_pcm(pcm16, 16000):
                 session.push_audio(frame)
             session.commit_turn(1)
+            self.assertTrue(session.wait_until_idle(timeout=300.0))
 
             # Properties, never exact neural text (no flaky assertions).
             self.assertEqual(events["failures"], [])
+            self.assertTrue(events["sidecars"])
             self.assertTrue(events["responses"] or events["actions"])
             self.assertGreater(
                 sum(len(frame.pcm) for frame in events["audios"]), 0

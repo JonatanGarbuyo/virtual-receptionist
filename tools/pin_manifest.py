@@ -26,28 +26,52 @@ from receptionist.voice_manifest import (  # noqa: E402
 )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pin a model-pack manifest.")
     parser.add_argument("--model-root", required=True)
     parser.add_argument("--template", required=True)
     parser.add_argument("--out", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     with open(args.template, encoding="utf-8") as handle:
         template = json.load(handle)
     manifest = load_manifest(template)
     components = []
+    failed = False
     for component in manifest.components:
-        path = resolve_trusted_path(args.model_root, component.filename)
-        if not os.path.isfile(path):
-            print(f"missing artifact (leaving placeholder): {component.filename}")
-            components.append(component)
+        names = list(component.files or (component.filename,))
+        hashes = []
+        sizes = []
+        for name in names:
+            path = resolve_trusted_path(args.model_root, name)
+            if not os.path.isfile(path):
+                print(f"missing artifact: {name}")
+                failed = True
+                break
+            hashes.append(sha256_file(path))
+            sizes.append(os.path.getsize(path))
+        else:
+            primary_size = sizes[0] if len(names) == 1 and component.size == 0 else component.size
+            components.append(
+                component.__class__(
+                    **{
+                        **component.__dict__,
+                        "sha256": hashes[0],
+                        "size": primary_size or sizes[0],
+                        "files": tuple(names),
+                        "file_hashes": tuple(hashes),
+                    }
+                )
+            )
             continue
-        digest = sha256_file(path)
-        size = os.path.getsize(path)
-        components.append(
-            component.__class__(**{**component.__dict__, "sha256": digest, "size": size})
-        )
+        # A required component with a missing file keeps its placeholder
+        # and fails the run below: pinning must never look successful.
+        components.append(component)
+        if component.required:
+            failed = True
+    if failed:
+        print("pin_manifest FAILED: required artifacts missing; manifest not written")
+        return 1
     pinned = manifest.__class__(
         schema_version=manifest.schema_version,
         profile_id=manifest.profile_id,

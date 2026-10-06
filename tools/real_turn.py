@@ -3,7 +3,7 @@
 Offline: needs installed runtimes + pinned manifest + model pack.
 Fails closed with a clear reason when anything is missing — it never
 fabricates a turn. Prints a sanitized evidence document (ids, sizes,
-timings; transcript summarized, never full prompts).
+timings, versions; transcript summarized, never full prompts).
 
 Run:  PYTHONPATH=src python3 tools/real_turn.py --model-root /models \\
           --manifest /models/pinned.json --audio-fixture /path/to/es-16k.wav
@@ -46,69 +46,71 @@ def main() -> int:
     parser.add_argument("--model-root", required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--audio-fixture", required=True)
-    parser.add_argument("--stt-exe", default="whisper-cli")
-    parser.add_argument("--llm-exe", default="llama-cli")
-    parser.add_argument("--tts-voice-dir", default="")
+    parser.add_argument("--stt-exe", default="whisper-server")
+    parser.add_argument("--llm-exe", default="llama-server")
+    parser.add_argument("--tts-voice", default="es-female-1")
     parser.add_argument("--profile-id", default="cascaded-cpu-baseline-v1")
     args = parser.parse_args()
 
     from receptionist.audio import resample_pcm16, split_pcm
     from receptionist.boundaries import ProviderFailure
-    from receptionist.cascaded import CascadedVoiceBackend, VoiceProfile
-    from receptionist.local_runtimes import (
-        LlamaSubprocessLLM,
-        SherpaOnnxTTS,
-        WhisperSubprocessSTT,
+    from receptionist.cascaded import VoiceProfile
+    from receptionist.local_runtimes import build_cascaded_backend
+    from receptionist.voice_manifest import (
+        load_manifest_file,
+        resolve_trusted_path,
+        sha256_file,
+        verify_manifest,
     )
-    from receptionist.voice_manifest import load_manifest_file, sha256_file
 
     try:
         manifest = load_manifest_file(args.manifest)
     except Exception as error:
         return fail(f"manifest unreadable: {type(error).__name__}")
 
-    from receptionist.voice_manifest import verify_manifest
-
     problems = verify_manifest(args.model_root, manifest)
     if problems:
         return fail(f"integrity failed: {[f'{p.component}:{p.reason}' for p in problems]}")
 
-    by_component = {c.component: c for c in manifest.components}
     try:
-        import os as _os
-
-        stt_path = _os.path.join(args.model_root, by_component["stt"].filename)
-        llm_path = _os.path.join(args.model_root, by_component["llm"].filename)
-        stt = WhisperSubprocessSTT(executable=args.stt_exe, model_path=stt_path)
-        llm = LlamaSubprocessLLM(executable=args.llm_exe, model_path=llm_path)
-        tts = SherpaOnnxTTS(
-            model_dir=args.tts_voice_dir
-            or _os.path.join(args.model_root, "tts"),
-        )
-    except Exception as error:
-        return fail(f"adapter construction failed: {type(error).__name__}")
-
-    try:
-        pcm, rate = read_pcm_16k_mono(args.audio_fixture)
-    except Exception as error:
+        fixture_sha = sha256_file(args.audio_fixture)
+    except OSError as error:
         return fail(f"fixture unreadable: {type(error).__name__}")
-    pcm16 = resample_pcm16(pcm, rate, 16000)
 
     profile = VoiceProfile(
         profile_id=args.profile_id,
         model_root=args.model_root,
         manifest_path=args.manifest,
+        stt_executable=args.stt_exe,
+        llm_executable=args.llm_exe,
+        tts_voice=args.tts_voice,
     )
-    backend = CascadedVoiceBackend(
-        profile=profile, stt=stt, llm=llm, tts=tts, knowledge_lookup=None
-    )
+    try:
+        backend = build_cascaded_backend(profile)
+    except Exception as error:
+        return fail(f"backend composition failed: {type(error).__name__}")
+
+    try:
+        pcm, rate = read_pcm_16k_mono(args.audio_fixture)
+    except Exception as error:
+        backend.shutdown()
+        return fail(f"fixture unreadable: {type(error).__name__}")
+    pcm16 = resample_pcm16(pcm, rate, 16000)
+
     backend.start()
     warm_problems = backend.warm()
-    if warm_problems:
+    versions = {
+        "stt": backend._stt.version_info(),
+        "llm": backend._llm.version_info(),
+        "tts": backend._tts.version_info(),
+    }
+    if warm_problems or not backend.ready:
+        ready, detail = backend.check_ready()
         backend.shutdown()
-        return fail(f"warmup failed: {warm_problems}")
+        return fail(f"warmup failed: {warm_problems or [detail]}")
 
     events: dict = {
+        "sidecars": [],
         "responses": [],
         "audios": [],
         "actions": [],
@@ -119,6 +121,9 @@ def main() -> int:
     class Listener:
         def on_transcript(self, text: str) -> None:
             pass
+
+        def on_transcript_sidecar(self, text: str) -> None:
+            events["sidecars"].append(text)
 
         def on_response(self, turn_id: int, text: str) -> None:
             events["responses"].append((turn_id, text))
@@ -140,16 +145,21 @@ def main() -> int:
         session.push_audio(frame)
     started = time.monotonic()
     session.commit_turn(1)
+    drained = session.wait_until_idle(timeout=300.0)
     total_ms = (time.monotonic() - started) * 1000.0
     timings = session.last_timings
     backend.shutdown()
 
-    try:
-        import resource
+    def _rusage() -> dict[str, int]:
+        try:
+            import resource
 
-        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    except Exception:
-        peak_kb = -1
+            me = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            return {"peak_rss_kb_self": me, "peak_rss_kb_children": kids}
+        except Exception:
+            return {"peak_rss_kb_self": -1, "peak_rss_kb_children": -1}
+
     try:
         with open("/proc/meminfo") as handle:
             mem_total = next(
@@ -158,31 +168,44 @@ def main() -> int:
     except Exception:
         mem_total = "unknown"
 
-    transcript_summary = ""
-    if events["responses"]:
-        text = events["responses"][0][1]
-        transcript_summary = f"{len(text.split())} words / {len(text)} chars"
-
+    stt_text = events["sidecars"][0] if events["sidecars"] else ""
+    out_bytes = sum(n for _, n, _ in events["audios"])
+    out_rate = events["audios"][0][2] if events["audios"] else 16000
     evidence = {
-        "ok": not events["failures"] and bool(events["audios"]),
+        "ok": bool(drained) and not events["failures"] and bool(events["audios"]),
         "cpu_arch": platform.machine(),
         "cpu_count": os.cpu_count(),
         "mem_total": mem_total,
         "python": platform.python_version(),
         "platform": platform.platform(),
+        "cpu_only": {
+            "whisper_flag": "--no-gpu",
+            "llama_flag": "-ngl 0",
+            "llama_offline_flag": "--offline",
+            "sherpa_provider": "cpu",
+        },
+        "runtime_versions": versions,
         "profile_id": manifest.profile_id,
         "model_ids": [c.model_id for c in manifest.components],
-        "sha256": {c.component: sha256_file(f"{args.model_root}/{c.filename}") for c in manifest.components},
+        "artifact_sha256": {
+            filename: sha256_file(resolve_trusted_path(args.model_root, filename))
+            for component in manifest.components
+            for filename in (component.files or (component.filename,))
+        },
         "input_fixture": os.path.basename(args.audio_fixture),
+        "input_fixture_sha256": fixture_sha,
         "input_seconds": round(len(pcm16) / 2 / 16000, 2),
+        "stt_transcript_summary": (
+            f"{len(stt_text.split())} words / {len(stt_text)} chars" if stt_text else "none"
+        ),
         "llm_result": (
             events["actions"][0]
             if events["actions"]
             else ("spoken" if events["responses"] else "none")
         ),
-        "transcript_summary": transcript_summary,
-        "output_audio_bytes": sum(n for _, n, _ in events["audios"]),
+        "output_audio_bytes": out_bytes,
         "output_audio_frames": len(events["audios"]),
+        "output_audio_seconds": round(out_bytes / 2 / (out_rate or 16000), 2),
         "eou_to_first_audio_ms": (
             round(timings.eou_to_first_audio_ms, 1)
             if timings and timings.eou_to_first_audio_ms is not None
@@ -190,7 +213,7 @@ def main() -> int:
         ),
         "total_turn_ms": round(total_ms, 1),
         "latency_band": timings.latency_band() if timings else "unknown",
-        "peak_rss_kb": peak_kb,
+        **_rusage(),
         "failures": events["failures"],
     }
     print(json.dumps(evidence, indent=2))

@@ -218,10 +218,16 @@ class ReceptionistCore:
             monitor=self.monitor,
         )
         self._sessions[call_id] = session
+        # Voice readiness syncs BEFORE the admission decision, so a
+        # recovered backend re-admits without a manual start(), and a
+        # backend that died mid-run is observed on the next call. Ticks
+        # re-sync too, so recovery never waits for new traffic.
+        self._sync_voice_readiness()
         # No AI session may start while STARTING/NOT_READY. Refusing here
-        # acquires no voice resources (lazy open in request_answer). A
-        # required voice backend that reports not-ready routes to PBX
-        # fallback the same way an open circuit does.
+        # acquires no voice resources (lazy open in request_answer).
+        # Deliberate AI-unadmission (distinct from service admission):
+        # a voice-only outage with otherwise usable configuration routes
+        # to PBX fallback exactly like an open circuit, opening nothing.
         admitted = self.health.status not in (HealthStatus.STARTING, HealthStatus.NOT_READY)
         if (
             admitted
@@ -230,7 +236,6 @@ class ReceptionistCore:
             and self._policy.should_answer(caller_id)
         ):
             self._sync_breaker_health()
-            self._sync_voice_readiness()
             if not self._voice_usable():
                 session.begin_fallback_only("provider_unavailable")
             elif self.breaker.is_open:
@@ -246,11 +251,27 @@ class ReceptionistCore:
                 self.monitor.report_recovered(
                     HealthComponent.CAPACITY, CODE_CAPACITY_SATURATED
                 )
+        elif (
+            config_trusted
+            and not missing
+            and self._voice_has_hook()
+            and not self._voice_usable()
+            and self._policy.should_answer(caller_id)
+        ):
+            # Voice-only outage (service config usable, AI path down):
+            # deliberate AI-unadmission to PBX fallback, no provider
+            # resources opened. Distinct from service-level refusal.
+            session.begin_fallback_only("provider_unavailable")
         else:
             session.reject()
             del self._sessions[call_id]
         self._reconcile_health()
         return session
+
+    def _voice_has_hook(self) -> bool:
+        """Whether the voice backend reports readiness at all. Legacy
+        backends without the hook never gate admission."""
+        return callable(getattr(self._voice, "check_ready", None))
 
     def _voice_usable(self) -> bool:
         """Whether the required voice backend may accept a call right
@@ -387,6 +408,7 @@ class ReceptionistCore:
             if session is not None:
                 session.check_timeouts()
         self._sync_breaker_health()
+        self._sync_voice_readiness()
         now = self._clock.now()
         if (
             self._last_prune is None

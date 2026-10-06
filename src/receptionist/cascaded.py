@@ -17,9 +17,16 @@ Layering (each adapter isolated behind a project-owned protocol):
 - :class:`CascadedVoiceBackend` / :class:`CascadedVoiceSession`:
   per-call coordinator over shared warmed adapters. Long-lived
   runtimes live at backend level; sessions hold only transient PCM
-  buffers. Thread-safe: ``cancel_output`` from any thread invalidates
-  the in-flight generation and terminates in-flight subprocesses via
-  the cancel token; late output never crosses the seam.
+  buffers.
+
+Execution model: every session owns one worker thread. ``commit_turn``
+and ``speak`` enqueue jobs and return promptly, so media input,
+hangup, and barge-in are processed while a turn is in flight;
+``cancel_output``/``close`` from any thread invalidate the in-flight
+generation and late output never crosses the seam. Listener events
+arrive on the worker thread; sessions serialize them with the media
+path through the epoch + turn guards (and CallSession holds its own
+lock on top).
 
 Privacy: no PCM persisted, no prompts/transcripts/responses logged;
 only ids, timings, and normalized categories reach logs/health.
@@ -29,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
 import threading
 from dataclasses import dataclass
@@ -56,8 +64,14 @@ STT_SAMPLE_RATE = 16000
 #: TTS output rate exposed on AssistantAudio frames.
 TTS_SAMPLE_RATE = 16000
 
-#: Samples per AssistantAudio frame emitted caller-facing.
-TTS_CHUNK_SAMPLES = 1600  # 100 ms at 16 kHz
+#: Samples per AssistantAudio frame emitted caller-facing. Frames carry
+#: their real sample rate downstream, so this is 100 ms at 16 kHz and
+#: proportionally less time at higher TTS-native rates.
+TTS_CHUNK_SAMPLES = 1600
+
+#: Hard cap on buffered caller PCM per session turn (~64 s at 16 kHz).
+#: Beyond it the turn fails closed INVALID_OUTPUT instead of growing RAM.
+MAX_TURN_AUDIO_BYTES = 2 * 1024 * 1024
 
 #: Latency targets for end-of-user-turn -> first playable audio.
 EOU_TO_FIRST_AUDIO_DESIRED_MS = 1500.0
@@ -440,19 +454,25 @@ class VoiceProfile:
     manifest_path: str = ""
     stt_executable: str = ""
     llm_executable: str = ""
-    tts_executable: str = ""
     tts_voice: str = "es-female-1"
+    tts_speaker_id: int = 0
+    server_host: str = "127.0.0.1"
     max_context_chars: int = 9000
     max_spoken_chars: int = 500
     stt_timeout_seconds: float = 30.0
     llm_timeout_seconds: float = 60.0
     tts_timeout_seconds: float = 60.0
+    #: Production backends require a verified manifest. Test/dev
+    #: profiles may opt out explicitly (never silently).
+    require_manifest: bool = True
 
     def __post_init__(self) -> None:
         if not self.profile_id.strip():
             raise ValueError("voice profile needs an id")
         if self.max_context_chars <= 0 or self.max_spoken_chars <= 0:
             raise ValueError("voice profile bounds must be > 0")
+        if self.tts_speaker_id < 0:
+            raise ValueError("voice profile tts_speaker_id must be >= 0")
         for name in (
             "stt_timeout_seconds",
             "llm_timeout_seconds",
@@ -468,8 +488,8 @@ def baseline_profile(
     *,
     stt_executable: str = "",
     llm_executable: str = "",
-    tts_executable: str = "",
     tts_voice: str = "es-female-1",
+    require_manifest: bool = True,
 ) -> VoiceProfile:
     """The approved default: whisper.cpp base multilingual, llama.cpp
     Qwen3-1.7B Q4_K_M non-thinking, sherpa-onnx Spanish voice."""
@@ -479,8 +499,8 @@ def baseline_profile(
         manifest_path=manifest_path,
         stt_executable=stt_executable,
         llm_executable=llm_executable,
-        tts_executable=tts_executable,
         tts_voice=tts_voice,
+        require_manifest=require_manifest,
     )
 
 
@@ -494,11 +514,15 @@ class _NullClock:
 class CascadedVoiceSession:
     """One call's coordinator over shared backend adapters.
 
-    Synchronous and thread-safe: the pipeline runs on the committing
-    thread; ``cancel_output``/``close`` from any thread invalidate the
-    generation so late chunks, text, actions, completions, and failures
-    can never cross the seam afterwards. ``close`` is idempotent and
-    frees only session buffers (adapters stay warm at backend level).
+    One worker thread per session: ``commit_turn``/``speak`` enqueue
+    jobs and return promptly, so barge-in, hangup, and media input are
+    processed while a turn is in flight. ``cancel_output``/``close``
+    from any thread invalidate the generation so late chunks, text,
+    actions, completions, and failures can never cross the seam
+    afterwards. ``close`` is idempotent, frees only session buffers
+    (adapters stay warm at backend level), and never joins the worker
+    from inside itself. ``wait_until_idle`` lets deterministic tests
+    rendezvous without sleeps.
     """
 
     provides_playback = True
@@ -528,11 +552,19 @@ class CascadedVoiceSession:
         self._lock = threading.Lock()
         self._buffer = bytearray()
         self._buffer_rate = STT_SAMPLE_RATE
+        self._audio_over_budget = False
         self._generation = 0
         self._token = CancelToken()
         self._closed = False
         self._audio_sequence = 0
         self.last_timings: TurnTimings | None = None
+        self._jobs: queue.Queue = queue.Queue()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._worker = threading.Thread(
+            target=self._drain, name=f"cascaded-{call_id}", daemon=True
+        )
+        self._worker.start()
 
     # -- VoiceSession contract --------------------------------------
 
@@ -541,6 +573,11 @@ class CascadedVoiceSession:
             if self._closed:
                 return
             pcm = resample_pcm16(bytes(frame.pcm), frame.sample_rate, STT_SAMPLE_RATE)
+            if len(self._buffer) + len(pcm) > MAX_TURN_AUDIO_BYTES:
+                # Fail closed at commit: unbounded growth is never an
+                # option, silent truncation of caller speech neither.
+                self._audio_over_budget = True
+                return
             self._buffer.extend(pcm)
             self._buffer_rate = STT_SAMPLE_RATE
 
@@ -553,8 +590,11 @@ class CascadedVoiceSession:
             self._token = CancelToken()
             token = self._token
             pcm = bytes(self._buffer)
+            over_budget = self._audio_over_budget
             self._buffer.clear()
-        self._run_turn(turn_id, generation, token, pcm)
+            self._audio_over_budget = False
+            self._idle.clear()
+            self._jobs.put(("turn", turn_id, generation, token, pcm, over_budget))
 
     def cancel_output(self, reason: CancelReason) -> None:
         if not isinstance(reason, CancelReason):
@@ -576,6 +616,61 @@ class CascadedVoiceSession:
                 return
             generation = self._generation
             token = self._token
+            self._idle.clear()
+            self._jobs.put(("speak", turn_id, generation, token, text))
+
+    def close(self) -> None:
+        # Never joins the worker: close() runs under the session lock on
+        # media threads while the worker may be emitting into that same
+        # lock — joining here would stall barge-in/handoff for the join
+        # timeout. It also never forces the idle flag: the worker sets it
+        # when its queue actually drains, so wait_until_idle stays a true
+        # rendezvous. The daemon worker observes closed/generation and
+        # exits after its bounded in-flight job; late emits are dropped
+        # by the generation guard either way.
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._generation += 1
+            token = self._token
+            self._buffer.clear()
+        token.set()
+
+    def wait_until_idle(self, timeout: float = 5.0) -> bool:
+        """Block (bounded) until every queued job finished. Test seam:
+        deterministic rendezvous without sleeps."""
+        return self._idle.wait(timeout=timeout)
+
+    # -- worker ------------------------------------------------------
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                job = self._jobs.get(timeout=0.05)
+            except queue.Empty:
+                with self._lock:
+                    closed = self._closed
+                if closed:
+                    self._idle.set()
+                    return
+                continue
+            try:
+                kind = job[0]
+                if kind == "turn":
+                    _, turn_id, generation, token, pcm, over_budget = job
+                    self._run_turn(turn_id, generation, token, pcm, over_budget)
+                else:
+                    _, turn_id, generation, token, text = job
+                    self._run_speak(text, turn_id, generation, token)
+            finally:
+                self._jobs.task_done()
+                if self._jobs.empty():
+                    self._idle.set()
+
+    def _run_speak(
+        self, text: str, turn_id: int, generation: int, token: CancelToken
+    ) -> None:
         timings = TurnTimings(
             call_id=self._call_id,
             turn_id=turn_id,
@@ -598,16 +693,6 @@ class CascadedVoiceSession:
             self.last_timings = timings
             self._listener.on_playback_finished(turn_id)
 
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._generation += 1
-            token = self._token
-            self._buffer.clear()
-        token.set()
-
     # -- pipeline ----------------------------------------------------
 
     def _current(self, generation: int) -> bool:
@@ -625,7 +710,12 @@ class CascadedVoiceSession:
         )
 
     def _run_turn(
-        self, turn_id: int, generation: int, token: CancelToken, pcm: bytes
+        self,
+        turn_id: int,
+        generation: int,
+        token: CancelToken,
+        pcm: bytes,
+        over_budget: bool = False,
     ) -> None:
         timings = TurnTimings(
             call_id=self._call_id, turn_id=turn_id, eou_at=self._clock.now()
@@ -634,6 +724,12 @@ class CascadedVoiceSession:
             self._fail(
                 turn_id, generation, token,
                 ProviderFailureCategory.UNAVAILABLE, "voice backend not ready",
+            )
+            return
+        if over_budget:
+            self._fail(
+                turn_id, generation, token,
+                ProviderFailureCategory.INVALID_OUTPUT, "turn audio over budget",
             )
             return
         if not pcm:
@@ -666,6 +762,10 @@ class CascadedVoiceSession:
                 ProviderFailureCategory.INVALID_OUTPUT, "empty transcript",
             )
             return
+        # Observational caller-text sidecar: never opens a turn, never
+        # authorizes anything. Primary STT is reused for transcripts.
+        if not token.cancelled and self._current(generation):
+            self._listener.on_transcript_sidecar(transcript)
         # -- knowledge (application-owned, data only) ----------------
         knowledge = self._lookup_knowledge(transcript)
         # -- prompt + LLM -------------------------------------------
@@ -813,8 +913,11 @@ class CascadedVoiceBackend:
 
     Adapters (and their model processes) are constructed once and
     shared by every session: no per-turn loading, no per-call model
-    duplication. ``verify`` + ``start`` + ``warm`` must succeed before
-    :meth:`ready` reports True; the core gates admission on it.
+    duplication. ``start`` loads and verifies the declared manifest,
+    ``warm`` proves every resident runtime actually serves, and only
+    then does :meth:`ready` report True; the core gates admission on
+    it. Readiness requires a *positive* verification: ``verify()``
+    without material fails closed and never clears recorded problems.
     """
 
     def __init__(
@@ -836,6 +939,7 @@ class CascadedVoiceBackend:
         self._lock = threading.Lock()
         self._started = False
         self._warmed = False
+        self._verified = False
         self._warm_problems: list[str] = []
         self._integrity_problems: list[str] = []
         self._closed = False
@@ -846,23 +950,68 @@ class CascadedVoiceBackend:
 
     def verify(self, manifest=None, model_root: str | None = None) -> list[str]:
         """Validate required model artifacts. Returns sanitized problem
-        ids (``"<component>:<reason>"``); empty means integrity holds."""
+        ids (``"<component>:<reason>"``); empty means integrity holds.
+
+        Fail-closed: with nothing to verify, records
+        ``manifest:unverified`` instead of clearing previous evidence.
+        """
         from receptionist.voice_manifest import verify_manifest
 
-        root = model_root if model_root is not None else self._profile.model_root
+        if manifest is None:
+            manifest = None  # explicit re-verify uses the stored manifest
+        with self._lock:
+            stored_manifest = getattr(self, "_manifest", None)
+            stored_root = getattr(self, "_manifest_root", None)
+        if manifest is None:
+            manifest = stored_manifest
+        root = model_root if model_root is not None else (
+            stored_root if stored_root is not None else self._profile.model_root
+        )
         if manifest is None or not root:
-            self._integrity_problems = []
-            return []
+            with self._lock:
+                if "manifest:unverified" not in self._integrity_problems:
+                    self._integrity_problems.append("manifest:unverified")
+                self._verified = False
+                return list(self._integrity_problems)
         problems = [
             f"{problem.component}:{problem.reason}"
             for problem in verify_manifest(root, manifest)
         ]
-        self._integrity_problems = problems
+        with self._lock:
+            self._manifest = manifest
+            self._manifest_root = root
+            self._integrity_problems = problems
+            self._verified = not problems
         return list(problems)
 
     def start(self) -> None:
-        """Load phase: adapters are already constructed (injected);
-        this marks the backend started. Idempotent."""
+        """Load phase: when the profile declares a manifest, load and
+        verify it now (fail closed when unreadable). Profiles that
+        explicitly opt out (`require_manifest=False`, tests/dev only)
+        skip manifest verification by operator declaration — never
+        silently. Idempotent."""
+        if not self._profile.require_manifest:
+            with self._lock:
+                self._verified = True
+        elif not self._profile.manifest_path:
+            with self._lock:
+                if "manifest:unverified" not in self._integrity_problems:
+                    self._integrity_problems.append("manifest:unverified")
+                self._verified = False
+        else:
+            manifest_path = self._profile.manifest_path
+            try:
+                from receptionist.voice_manifest import load_manifest_file
+
+                manifest = load_manifest_file(manifest_path)
+            except (OSError, ValueError):
+                with self._lock:
+                    if "manifest:unreadable" not in self._integrity_problems:
+                        self._integrity_problems.append("manifest:unreadable")
+                    self._verified = False
+                manifest = None
+            if manifest is not None:
+                self.verify(manifest, self._profile.model_root)
         with self._lock:
             if self._closed:
                 return
@@ -893,6 +1042,7 @@ class CascadedVoiceBackend:
             return (
                 self._started
                 and self._warmed
+                and self._verified
                 and not self._warm_problems
                 and not self._integrity_problems
                 and not self._closed
@@ -944,201 +1094,3 @@ class CascadedVoiceBackend:
                 adapter.close()
             except Exception:
                 pass
-
-
-# -- deterministic test adapters ----------------------------------------
-
-
-@dataclass
-class ScriptedFailure:
-    category: ProviderFailureCategory
-    detail: str = "scripted failure"
-
-
-class FakeSTTAdapter:
-    """Deterministic STT double: scripted transcripts/failures."""
-
-    component = "stt"
-
-    def __init__(
-        self,
-        transcripts: list[str] | None = None,
-        failures: list[ScriptedFailure] | None = None,
-    ) -> None:
-        self.transcripts = list(transcripts or [])
-        self.failures = list(failures or [])
-        self.calls: list[dict] = []
-        self.warmups = 0
-        self.closed = False
-
-    def transcribe(self, pcm: bytes, sample_rate: int, cancel: CancelToken) -> STTResult:
-        cancel.throw_if_cancelled()
-        self.calls.append({"bytes": len(pcm), "sample_rate": sample_rate})
-        if self.failures:
-            failure = self.failures.pop(0)
-            raise AdapterError(failure.category, failure.detail)
-        if self.transcripts:
-            return STTResult(text=self.transcripts.pop(0))
-        return STTResult(text="")
-
-    def warmup(self) -> None:
-        self.warmups += 1
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class FakeLLMAdapter:
-    """Deterministic LLM double: scripted raw structured documents."""
-
-    component = "llm"
-
-    def __init__(
-        self,
-        documents: list[str] | None = None,
-        failures: list[ScriptedFailure] | None = None,
-    ) -> None:
-        self.documents = list(documents or [])
-        self.failures = list(failures or [])
-        self.prompts: list[str] = []
-        self.warmups = 0
-        self.closed = False
-
-    def generate(self, prompt: str, cancel: CancelToken) -> str:
-        cancel.throw_if_cancelled()
-        self.prompts.append(prompt)
-        if self.failures:
-            failure = self.failures.pop(0)
-            raise AdapterError(failure.category, failure.detail)
-        if self.documents:
-            return self.documents.pop(0)
-        return json.dumps({"spoken_text": "De acuerdo.", "action": None})
-
-    def warmup(self) -> None:
-        self.warmups += 1
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class FakeTTSAdapter:
-    """Deterministic TTS double: scripted PCM chunks per synthesis.
-
-    ``fail_after_chunks`` emits N chunks then raises; ``fail_before``
-    raises before any audio. ``on_chunk_hook`` runs before each chunk
-    so tests can interleave barge-in deterministically.
-    """
-
-    component = "tts"
-
-    def __init__(
-        self,
-        chunks: list[bytes] | None = None,
-        failures: list[ScriptedFailure] | None = None,
-        fail_after_chunks: int | None = None,
-        fail_before: ScriptedFailure | None = None,
-        on_chunk_hook: Callable[[], None] | None = None,
-        sample_rate: int = TTS_SAMPLE_RATE,
-    ) -> None:
-        self.chunks = list(chunks or [])
-        self.failures = list(failures or [])
-        self.fail_after_chunks = fail_after_chunks
-        self.fail_before = fail_before
-        self.on_chunk_hook = on_chunk_hook
-        self.sample_rate = sample_rate
-        self.texts: list[str] = []
-        self.warmups = 0
-        self.closed = False
-
-    def synthesize(
-        self,
-        text: str,
-        cancel: CancelToken,
-        on_chunk: Callable[[bytes, int], None],
-    ) -> int:
-        cancel.throw_if_cancelled()
-        self.texts.append(text)
-        if self.fail_before is not None:
-            failure = self.fail_before
-            self.fail_before = None
-            raise AdapterError(failure.category, failure.detail)
-        if self.failures:
-            failure = self.failures.pop(0)
-            raise AdapterError(failure.category, failure.detail)
-        total = 0
-        emitted = 0
-        pending = list(self.chunks) if self.chunks else [_default_tts_bytes()]
-        for piece in pending:
-            if self.on_chunk_hook is not None:
-                self.on_chunk_hook()
-            cancel.throw_if_cancelled()
-            on_chunk(piece, self.sample_rate)
-            total += len(piece)
-            emitted += 1
-            if (
-                self.fail_after_chunks is not None
-                and emitted >= self.fail_after_chunks
-            ):
-                self.fail_after_chunks = None
-                raise AdapterError(
-                    ProviderFailureCategory.INTERNAL, "tts failed mid-stream"
-                )
-        return total
-
-    def warmup(self) -> None:
-        self.warmups += 1
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def _default_tts_bytes() -> bytes:
-    from receptionist.audio import tone_pcm
-
-    return tone_pcm(duration_seconds=0.2)
-
-
-class FailingAdapter:
-    """Warmup-failure double for readiness tests."""
-
-    def __init__(
-        self, component: str, category: ProviderFailureCategory
-    ) -> None:
-        self.component = component
-        self._category = category
-        self.closed = False
-
-    def transcribe(self, pcm: bytes, sample_rate: int, cancel: CancelToken) -> STTResult:
-        raise AdapterError(self._category, "failing adapter")
-
-    def generate(self, prompt: str, cancel: CancelToken) -> str:
-        raise AdapterError(self._category, "failing adapter")
-
-    def synthesize(
-        self,
-        text: str,
-        cancel: CancelToken,
-        on_chunk: Callable[[bytes, int], None],
-    ) -> int:
-        raise AdapterError(self._category, "failing adapter")
-
-    def warmup(self) -> None:
-        raise AdapterError(self._category, "warmup failed")
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def spoken_document(text: str) -> str:
-    """Test helper: spoken-only structured document."""
-    return json.dumps({"spoken_text": text, "action": None})
-
-
-def transfer_document(text: str, destination_id: str) -> str:
-    """Test helper: spoken text plus a typed transfer request."""
-    return json.dumps(
-        {
-            "spoken_text": text,
-            "action": {"type": "transfer", "destination_id": destination_id},
-        }
-    )

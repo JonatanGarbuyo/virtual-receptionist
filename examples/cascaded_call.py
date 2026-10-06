@@ -14,12 +14,11 @@ sys.path.insert(0, "tests")
 
 from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony
 from receptionist.audio import make_frame, tone_pcm
-from receptionist.cascaded import (
-    CascadedVoiceBackend,
+from receptionist.cascaded import CascadedVoiceBackend, VoiceProfile
+from cascaded_fakes import (
     FakeLLMAdapter,
     FakeSTTAdapter,
     FakeTTSAdapter,
-    VoiceProfile,
     transfer_document,
 )
 from receptionist.config import ConfigService, InMemoryConfigRepository
@@ -38,7 +37,7 @@ from receptionist.policy import Destination, Limits, PolicyEngine, RetentionPoli
 def main() -> None:
     clock = FakeClock()
     backend = CascadedVoiceBackend(
-        profile=VoiceProfile(profile_id="demo"),
+        profile=VoiceProfile(profile_id="demo", require_manifest=False),
         stt=FakeSTTAdapter(["quiero hablar con ventas por favor"]),
         llm=FakeLLMAdapter(
             [transfer_document("Por supuesto, le comunico con ventas.", "ventas")]
@@ -84,13 +83,17 @@ def main() -> None:
 
     session = core.incoming_call("+34910000001")
     print(f"answered: state={session.state.value} mode={session.mode.value}")
+    session.drain_voice()
 
     pcm = tone_pcm(duration_seconds=0.6)
     session.push_caller_audio(make_frame(pcm, 16000, call_id=session.call_id))
     session.commit_caller_turn()
+    session.drain_voice()
     print(f"after turn: state={session.state.value} mode={session.mode}")
     print(f"telephony transfers: {telephony.transfers}")
-    print(f"turn timings band: {session._voice_session.last_timings}")
+    voice = session.voice_session
+    timings = getattr(voice, "last_timings", None)
+    print(f"turn timings: {timings}")
 
 
 if __name__ == "__main__":

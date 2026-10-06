@@ -27,7 +27,14 @@ REQUIRED_BASELINE_COMPONENTS = ("stt", "llm", "tts")
 @dataclass(frozen=True)
 class ModelComponent:
     """One model artifact in a pack. ``filename`` is relative to the
-    trusted model root; ``required`` marks startup-blocking artifacts."""
+    trusted model root; ``required`` marks startup-blocking artifacts.
+
+    ``files`` lists every runtime file actually executed for this
+    component (model + sidecars such as tokens/lexicon), each resolved
+    and hashed like ``filename``. Defaults to ``(filename,)`` for
+    single-file components; multi-file components (TTS voices) must
+    list all of them — an unlisted sidecar is an unverified sidecar.
+    """
 
     component: str
     runtime: str
@@ -42,6 +49,23 @@ class ModelComponent:
     source: str = ""
     license: str = ""
     required: bool = True
+    files: tuple[str, ...] = ()
+    file_hashes: tuple[str, ...] = ()
+
+    def resolved_files(self) -> list[tuple[str, str]]:
+        """(filename, expected sha256) for every verified file."""
+        names = self.files or (self.filename,)
+        if self.file_hashes:
+            if len(self.file_hashes) != len(names):
+                raise ValueError(
+                    f"manifest component {self.component}: files/file_hashes mismatch"
+                )
+            return list(zip(names, [h.lower() for h in self.file_hashes]))
+        if len(names) == 1:
+            return [(names[0], self.sha256)]
+        raise ValueError(
+            f"manifest component {self.component}: multi-file entry needs file_hashes"
+        )
 
 
 @dataclass(frozen=True)
@@ -70,6 +94,23 @@ def _component_from_dict(raw: dict) -> ModelComponent:
     if digest_len != 64 or any(c not in "0123456789abcdef" for c in sha256):
         raise ValueError(f"manifest component has invalid sha256: {sha256!r}")
     _check_relative_filename(filename)
+    raw_files = raw.get("files", [filename])
+    if not isinstance(raw_files, list) or not raw_files or not all(
+        isinstance(item, str) for item in raw_files
+    ):
+        raise ValueError("manifest component files must be a non-empty string list")
+    for name in raw_files:
+        _check_relative_filename(name)
+    raw_hashes = raw.get("file_hashes", [])
+    if raw_hashes and (
+        not isinstance(raw_hashes, list)
+        or len(raw_hashes) != len(raw_files)
+        or not all(isinstance(item, str) for item in raw_hashes)
+    ):
+        raise ValueError("manifest component file_hashes must match files")
+    for digest in raw_hashes:
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest.lower()):
+            raise ValueError(f"manifest component has invalid sha256: {digest!r}")
     return ModelComponent(
         component=component,
         runtime=runtime,
@@ -84,6 +125,8 @@ def _component_from_dict(raw: dict) -> ModelComponent:
         source=str(raw.get("source", "")),
         license=str(raw.get("license", "")),
         required=bool(raw.get("required", True)),
+        files=tuple(raw_files),
+        file_hashes=tuple(h.lower() for h in raw_hashes),
     )
 
 
@@ -156,6 +199,8 @@ def manifest_to_dict(manifest: ModelManifest) -> dict:
                 "source": c.source,
                 "license": c.license,
                 "required": c.required,
+                "files": list(c.files or (c.filename,)),
+                "file_hashes": list(c.file_hashes),
             }
             for c in manifest.components
         ],
@@ -198,42 +243,50 @@ class IntegrityProblem:
 
 
 def verify_manifest(model_root: str, manifest: ModelManifest) -> list[IntegrityProblem]:
-    """Check every required component: file exists, expected type/path,
-    size matches when declared, SHA-256 matches. Optional components
-    that are absent are skipped; present-but-corrupt optional ones are
-    still reported. Never raises for content problems (returns them);
-    never downloads anything."""
+    """Check every required component file: exists under the trusted
+    root, non-empty, size matches when declared (primary file), SHA-256
+    matches. Optional components that are fully absent are skipped;
+    present-but-corrupt optional files are still reported. Never raises
+    for content problems (returns them); never downloads anything."""
     import os
 
     problems: list[IntegrityProblem] = []
     for component in manifest.components:
         try:
-            path = resolve_trusted_path(model_root, component.filename)
+            entries = component.resolved_files()
         except ValueError:
-            problems.append(IntegrityProblem(component.component, "unsafe_path"))
+            problems.append(IntegrityProblem(component.component, "invalid_entry"))
             continue
-        if not os.path.isfile(path):
-            if component.required:
-                problems.append(IntegrityProblem(component.component, "missing_file"))
-            continue
-        try:
-            actual_size = os.path.getsize(path)
-        except OSError:
-            problems.append(IntegrityProblem(component.component, "unreadable_file"))
-            continue
-        if actual_size == 0:
-            problems.append(IntegrityProblem(component.component, "empty_file"))
-            continue
-        if component.size and actual_size != component.size:
-            problems.append(IntegrityProblem(component.component, "size_mismatch"))
-            continue
-        try:
-            actual_digest = sha256_file(path)
-        except OSError:
-            problems.append(IntegrityProblem(component.component, "unreadable_file"))
-            continue
-        if actual_digest != component.sha256:
-            problems.append(IntegrityProblem(component.component, "hash_mismatch"))
+        for index, (filename, expected) in enumerate(entries):
+            try:
+                path = resolve_trusted_path(model_root, filename)
+            except ValueError:
+                problems.append(IntegrityProblem(component.component, "unsafe_path"))
+                continue
+            if not os.path.isfile(path):
+                if component.required:
+                    problems.append(
+                        IntegrityProblem(component.component, "missing_file")
+                    )
+                continue
+            try:
+                actual_size = os.path.getsize(path)
+            except OSError:
+                problems.append(IntegrityProblem(component.component, "unreadable_file"))
+                continue
+            if actual_size == 0:
+                problems.append(IntegrityProblem(component.component, "empty_file"))
+                continue
+            if index == 0 and component.size and actual_size != component.size:
+                problems.append(IntegrityProblem(component.component, "size_mismatch"))
+                continue
+            try:
+                actual_digest = sha256_file(path)
+            except OSError:
+                problems.append(IntegrityProblem(component.component, "unreadable_file"))
+                continue
+            if actual_digest != expected:
+                problems.append(IntegrityProblem(component.component, "hash_mismatch"))
     return problems
 
 
@@ -241,21 +294,24 @@ def baseline_manifest(
     *,
     whisper_sha256: str,
     llama_sha256: str,
-    tts_sha256: str,
+    tts_model_sha256: str,
+    tts_tokens_sha256: str,
     whisper_size: int = 0,
     llama_size: int = 0,
-    tts_size: int = 0,
+    tts_voice: str = "es-female-1",
     whisper_runtime_version: str = "",
     llama_runtime_version: str = "",
     tts_runtime_version: str = "",
-    tts_voice: str = "es-female-1",
 ) -> ModelManifest:
     """Build the approved CPU baseline profile manifest.
 
-    Caller supplies the artifact checksums measured at install time
-    (pinned per deployment); logical ids, runtimes, and provenance are
-    fixed by this function so the default can never silently drift to
-    a different model.
+    The caller supplies the artifact checksums measured at install
+    time (pinned per deployment); logical ids, runtimes, and
+    provenance are fixed here so the default can never silently drift
+    to a different model. The TTS voice is a directory
+    (``tts/<voice>/``) whose executed files — ``model.onnx`` plus
+    ``tokens.txt`` — are each hashed: swapping any of them invalidates
+    integrity.
     """
     return ModelManifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
@@ -294,15 +350,22 @@ def baseline_manifest(
                 runtime="sherpa-onnx",
                 runtime_version=tts_runtime_version,
                 model_id="tts-es-onnx",
-                filename="tts/es-voice.onnx",
-                sha256=tts_sha256.lower(),
-                size=tts_size,
+                filename=f"tts/{tts_voice}/model.onnx",
+                sha256=tts_model_sha256.lower(),
                 arch_quant="ONNX VITS-compatible",
                 language="es",
                 voice=tts_voice,
                 source="operator-provisioned Spanish ONNX voice",
                 license="operator-provisioned (check voice license before use)",
                 required=True,
+                files=(
+                    f"tts/{tts_voice}/model.onnx",
+                    f"tts/{tts_voice}/tokens.txt",
+                ),
+                file_hashes=(
+                    tts_model_sha256.lower(),
+                    tts_tokens_sha256.lower(),
+                ),
             ),
         ),
     )
