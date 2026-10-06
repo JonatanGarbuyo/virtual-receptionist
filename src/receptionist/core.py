@@ -25,6 +25,9 @@ from receptionist.alerting import (
     CODE_TRANSCRIPT_UNAVAILABLE,
     HealthComponent,
     HealthMonitor,
+    HttpTransport,
+    SmtpTransport,
+    build_monitor,
 )
 from receptionist.call_session import CallSession, CallState
 from receptionist.config import ConfigService
@@ -66,6 +69,8 @@ class ReceptionistCore:
         knowledge: KnowledgeService | None = None,
         resilience: ResilienceConfig | None = None,
         monitor: HealthMonitor | None = None,
+        smtp_transport: SmtpTransport | None = None,
+        http_transport: HttpTransport | None = None,
     ) -> None:
         self._telephony = telephony
         self._voice = voice
@@ -85,9 +90,19 @@ class ReceptionistCore:
         )
         self.capacity = CapacityLimiter(max_sessions=self._resilience.max_ai_sessions)
         self.health = ServiceHealth()
-        # Structured alerting is always available: with no sinks the
-        # monitor keeps the local transition record only.
-        self.monitor = monitor if monitor is not None else HealthMonitor(clock=clock)
+        # Productive alerting composition: with no monitor injected, the
+        # monitor (and its sinks) is built once from config.db through
+        # ConfigService, honoring the persisted notify_recovery flag.
+        # Disabled channels stay local-only; invalid enabled channels
+        # fail composition explicitly instead of half-applied operation.
+        if monitor is None:
+            monitor = build_monitor(
+                config_service.alert_settings(),
+                clock,
+                smtp_transport=smtp_transport,
+                http_transport=http_transport,
+            )
+        self.monitor = monitor
         self._sessions: dict[str, CallSession] = {}
         self._ai_permits: set[str] = set()
         self._last_prune: float | None = None

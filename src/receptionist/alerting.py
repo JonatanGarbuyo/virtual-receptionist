@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -122,9 +125,10 @@ class AlertSink(Protocol):
     def send(self, transition: HealthTransition) -> None: ...
 
 
-#: Upper bound on concurrent in-flight deliveries. Beyond it, transitions
+#: Upper bound on queued undelivered transitions. Beyond it, transitions
 #: are still recorded locally but external fan-out for the excess is
-#: skipped with a local diagnostic: saturation never blocks reporters.
+#: skipped with a local diagnostic: saturation never blocks reporters
+#: and never reorders the transitions already accepted.
 MAX_PENDING_DELIVERIES = 32
 
 _LOGGER = logging.getLogger("virtual-receptionist.health")
@@ -168,16 +172,17 @@ class HealthMonitor:
     The single place that turns subsystem reports into transitions:
     first report of a (component, code) emits UNHEALTHY, repeats are
     silent, recovery emits RECOVERED once (externally only when
-    notify_recovery is set; locally always). Every emitted transition is
-    recorded locally and emitted as a structured log line before any
+    notify_recovery is set; locally always). Every emitted transition
+    is recorded locally and emitted as a structured log line before any
     sink runs, so the local record exists even when all sinks fail.
 
-    External delivery never blocks reporters: each emitted transition is
-    fanned out on a bounded daemon thread with per-sink isolation, so a
-    slow endpoint cannot stall call admission. Use drain() in tests and
-    close() at shutdown for explicit lifecycle. Sink exceptions (and
-    hostile sink objects) are contained per sink and diagnosed locally
-    without recursion.
+    External delivery never blocks reporters: emitted transitions wait
+    on one bounded FIFO queue drained by a single daemon worker, so the
+    external order always matches history() order while slow endpoints
+    cannot stall call admission. Use drain() in tests and close() at
+    shutdown for explicit lifecycle. Sink exceptions (and hostile sink
+    objects) are contained per sink and diagnosed locally without
+    recursion.
     """
 
     clock: Clock
@@ -189,7 +194,8 @@ class HealthMonitor:
         self._active: dict[tuple[HealthComponent, str], ActiveCondition] = {}
         self._history: list[HealthTransition] = []
         self._diagnostics: list[DeliveryDiagnostic] = []
-        self._pending: list[threading.Thread] = []
+        self._queue: queue.Queue = queue.Queue(maxsize=MAX_PENDING_DELIVERIES)
+        self._worker: threading.Thread | None = None
         self._closed = False
 
     def active_conditions(self) -> tuple[ActiveCondition, ...]:
@@ -205,20 +211,34 @@ class HealthMonitor:
         return tuple(self._diagnostics)
 
     def drain(self, timeout: float = 5.0) -> None:
-        """Wait (bounded) for in-flight deliveries. Deterministic tests
-        call this before asserting what sinks received."""
+        """Wait (bounded) until every accepted transition is delivered.
+        Deterministic tests call this before asserting what sinks
+        received. Delivery order always matches history() order."""
+        if self._worker is None:
+            return
+        done = threading.Event()
         deadline = time.monotonic() + timeout
-        for thread in list(self._pending):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(timeout=remaining)
-        self._pending = [t for t in self._pending if t.is_alive()]
+        try:
+            self._queue.put(("flush", done), timeout=max(deadline - time.monotonic(), 0))
+        except queue.Full:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            done.wait(timeout=remaining)
 
     def close(self) -> None:
-        """Shutdown: no further external deliveries; drain what is flying."""
+        """Shutdown: no further external deliveries; drain what is queued,
+        bounded. Never leaves one thread per transition behind: there is
+        a single worker at most, and joining it drains everything ahead
+        of the stop marker."""
         self._closed = True
-        self.drain()
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            try:
+                self._queue.put(("stop", None), timeout=5.0)
+            except queue.Full:
+                pass
+            worker.join(timeout=5.0)
 
     def _now(self) -> float:
         try:
@@ -282,8 +302,14 @@ class HealthMonitor:
     def _fan_out_async(self, transition: HealthTransition) -> None:
         if self._closed or not self.sinks:
             return
-        self._pending = [t for t in self._pending if t.is_alive()]
-        if len(self._pending) >= MAX_PENDING_DELIVERIES:
+        if self._worker is None or not self._worker.is_alive():
+            self._worker = threading.Thread(
+                target=self._drain_queue, daemon=True, name="health-alerts"
+            )
+            self._worker.start()
+        try:
+            self._queue.put_nowait(("transition", transition))
+        except queue.Full:
             diagnostic = DeliveryDiagnostic(
                 timestamp=self._now(),
                 sink_name="dispatcher",
@@ -291,12 +317,19 @@ class HealthMonitor:
             )
             self._diagnostics.append(diagnostic)
             _log_diagnostic(diagnostic)
-            return
-        thread = threading.Thread(
-            target=self._deliver, args=(transition,), daemon=True
-        )
-        self._pending.append(thread)
-        thread.start()
+
+    def _drain_queue(self) -> None:
+        while True:
+            kind, payload = self._queue.get()
+            try:
+                if kind == "stop":
+                    return
+                if kind == "flush":
+                    payload.set()
+                elif kind == "transition":
+                    self._deliver(payload)
+            finally:
+                self._queue.task_done()
 
     def _deliver(self, transition: HealthTransition) -> None:
         for index, sink in enumerate(self.sinks):
@@ -550,6 +583,16 @@ class SmtplibTransport:
             client.sendmail(sender, list(recipients), message)
 
 
+class _NoFollowRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect before headers or payload move. Following a
+    301/302/303 would resend the Authorization header to a host the
+    operator never configured; a redirecting endpoint surfaces as a
+    delivery failure instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise TransportError(f"redirect refused (http {code})")
+
+
 class UrllibTransport:
     """Real outbound HTTPS posts over the standard library. Bounded by
     timeout; failures raise for local diagnosis by type name only.
@@ -561,19 +604,15 @@ class UrllibTransport:
     """
 
     def __init__(self) -> None:
-        import urllib.request
-
         self._opener = urllib.request.build_opener(
-            urllib.request.HTTPHandler, urllib.request.HTTPSHandler
+            urllib.request.HTTPHandler,
+            urllib.request.HTTPSHandler,
+            _NoFollowRedirectHandler(),
         )
 
     def post(
         self, url: str, payload: dict, headers: dict, timeout_seconds: float
     ) -> None:
-        import json
-        import urllib.error
-        import urllib.request
-
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
