@@ -8,6 +8,7 @@ modes, spoken audio, persisted summaries, and health.
 
 import unittest
 
+from receptionist.alerting import HealthComponent
 from receptionist.boundaries import CallOutcome
 from receptionist.call_session import ActiveMode, CallSession, CallState
 from receptionist.config import ConfigService, InMemoryConfigRepository
@@ -409,7 +410,13 @@ class HealthSemanticsTest(unittest.TestCase):
         core.start()
 
         self.assertEqual(core.health.status, HealthStatus.NOT_READY)
-        self.assertIn("greeting", core.health.detail)
+        # Detail is registry-owned (no dynamic key names leak into health):
+        # the stable condition identifies what is missing.
+        self.assertEqual(core.health.detail, "required configuration missing")
+        active = {(c.component, c.code) for c in core.monitor.active_conditions()}
+        self.assertIn(
+            (HealthComponent.CONFIGURATION, "config.missing_required"), active
+        )
 
     def test_blank_required_values_count_as_missing(self) -> None:
         blank_greeting, _, _, _, _ = make_core(
@@ -417,14 +424,14 @@ class HealthSemanticsTest(unittest.TestCase):
         )
         blank_greeting.start()
         self.assertEqual(blank_greeting.health.status, HealthStatus.NOT_READY)
-        self.assertIn("greeting", blank_greeting.health.detail)
+        self.assertEqual(blank_greeting.health.detail, "required configuration missing")
 
         blank_language, _, _, _, _ = make_core(
             config_values={"greeting": GREETING, "language": ""}
         )
         blank_language.start()
         self.assertEqual(blank_language.health.status, HealthStatus.NOT_READY)
-        self.assertIn("language", blank_language.health.detail)
+        self.assertEqual(blank_language.health.detail, "required configuration missing")
 
 
 class SessionEvictionTest(unittest.TestCase):

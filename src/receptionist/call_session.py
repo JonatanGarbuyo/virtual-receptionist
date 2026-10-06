@@ -33,6 +33,13 @@ from receptionist.boundaries import (
     VoiceBackend,
     VoiceSession,
 )
+from receptionist.alerting import (
+    CODE_AUDIT_UNAVAILABLE,
+    CODE_HISTORY_UNAVAILABLE,
+    CODE_TRANSCRIPT_UNAVAILABLE,
+    HealthComponent,
+    HealthMonitor,
+)
 from receptionist.persistence import RuntimeStorage
 from receptionist.policy import DestinationStatus, PolicyEngine
 from receptionist.resilience import CircuitBreaker, ResilienceConfig, RetryPolicy
@@ -128,6 +135,7 @@ class CallSession:
         transcripts_enabled: bool = False,
         resilience: ResilienceConfig | None = None,
         breaker: CircuitBreaker | None = None,
+        monitor: HealthMonitor | None = None,
     ) -> None:
         self.call_id = call_id
         self.caller_id = caller_id
@@ -145,6 +153,7 @@ class CallSession:
         self._resilience = resilience if resilience is not None else ResilienceConfig()
         self._retry_policy = RetryPolicy(self._resilience.provider_retries)
         self._breaker = breaker
+        self._monitor = monitor
         self._voice_epoch = -1
         self._attempts_made = 0
         self._turn_started_at = clock.now()
@@ -213,6 +222,41 @@ class CallSession:
         self._state = state
         self._history.append(state)
 
+    def _report_unhealthy(self, component: HealthComponent, code: str) -> None:
+        if self._monitor is not None:
+            self._monitor.report_unhealthy(component, code)
+
+    def _report_recovered(self, component: HealthComponent, code: str) -> None:
+        if self._monitor is not None:
+            self._monitor.report_recovered(component, code)
+
+    def _record_transcript(self, speaker: str, text: str) -> None:
+        # The transcript boundary declares no error type, so any sidecar
+        # failure is contained here: audio already played, the call
+        # continues, degradation is flagged, nothing is swallowed blindly.
+        # A later success clears both the flag and the condition, so the
+        # aggregate health cannot disagree with the monitor.
+        try:
+            self._runtime.transcripts.append(
+                TranscriptEntry(
+                    call_id=self.call_id,
+                    timestamp=self._clock.now(),
+                    speaker=speaker,
+                    text=text,
+                )
+            )
+        except Exception:
+            self._transcript_failed = True
+            self._report_unhealthy(
+                HealthComponent.TRANSCRIPT,
+                CODE_TRANSCRIPT_UNAVAILABLE,
+            )
+        else:
+            self._transcript_failed = False
+            self._report_recovered(
+                HealthComponent.TRANSCRIPT, CODE_TRANSCRIPT_UNAVAILABLE
+            )
+
     def _speak(self, text: str, turn_id: int) -> None:
         """Play assistant audio; record it as observational text when enabled.
 
@@ -222,20 +266,7 @@ class CallSession:
         assert self._voice_session is not None  # opened in request_answer
         self._voice_session.speak(text, turn_id)
         if self._transcripts_enabled:
-            # The transcript boundary declares no error type, so any sidecar
-            # failure is contained here: audio already played, the call
-            # continues, degradation is flagged, nothing is swallowed blindly.
-            try:
-                self._runtime.transcripts.append(
-                    TranscriptEntry(
-                        call_id=self.call_id,
-                        timestamp=self._clock.now(),
-                        speaker="assistant",
-                        text=text,
-                    )
-                )
-            except Exception:
-                self._transcript_failed = True
+            self._record_transcript("assistant", text)
 
     def _open_voice_attempt(self) -> None:
         """Close the previous attempt (cancelling it) and open a fresh
@@ -385,18 +416,7 @@ class CallSession:
         if self._state is not CallState.ACTIVE:
             return
         if self._transcripts_enabled:
-            # Same containment as assistant-side transcripts (see _speak).
-            try:
-                self._runtime.transcripts.append(
-                    TranscriptEntry(
-                        call_id=self.call_id,
-                        timestamp=self._clock.now(),
-                        speaker="caller",
-                        text=text,
-                    )
-                )
-            except Exception:
-                self._transcript_failed = True
+            self._record_transcript("caller", text)
         if self._terminate_if_over_limit():
             return
         if self._mode is ActiveMode.MESSAGE_CAPTURE:
@@ -744,6 +764,13 @@ class CallSession:
             )
         except (StoreUnavailableError, TransientStoreError):
             self._audit_failed = True
+            self._report_unhealthy(
+                HealthComponent.RUNTIME,
+                CODE_AUDIT_UNAVAILABLE,
+            )
+        else:
+            self._audit_failed = False
+            self._report_recovered(HealthComponent.RUNTIME, CODE_AUDIT_UNAVAILABLE)
 
     # -- local actions -----------------------------------------------------
 
@@ -782,3 +809,12 @@ class CallSession:
             # History is observability: a store write failure is flagged
             # for degradation, never allowed to break call teardown.
             self._history_failed = True
+            self._report_unhealthy(
+                HealthComponent.RUNTIME,
+                CODE_HISTORY_UNAVAILABLE,
+            )
+        else:
+            self._history_failed = False
+            self._report_recovered(
+                HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE
+            )

@@ -196,6 +196,11 @@ class CapacityLimiter:
     def active(self) -> int:
         return self._active
 
+    @property
+    def saturated(self) -> bool:
+        """Whether no free slot remains right now."""
+        return self._active >= self._max_sessions
+
     def acquire(self) -> bool:
         """Take one AI slot. False when saturated: no resources opened."""
         if self._active >= self._max_sessions:
