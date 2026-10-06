@@ -942,6 +942,7 @@ class CascadedVoiceBackend:
         self._verified = False
         self._warm_problems: list[str] = []
         self._integrity_problems: list[str] = []
+        self._runtime_versions: dict[str, str] = {}
         self._closed = False
 
     @property
@@ -1012,10 +1013,45 @@ class CascadedVoiceBackend:
                 manifest = None
             if manifest is not None:
                 self.verify(manifest, self._profile.model_root)
+                self._check_runtime_versions(manifest)
         with self._lock:
             if self._closed:
                 return
             self._started = True
+
+    def _check_runtime_versions(self, manifest) -> None:
+        """Actual runtime vs manifest-pinned identity, before READY.
+
+        Probes each adapter's real version and gates on
+        `versions_compatible`: exact series with patch >= pinned.
+        Empty/malformed/unknown on either side is a version problem,
+        never a silent pass — a productive manifest pins every
+        required component's `runtime_version`.
+        """
+        from receptionist.voice_manifest import versions_compatible
+
+        by_id = {c.component: c for c in manifest.components}
+        for component_id, adapter in (
+            ("stt", self._stt),
+            ("llm", self._llm),
+            ("tts", self._tts),
+        ):
+            entry = by_id.get(component_id)
+            probe = getattr(adapter, "probe_version", None)
+            if entry is None or not callable(probe):
+                continue
+            try:
+                actual = probe()
+            except Exception:
+                actual = "unknown"
+            with self._lock:
+                self._runtime_versions[component_id] = actual
+            if not versions_compatible(actual, entry.runtime_version):
+                with self._lock:
+                    problem = f"{component_id}:version_mismatch"
+                    if problem not in self._integrity_problems:
+                        self._integrity_problems.append(problem)
+                    self._verified = False
 
     def warm(self) -> list[str]:
         """Minimal real warmup per component: each adapter must prove

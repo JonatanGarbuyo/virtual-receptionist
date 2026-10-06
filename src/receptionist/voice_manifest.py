@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -231,6 +232,36 @@ def sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def parse_runtime_version(raw: str) -> tuple[int, int, int] | None:
+    """Strict X.Y.Z runtime version. Anything else (empty, `unknown`,
+    build tags) is unparseable and never compatible."""
+    if not isinstance(raw, str):
+        return None
+    match = _VERSION_RE.match(raw.strip())
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def versions_compatible(actual: str, pinned: str) -> bool:
+    """Compat gate: same MAJOR.MINOR series with actual patch >= pinned
+    patch. Anything unparseable or empty on either side is incompatible:
+    a productive manifest must pin an exact version and the installed
+    runtime must identifiably belong to its series."""
+    actual_v = parse_runtime_version(actual)
+    pinned_v = parse_runtime_version(pinned)
+    if actual_v is None or pinned_v is None:
+        return False
+    return (
+        actual_v[0] == pinned_v[0]
+        and actual_v[1] == pinned_v[1]
+        and actual_v[2] >= pinned_v[2]
+    )
 
 
 @dataclass(frozen=True)

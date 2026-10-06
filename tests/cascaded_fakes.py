@@ -42,6 +42,7 @@ class FakeSTTAdapter:
         self.calls: list[dict] = []
         self.warmups = 0
         self.closed = False
+        self.version = "9.9.9"
 
     def transcribe(self, pcm: bytes, sample_rate: int, cancel: CancelToken) -> STTResult:
         cancel.throw_if_cancelled()
@@ -52,6 +53,12 @@ class FakeSTTAdapter:
         if self.transcripts:
             return STTResult(text=self.transcripts.pop(0))
         return STTResult(text="")
+
+    def version_info(self) -> str:
+        return self.version
+
+    def probe_version(self) -> str:
+        return self.version
 
     def warmup(self) -> None:
         self.warmups += 1
@@ -75,6 +82,7 @@ class FakeLLMAdapter:
         self.prompts: list[str] = []
         self.warmups = 0
         self.closed = False
+        self.version = "9.9.9"
 
     def generate(self, prompt: str, cancel: CancelToken) -> str:
         cancel.throw_if_cancelled()
@@ -85,6 +93,12 @@ class FakeLLMAdapter:
         if self.documents:
             return self.documents.pop(0)
         return json.dumps({"spoken_text": "De acuerdo.", "action": None})
+
+    def version_info(self) -> str:
+        return self.version
+
+    def probe_version(self) -> str:
+        return self.version
 
     def warmup(self) -> None:
         self.warmups += 1
@@ -121,6 +135,7 @@ class FakeTTSAdapter:
         self.texts: list[str] = []
         self.warmups = 0
         self.closed = False
+        self.version = "9.9.9"
 
     def synthesize(
         self,
@@ -156,6 +171,12 @@ class FakeTTSAdapter:
                     ProviderFailureCategory.INTERNAL, "tts failed mid-stream"
                 )
         return total
+
+    def version_info(self) -> str:
+        return self.version
+
+    def probe_version(self) -> str:
+        return self.version
 
     def warmup(self) -> None:
         self.warmups += 1

@@ -36,6 +36,7 @@ import json
 import logging
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import socket
@@ -43,8 +44,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 import wave
 
@@ -289,30 +288,110 @@ def wait_for_port(
     ) from last
 
 
+def _cancellable_exchange(
+    url: str,
+    method: str,
+    body: bytes | None,
+    headers: dict[str, str],
+    *,
+    timeout_seconds: float,
+    cancel: CancelToken,
+) -> tuple[int, bytes]:
+    """One HTTP exchange with a loopback runtime server that cancel can
+    genuinely preempt: the request runs on a short-lived worker holding
+    an `http.client` connection, while the caller waits in small slices.
+    On cancel (or deadline) the socket is closed, which unblocks the
+    worker promptly — the caller never sits in `urlopen()` until a
+    30/60 s timeout. The worker is always reaped (bounded join); the
+    server-side tail of an abandoned request is bounded by the short
+    turn sizes (capped `n_predict`, capped audio), and capacity-1
+    admission plus per-adapter serialization keep stale requests from
+    accumulating without bound: at most one abandoned tail per adapter
+    can exist, and each finishes server-side on its own bounded work.
+    """
+    import http.client
+    from urllib.parse import urlparse
+
+    _check_url_loopback(url)
+    cancel.throw_if_cancelled()
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    outcome: dict[str, object] = {}
+    finished = threading.Event()
+    slot: dict[str, object] = {}
+
+    def _close_slot() -> None:
+        conn = slot.get("conn")
+        if conn is not None:
+            try:
+                conn.close()  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+    def _worker() -> None:
+        conn = http.client.HTTPConnection(host, port)
+        slot["conn"] = conn
+        # Fires immediately when cancellation already landed, so the
+        # close cannot be missed in any registration race.
+        cancel.on_cancel(_close_slot)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            raw = response.read(MAX_HTTP_BODY + 1)
+            outcome["result"] = (int(response.status), raw)
+        except Exception as error:  # closed socket, reset, refusal, ...
+            outcome["error"] = error
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            finished.set()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + timeout_seconds
+    while not finished.wait(0.02):
+        if cancel.cancelled:
+            _close_slot()
+            break
+        if time.monotonic() >= deadline:
+            _close_slot()
+            break
+    if not finished.is_set():
+        # Abandoned in flight: the socket close above unblocks the
+        # worker; the bounded join reaps it (no leak by construction).
+        thread.join(timeout=2.0)
+        if cancel.cancelled:
+            raise CancelledError()
+        raise AdapterError(ProviderFailureCategory.TIMEOUT, "runtime request timed out")
+    thread.join(timeout=2.0)
+    if cancel.cancelled and "result" not in outcome:
+        raise CancelledError()
+    if "result" in outcome:
+        result = outcome["result"]
+        assert isinstance(result, tuple)
+        return result[0], result[1]
+    error = outcome.get("error")
+    if isinstance(error, CancelledError):
+        raise error
+    raise AdapterError(
+        ProviderFailureCategory.UNAVAILABLE, "runtime server unreachable"
+    ) from (error if isinstance(error, Exception) else None)
+
+
 def http_get_json(
     url: str, *, timeout_seconds: float, cancel: CancelToken
 ) -> tuple[int, dict]:
     """GET JSON from a loopback runtime server. Capped body, parsed
     defensively (non-JSON or non-object fails closed)."""
-    _check_url_loopback(url)
-    cancel.throw_if_cancelled()
-    request = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = int(response.status)
-            raw = response.read(MAX_HTTP_BODY + 1)
-    except urllib.error.HTTPError as error:
-        try:
-            raw = error.read(MAX_HTTP_BODY + 1)
-        except Exception:
-            raw = b""
-        return int(error.code), _parse_json_object(raw)
-    except (OSError, ValueError) as error:
-        raise AdapterError(
-            ProviderFailureCategory.UNAVAILABLE, "runtime server unreachable"
-        ) from error
-    if cancel.cancelled:
-        raise CancelledError()
+    status, raw = _cancellable_exchange(
+        url, "GET", None, {}, timeout_seconds=timeout_seconds, cancel=cancel
+    )
     return status, _parse_json_object(raw)
 
 
@@ -324,8 +403,6 @@ def http_post_json(
     cancel: CancelToken,
 ) -> tuple[int, dict]:
     """POST JSON to a loopback runtime server. Capped bodies both ways."""
-    _check_url_loopback(url)
-    cancel.throw_if_cancelled()
     try:
         body = json.dumps(payload).encode("utf-8")
     except (TypeError, ValueError) as error:
@@ -336,25 +413,14 @@ def http_post_json(
         raise AdapterError(
             ProviderFailureCategory.INVALID_OUTPUT, "runtime request too large"
         )
-    request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    status, raw = _cancellable_exchange(
+        url,
+        "POST",
+        body,
+        {"Content-Type": "application/json"},
+        timeout_seconds=timeout_seconds,
+        cancel=cancel,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = int(response.status)
-            raw = response.read(MAX_HTTP_BODY + 1)
-    except urllib.error.HTTPError as error:
-        try:
-            raw = error.read(MAX_HTTP_BODY + 1)
-        except Exception:
-            raw = b""
-        return int(error.code), _parse_json_object(raw)
-    except (OSError, ValueError) as error:
-        raise AdapterError(
-            ProviderFailureCategory.UNAVAILABLE, "runtime server unreachable"
-        ) from error
-    if cancel.cancelled:
-        raise CancelledError()
     return status, _parse_json_object(raw)
 
 
@@ -395,28 +461,14 @@ def http_post_multipart(
         raise AdapterError(
             ProviderFailureCategory.INVALID_OUTPUT, "runtime request too large"
         )
-    request = urllib.request.Request(
+    status, raw = _cancellable_exchange(
         url,
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
+        "POST",
+        body,
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        timeout_seconds=timeout_seconds,
+        cancel=cancel,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = int(response.status)
-            raw = response.read(MAX_HTTP_BODY + 1)
-    except urllib.error.HTTPError as error:
-        try:
-            raw = error.read(MAX_HTTP_BODY + 1)
-        except Exception:
-            raw = b""
-        return int(error.code), _parse_json_object(raw)
-    except (OSError, ValueError) as error:
-        raise AdapterError(
-            ProviderFailureCategory.UNAVAILABLE, "runtime server unreachable"
-        ) from error
-    if cancel.cancelled:
-        raise CancelledError()
     return status, _parse_json_object(raw)
 
 
@@ -440,28 +492,19 @@ def _parse_json_object(raw: bytes) -> dict:
     return document if isinstance(document, dict) else {}
 
 
-def _write_wav_16k_mono(pcm: bytes, path: str) -> None:
-    """Transient WAV for the STT server upload. Deleted (with any
-    runtime-created siblings) immediately after the request."""
-    with wave.open(path, "wb") as handle:
+def _wav_16k_mono_bytes(pcm: bytes) -> bytes:
+    """Encode transient 16 kHz mono WAV fully in RAM. Caller audio
+    never touches the filesystem: no temp files, no siblings, no
+    cleanup protocol needed."""
+    import io
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
         handle.setnchannels(1)
         handle.setsampwidth(2)
         handle.setframerate(16000)
         handle.writeframes(pcm)
-
-
-def _cleanup_tracked_wav(tmp_path: str) -> None:
-    """Delete the transient WAV plus any sibling the runtime derived
-    from it (defense for file-output modes we never request)."""
-    import glob
-
-    candidates = [tmp_path] + sorted(glob.glob(tmp_path + ".*"))
-    for path in candidates:
-        try:
-            if os.path.isfile(path):
-                os.unlink(path)
-        except OSError:
-            pass
+    return buffer.getvalue()
 
 
 class _ServerProcess:
@@ -519,11 +562,11 @@ class WhisperServerSTT:
     """whisper.cpp STT via a resident `whisper-server` process.
 
     Spawned once (`-m model --host 127.0.0.1 --port P -l es --no-gpu`);
-    every turn POSTs the transient WAV to `/inference`
+    every turn POSTs an in-RAM WAV to `/inference`
     (`response_format=json` → `{"text": ...}`). No `--output-txt`
-    anywhere: transcription travels in the HTTP body only, and the
-    transient WAV (plus any runtime-derived sibling) is deleted right
-    after the request — no transcript ever touches disk as a side effect.
+    anywhere and no caller-audio file creation at all: transcription
+    travels in the HTTP body only, so no transcript can leak to disk
+    as a side effect.
     """
 
     component = "stt"
@@ -555,6 +598,19 @@ class WhisperServerSTT:
         self._closed = False
 
     def version_info(self) -> str:
+        return self._version
+
+    def probe_version(self) -> str:
+        """Lightweight runtime identity (no serving): query `--version`
+        and parse the real upstream format. Raises AdapterError when
+        the binary cannot answer or the output is malformed."""
+        raw = query_version(self._executable, name="stt")
+        parsed = parse_whisper_version(raw)
+        if parsed is None:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
+            )
+        self._version = format_version(parsed)
         return self._version
 
     def start(self) -> None:
@@ -601,27 +657,16 @@ class WhisperServerSTT:
             raise AdapterError(
                 ProviderFailureCategory.INVALID_OUTPUT, "empty turn audio"
             )
-        tmp_path = ""
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".wav", delete=False
-            ) as tmp:
-                tmp_path = tmp.name
-            _write_wav_16k_mono(pcm, tmp_path)
-            with open(tmp_path, "rb") as handle:
-                wav_bytes = handle.read()
-            status, document = http_post_multipart(
-                self.base_url() + "/inference",
-                {"temperature": "0.0", "response_format": "json"},
-                "file",
-                "turn.wav",
-                wav_bytes,
-                timeout_seconds=self._timeout,
-                cancel=cancel,
-            )
-        finally:
-            if tmp_path:
-                _cleanup_tracked_wav(tmp_path)
+        wav_bytes = _wav_16k_mono_bytes(pcm)
+        status, document = http_post_multipart(
+            self.base_url() + "/inference",
+            {"temperature": "0.0", "response_format": "json"},
+            "file",
+            "turn.wav",
+            wav_bytes,
+            timeout_seconds=self._timeout,
+            cancel=cancel,
+        )
         if status != 200:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, "stt inference failed"
@@ -634,13 +679,7 @@ class WhisperServerSTT:
         return STTResult(text=text.strip())
 
     def warmup(self) -> None:
-        raw = query_version(self._executable, name="stt")
-        parsed = parse_whisper_version(raw)
-        if parsed is None:
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
-            )
-        self._version = format_version(parsed)
+        self.probe_version()
         self.start()
         # Silence inference through the resident model: proves it serves.
         self.transcribe(bytes(16000 * 2), 16000, CancelToken())
@@ -697,6 +736,19 @@ class LlamaServerLLM:
         self._closed = False
 
     def version_info(self) -> str:
+        return self._version
+
+    def probe_version(self) -> str:
+        """Lightweight runtime identity (no serving): query `--version`
+        and parse the real upstream format (`version: X.Y.Z (build …)`
+        on stderr). Raises AdapterError when malformed."""
+        raw = query_version(self._executable, name="llm")
+        parsed = parse_llama_version(raw)
+        if parsed is None:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "llm version unsupported"
+            )
+        self._version = format_version(parsed)
         return self._version
 
     def start(self) -> None:
@@ -785,13 +837,7 @@ class LlamaServerLLM:
         return content.strip()
 
     def warmup(self) -> None:
-        raw = query_version(self._executable, name="llm")
-        parsed = parse_llama_version(raw)
-        if parsed is None:
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "llm version unsupported"
-            )
-        self._version = format_version(parsed)
+        self.probe_version()
         self.start()
         # Tiny completion through the resident model: proves it serves.
         self.generate('{"spoken_text": "Hola.", "action": null}', CancelToken())
@@ -804,42 +850,105 @@ class LlamaServerLLM:
 
 def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
     """Compose the production cascaded backend from a canonical voice
-    profile (config.db via ConfigService). Every operator-configurable
-    value — model root, executables, voice + speaker, timeouts — flows
-    into the adapters here; nothing in `voice.*` is dead surface.
+    profile (config.db via ConfigService). The manifest is the single
+    source of truth for artifacts:
 
-    Raises AdapterError fail-closed when the model root or a required
-    voice directory is missing.
+    1. load + schema-check the manifest;
+    2. require `manifest.profile_id == profile.profile_id`;
+    3. require exactly one of each required component (stt/llm/tts);
+    4. require the TTS component voice to match the selected voice;
+    5. resolve every path via `resolve_trusted_path` under the trusted
+       model root — no conventional filenames are reconstructed here;
+    6. verify SHA/size of exactly those resolved files;
+    7. only on positive integrity, construct the adapters with the
+       verified paths (no server is spawned yet — `start()`/`warm()`
+       do that, still fail-closed).
+
+    Anything else raises AdapterError fail-closed. No `verify A, run B`
+    is representable: the executed path always comes from the verified
+    manifest entry.
     """
     import os as _os
 
     from receptionist.cascaded import CascadedVoiceBackend
+    from receptionist.voice_manifest import (
+        load_manifest_file,
+        resolve_trusted_path,
+        verify_manifest,
+    )
 
     root = (profile.model_root or "").strip()
+    manifest_path = (profile.manifest_path or "").strip()
+    if not manifest_path:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "voice manifest not configured"
+        )
+    try:
+        manifest = load_manifest_file(manifest_path)
+    except (OSError, ValueError) as error:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "voice manifest unreadable"
+        ) from error
+    if manifest.profile_id != profile.profile_id:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "voice profile mismatch"
+        )
+    by_id: dict[str, list] = {}
+    for component in manifest.components:
+        by_id.setdefault(component.component, []).append(component)
+    for required in ("stt", "llm", "tts"):
+        entries = by_id.get(required, [])
+        if len(entries) != 1 or not entries[0].required:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE,
+                f"voice manifest missing {required}",
+            )
+    tts_entry = by_id["tts"][0]
+    selected_voice = (profile.tts_voice or "").strip() or "es-female-1"
+    if tts_entry.voice != selected_voice:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "voice incompatible with manifest"
+        )
     if not root or not _os.path.isdir(root):
         raise AdapterError(
             ProviderFailureCategory.UNAVAILABLE, "model root unavailable"
         )
-    by_file = {
-        "stt": _os.path.join(root, "stt", "ggml-model-base.bin"),
-        "llm": _os.path.join(root, "llm", "qwen3-1.7b-q4_k_m.gguf"),
-    }
-    voice_dir = _os.path.join(root, "tts", profile.tts_voice or "es-female-1")
+    problems = verify_manifest(root, manifest)
+    if problems:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE,
+            f"voice integrity failed: {problems[0]}",
+        )
+    try:
+        stt_files = by_id["stt"][0].resolved_files()
+        llm_files = by_id["llm"][0].resolved_files()
+        tts_files = tts_entry.resolved_files()
+        stt_model = resolve_trusted_path(root, stt_files[0][0])
+        llm_model = resolve_trusted_path(root, llm_files[0][0])
+        tts_names = [name for name, _ in tts_files]
+        tts_model_name = next(
+            (name for name in tts_names if name.endswith("model.onnx")), tts_names[0]
+        )
+        voice_dir = os.path.dirname(resolve_trusted_path(root, tts_model_name))
+    except (ValueError, IndexError) as error:
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE, "voice manifest invalid entry"
+        ) from error
     stt = WhisperServerSTT(
         executable=profile.stt_executable,
-        model_path=by_file["stt"],
+        model_path=stt_model,
         host=profile.server_host,
         timeout_seconds=profile.stt_timeout_seconds,
     )
     llm = LlamaServerLLM(
         executable=profile.llm_executable,
-        model_path=by_file["llm"],
+        model_path=llm_model,
         host=profile.server_host,
         timeout_seconds=profile.llm_timeout_seconds,
     )
     tts = SherpaOnnxTTS(
         model_dir=voice_dir,
-        voice=profile.tts_voice,
+        voice=selected_voice,
         speaker_id=profile.tts_speaker_id,
         timeout_seconds=profile.tts_timeout_seconds,
     )
@@ -877,54 +986,29 @@ def split_sentences(text: str, *, max_chars: int = 400) -> list[str]:
     return sentences
 
 
-def _call_with_deadline(
-    fn, *, budget_seconds: float, description: str
-):
-    """Run one blocking engine call with an effective timeout.
-
-    The call runs on a daemon worker; past the budget the turn fails
-    TIMEOUT while the orphaned worker is abandoned (never awaited).
-    Daemon-only so a stuck engine can never wedge shutdown.
-    """
-    result: list = []
-    failure: list[BaseException] = []
-
-    def _target() -> None:
-        try:
-            result.append(fn())
-        except BaseException as error:  # capture, never leak threads
-            failure.append(error)
-
-    worker = threading.Thread(target=_target, daemon=True)
-    worker.start()
-    worker.join(timeout=max(budget_seconds, 0.01))
-    if worker.is_alive():
-        raise AdapterError(ProviderFailureCategory.TIMEOUT, f"{description} timed out")
-    if failure:
-        error = failure[0]
-        if isinstance(error, AdapterError):
-            raise error
-        raise AdapterError(
-            ProviderFailureCategory.INTERNAL, f"{description} failed"
-        ) from error
-    return result[0] if result else None
-
-
 class SherpaOnnxTTS:
     """sherpa-onnx TTS via guarded optional import (stable binding).
 
-    The engine loads once and stays resident. Synthesis is
+    A single serial worker thread owns the engine: `generate()` never
+    runs concurrently with another `generate()` on the same engine —
+    no timeout, barge-in, hangup, fallback, or shutdown can leave a
+    previous synthesis running alongside a new one. Synthesis is
     sentence-chunked: first audio emits after the first sentence (never
     after the whole utterance), cancel is observed between sentences,
-    and the profile timeout bounds the whole call — the parts of M3 the
-    upstream Python API actually supports (streaming callbacks exist
-    only for some model types, so they are not claimed here).
+    and the profile timeout bounds the whole call. A timed-out or
+    cancelled job is marked abandoned and its late result is discarded
+    when the worker finishes it; later jobs queue strictly behind, so
+    abandonment never overlaps and never leaks: `close()` drains and
+    joins the single owned worker. (If a timeout ever required
+    recycling the worker/engine itself, that would be documented here:
+    with the serial design it does not — abandonment is isolation.)
 
     `sherpa_onnx` is never a hard dependency: without it (or without
     the voice files) every call fails closed UNAVAILABLE. Voice files
     resolve only under `<model_root>/tts/<voice>/` as listed in the
-    manifest (`model.onnx`, `tokens.txt`, optional lexicon/espeak data):
-    `voice` selects the directory, `speaker_id` the voice inside it.
+    manifest (`model.onnx`, `tokens.txt`, plus any lexicon/espeak data
+    the concrete voice consumes): `voice` selects the directory,
+    `speaker_id` the voice inside it.
     """
 
     component = "tts"
@@ -953,8 +1037,18 @@ class SherpaOnnxTTS:
         self._closed = False
         self._engine = None
         self._version = "unknown"
+        self._jobs: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
 
     def version_info(self) -> str:
+        return self._version
+
+    def probe_version(self) -> str:
+        """Lightweight runtime identity (no engine load): package
+        metadata, else the module attribute, else `unknown`.
+        `unknown` never passes the manifest compat gate."""
+        self._version = sherpa_version()
+        self._load()
         return self._version
 
     def _load(self):  # guarded import: optional dependency
@@ -974,9 +1068,7 @@ class SherpaOnnxTTS:
             )
         return path
 
-    def _ensure_engine(self):
-        if self._engine is not None:
-            return self._engine
+    def _create_engine(self):
         sherpa_onnx = self._load()
         try:
             vits = sherpa_onnx.OfflineTtsVitsModelConfig(
@@ -992,14 +1084,88 @@ class SherpaOnnxTTS:
                     num_threads=2,
                 )
             )
-            self._engine = sherpa_onnx.OfflineTts(config)
+            return sherpa_onnx.OfflineTts(config)
         except AdapterError:
             raise
         except Exception as error:
             raise AdapterError(
                 ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
             ) from error
-        return self._engine
+
+    def _ensure_worker(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise AdapterError(
+                    ProviderFailureCategory.UNAVAILABLE, "tts runtime closed"
+                )
+            if self._worker is not None and self._worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._serve, name=f"sherpa-tts-{id(self):x}", daemon=True
+            )
+            self._worker = worker
+            worker.start()
+
+    def _serve(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                if job is None:  # shutdown sentinel
+                    return
+                kind = job[0]
+                if kind == "load":
+                    _, done, outcome = job
+                    try:
+                        if self._engine is None:
+                            self._engine = self._create_engine()
+                        outcome["engine"] = self._engine
+                    except Exception as error:
+                        outcome["error"] = error
+                    finally:
+                        done.set()
+                else:
+                    _, done, outcome, text, speaker_id = job
+                    try:
+                        if self._engine is None:
+                            self._engine = self._create_engine()
+                        audio = self._engine.generate(
+                            text, sid=speaker_id, speed=1.0
+                        )
+                        outcome["audio"] = audio
+                    except Exception as error:
+                        outcome["error"] = error
+                    finally:
+                        done.set()
+            finally:
+                self._jobs.task_done()
+
+    def _submit(self, job: tuple) -> tuple[threading.Event, dict]:
+        done = threading.Event()
+        outcome: dict = {}
+        self._jobs.put(job[:1] + (done, outcome) + job[1:])
+        return done, outcome
+
+    def _await(
+        self, done: threading.Event, outcome: dict, cancel: CancelToken,
+        deadline: float, description: str,
+    ):
+        while not done.wait(0.02):
+            if cancel.cancelled:
+                outcome["abandoned"] = True
+                raise CancelledError()
+            if time.monotonic() >= deadline:
+                outcome["abandoned"] = True
+                raise AdapterError(
+                    ProviderFailureCategory.TIMEOUT, f"{description} timed out"
+                )
+        error = outcome.get("error")
+        if error is not None:
+            if isinstance(error, AdapterError):
+                raise error
+            raise AdapterError(
+                ProviderFailureCategory.INTERNAL, f"{description} failed"
+            ) from error
+        return outcome
 
     def synthesize(
         self,
@@ -1010,12 +1176,7 @@ class SherpaOnnxTTS:
         import struct
 
         cancel.throw_if_cancelled()
-        with self._lock:
-            if self._closed:
-                raise AdapterError(
-                    ProviderFailureCategory.UNAVAILABLE, "tts runtime closed"
-                )
-        engine = self._ensure_engine()
+        self._ensure_worker()
         sentences = split_sentences(text)
         if not sentences:
             raise AdapterError(
@@ -1025,23 +1186,12 @@ class SherpaOnnxTTS:
         total = 0
         for sentence in sentences:
             cancel.throw_if_cancelled()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AdapterError(
-                    ProviderFailureCategory.TIMEOUT, "tts synthesis timed out"
-                )
+            done, outcome = self._submit(("synth", sentence, self._speaker_id))
             try:
-                audio = _call_with_deadline(
-                    lambda: engine.generate(sentence, sid=self._speaker_id, speed=1.0),
-                    budget_seconds=remaining,
-                    description="tts synthesis",
-                )
-            except AdapterError:
+                self._await(done, outcome, cancel, deadline, "tts synthesis")
+            except (CancelledError, AdapterError):
                 raise
-            except Exception as error:
-                raise AdapterError(
-                    ProviderFailureCategory.INTERNAL, "tts synthesis failed"
-                ) from error
+            audio = outcome.get("audio")
             samples = getattr(audio, "samples", []) if audio is not None else []
             if not samples:
                 raise AdapterError(
@@ -1061,13 +1211,10 @@ class SherpaOnnxTTS:
         return total
 
     def warmup(self) -> None:
-        self._version = sherpa_version()
-        if self._version == "unknown":
-            try:
-                self._load()
-            except AdapterError:
-                raise
-        self._ensure_engine()
+        self.probe_version()
+        self._ensure_worker()
+        done, outcome = self._submit(("load",))
+        self._await(done, outcome, CancelToken(), time.monotonic() + 120.0, "tts load")
         # Tiny synthesis through the resident voice: proves it speaks.
         generated: list[bool] = []
 
@@ -1082,5 +1229,17 @@ class SherpaOnnxTTS:
 
     def close(self) -> None:
         with self._lock:
-            self._closed = True
-            self._engine = None
+            if self._closed:
+                worker = self._worker
+                self._worker = None
+            else:
+                self._closed = True
+                worker = self._worker
+                self._worker = None
+                self._engine = None
+        if worker is not None:
+            try:
+                self._jobs.put(None)
+            except Exception:
+                pass
+            worker.join(timeout=5.0)
