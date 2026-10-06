@@ -162,17 +162,65 @@ class ConversationLoopTest(unittest.TestCase):
         self.assertEqual(session.current_turn, 3)
         self.assertEqual(session.mode, ActiveMode.INFERENCE)
 
-    def test_caller_speech_while_greeting_or_speaking_is_ignored(self) -> None:
-        # Barge-in is deferred to a later ticket: speech outside
-        # LISTENING/INFERENCE must not start a turn.
+    def test_caller_speech_while_greeting_barges_in(self) -> None:
+        # Barge-in is enabled by default (#24): speech over the greeting
+        # cancels the greeting output and opens a fresh inference turn.
+        from receptionist.boundaries import CancelReason
+
         _, _, voice, _, _, session = self.start_call()
         backend = voice.sessions["call-1"]
 
         backend.deliver_caller_speech("Hola, ¿me oye?")
 
+        self.assertEqual(session.mode, ActiveMode.INFERENCE)
+        self.assertEqual(session.current_turn, 2)
+        self.assertEqual(backend.cancels, [CancelReason.BARGE_IN])
+        # A new voice attempt invalidates the greeting generation.
+        self.assertEqual(len(voice.all_sessions), 2)
+
+    def test_barge_in_disabled_keeps_deferred_behavior(self) -> None:
+        from receptionist.call_session import CallSession
+        from receptionist.persistence import (
+            InMemoryAuditLog,
+            InMemoryCallRepository,
+            InMemoryMessageRepository,
+            InMemoryTranscriptStore,
+            RuntimeStorage,
+        )
+        from receptionist.policy import Limits, PolicyEngine
+
+        from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony
+
+        clock = FakeClock()
+        telephony = FakeTelephony(auto_confirm=False)
+        voice = FakeVoiceBackend()
+        core, _, _, _, _ = make_core()
+        core.start()
+        session = CallSession(
+            call_id="call-9",
+            caller_id="+34910000001",
+            telephony=telephony,
+            voice=voice,
+            greeting=GREETING,
+            clock=clock,
+            policy_engine=PolicyEngine(destinations={}, fallback_id="none", limits=Limits()),
+            runtime=RuntimeStorage(
+                calls=InMemoryCallRepository(),
+                messages=InMemoryMessageRepository(clock=clock),
+                transcripts=InMemoryTranscriptStore(),
+                audit=InMemoryAuditLog(),
+            ),
+            barge_in_enabled=False,
+        )
+        session.request_answer()
+        session.handle_answered()
+        backend = voice.sessions["call-9"]
+        backend.deliver_caller_speech("Hola, ¿me oye?")
+
         self.assertEqual(session.mode, ActiveMode.GREETING)
         self.assertEqual(session.current_turn, 1)
         self.assertEqual(backend.spoken, [(GREETING, 1)])
+        self.assertEqual(backend.cancels, [])
 
 
 class EndCallTest(unittest.TestCase):

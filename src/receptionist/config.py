@@ -20,6 +20,20 @@ TRANSCRIPTS_ENABLED_KEY = "transcripts_enabled"
 
 REQUIRED_KEYS = (GREETING_KEY, LANGUAGE_KEY)
 
+#: Canonical voice-profile keys in config.db. Structural values (model,
+#: runtime executable, profile, voice) require a backend restart/reload;
+#: a live call keeps the snapshot it started with.
+VOICE_PROFILE_KEY = "voice.profile"
+VOICE_MODEL_ROOT_KEY = "voice.model_root"
+VOICE_MANIFEST_KEY = "voice.manifest"
+VOICE_STT_EXECUTABLE_KEY = "voice.stt_executable"
+VOICE_LLM_EXECUTABLE_KEY = "voice.llm_executable"
+VOICE_TTS_VOICE_KEY = "voice.tts_voice"
+VOICE_TTS_SPEAKER_KEY = "voice.tts_speaker_id"
+VOICE_LLM_THREADS_KEY = "voice.llm_threads"
+VOICE_MAX_CONTEXT_CHARS_KEY = "voice.max_context_chars"
+VOICE_MAX_SPOKEN_CHARS_KEY = "voice.max_spoken_chars"
+
 
 class InMemoryConfigRepository:
     """Stand-in repository seeded from a plain dict. SQLite arrives later."""
@@ -83,3 +97,47 @@ class ConfigService:
         if self._alerts is None:
             return AlertSettings()
         return self._alerts.load()
+
+    def voice_profile(self) -> VoiceProfile:
+        """Typed voice-profile read over config.db. Only the small
+        operator-configurable domain: profile id, trusted model root /
+        manifest, voice selection, context/output bounds, and runtime
+        executable paths. No workflow KV, no env-var second source."""
+        from receptionist.cascaded import VoiceProfile
+
+        get = self._repository.get
+
+        def _positive_int(key: str, default: int) -> int:
+            raw = (get(key) or "").strip()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                return default
+            return value if value > 0 else default
+
+        def _non_negative_int(key: str, default: int) -> int:
+            raw = (get(key) or "").strip()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                return default
+            return value if value >= 0 else default
+
+        return VoiceProfile(
+            profile_id=(get(VOICE_PROFILE_KEY) or "cascaded-cpu-baseline-v1").strip()
+            or "cascaded-cpu-baseline-v1",
+            model_root=(get(VOICE_MODEL_ROOT_KEY) or "").strip(),
+            manifest_path=(get(VOICE_MANIFEST_KEY) or "").strip(),
+            stt_executable=(get(VOICE_STT_EXECUTABLE_KEY) or "").strip(),
+            llm_executable=(get(VOICE_LLM_EXECUTABLE_KEY) or "").strip(),
+            tts_voice=(get(VOICE_TTS_VOICE_KEY) or "es-female-1").strip()
+            or "es-female-1",
+            tts_speaker_id=_non_negative_int(VOICE_TTS_SPEAKER_KEY, 0),
+            llm_threads=_positive_int(VOICE_LLM_THREADS_KEY, 4),
+            max_context_chars=_positive_int(VOICE_MAX_CONTEXT_CHARS_KEY, 9000),
+            max_spoken_chars=_positive_int(VOICE_MAX_SPOKEN_CHARS_KEY, 500),
+        )

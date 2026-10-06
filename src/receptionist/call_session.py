@@ -7,15 +7,19 @@ can never corrupt a newer one.
 
 from __future__ import annotations
 
+import logging
+import threading
 from enum import Enum
 
 from receptionist.boundaries import (
     AuditDecision,
     AuditEvent,
     AuditLog,
+    AudioFrame,
     CallOutcome,
     CallRepository,
     CallSummary,
+    CancelReason,
     Clock,
     MessageConfirmed,
     MessageDraft,
@@ -68,11 +72,21 @@ class ActiveMode(Enum):
 #: handoff and fallback both failed. Kept constant, not configurable.
 EXIT_APOLOGY = "Lo siento, no fue posible comunicarle. La llamada terminará."
 
+LOG = logging.getLogger("receptionist.session")
+
 #: Success acknowledgement, spoken only after the message commit succeeds.
 MESSAGE_SAVED_ACK = "Su mensaje ha sido guardado. Gracias."
 
 #: Short reprompt after one silence window. Kept constant, not configurable.
 NO_INPUT_REPROMPT = "¿Sigue ahí? ¿En qué puedo ayudarle?"
+
+#: Bound on transient caller PCM retained per turn for a bounded retry
+#: re-commit. Memory only, never persisted; oldest frames drop first.
+_MAX_RETAINED_AUDIO_FRAMES = 600
+
+#: Same retention bounded by bytes (~64 s at 16 kHz mono): frame count
+#: alone cannot bound memory when adapters choose chunk sizes.
+_MAX_RETAINED_AUDIO_BYTES = 2 * 1024 * 1024
 
 
 class _VoiceAttemptListener:
@@ -92,9 +106,17 @@ class _VoiceAttemptListener:
         if self._live():
             self._session.on_transcript(text)
 
+    def on_transcript_sidecar(self, text: str) -> None:
+        if self._live():
+            self._session.on_transcript_sidecar(text)
+
     def on_response(self, turn_id: int, text: str) -> None:
         if self._live():
             self._session.on_response(turn_id, text)
+
+    def on_audio(self, turn_id: int, frame: AudioFrame) -> None:
+        if self._live():
+            self._session.on_audio(turn_id, frame)
 
     def on_playback_finished(self, turn_id: int) -> None:
         if self._live():
@@ -118,7 +140,14 @@ class PendingTransfer:
 
 
 class CallSession:
-    """One inbound call. Observable via ``state``, ``mode``, ``history``."""
+    """One inbound call. Observable via ``state``, ``mode``, ``history``.
+
+    Threading: the telephony dispatcher drives one thread; voice-backend
+    workers may deliver events on others, and media input may arrive on
+    a third. Every voice/media entry point serializes on an internal
+    lock, so a barge-in, hangup, or timeout can preempt an in-flight
+    turn. Telephony dispatch itself stays single-threaded (core-owned).
+    """
 
     def __init__(
         self,
@@ -136,6 +165,7 @@ class CallSession:
         resilience: ResilienceConfig | None = None,
         breaker: CircuitBreaker | None = None,
         monitor: HealthMonitor | None = None,
+        barge_in_enabled: bool = True,
     ) -> None:
         self.call_id = call_id
         self.caller_id = caller_id
@@ -154,6 +184,7 @@ class CallSession:
         self._retry_policy = RetryPolicy(self._resilience.provider_retries)
         self._breaker = breaker
         self._monitor = monitor
+        self._barge_in_enabled = barge_in_enabled
         self._voice_epoch = -1
         self._attempts_made = 0
         self._turn_started_at = clock.now()
@@ -178,6 +209,20 @@ class CallSession:
         self._failure_category: str | None = None
         self._capture_started_at: float | None = None
         self._started_at = clock.now()
+        # Transient caller PCM for the audio path: frames pushed since
+        # the last turn commit, plus the snapshot consumed by it. Memory
+        # only, bounded, cleared on turn boundaries; never persisted.
+        self._pending_turn_audio: list[AudioFrame] = []
+        self._pending_audio_bytes = 0
+        self._last_committed_audio: list[AudioFrame] = []
+        # Whether the current turn was opened by an audio barge-in and
+        # still awaits its app-owned end-of-turn commit.
+        self._audio_turn_open = False
+        # Whether caller PCM ingest already failed on this turn: the
+        # commit then fails the provider path terminally instead of
+        # retrying an empty buffer forever.
+        self._ingest_failed = False
+        self._lock = threading.RLock()
 
     @property
     def state(self) -> CallState:
@@ -194,6 +239,25 @@ class CallSession:
     @property
     def current_turn(self) -> int:
         return self._turn
+
+    @property
+    def voice_session(self) -> VoiceSession | None:
+        """The live backend session, if admission opened one. Read-only
+        observability seam (tests, diagnostics); never drive the call
+        through it."""
+        return self._voice_session
+
+    def drain_voice(self, timeout: float = 5.0) -> bool:
+        """Bounded rendezvous with the backend worker (async backends).
+        No-op for synchronous sessions. Test/ops seam."""
+        session = self._voice_session
+        wait = getattr(session, "wait_until_idle", None)
+        if not callable(wait):
+            return True
+        try:
+            return bool(wait(timeout))
+        except Exception:
+            return False
 
     @property
     def provider_terminal_failure(self) -> bool:
@@ -268,6 +332,36 @@ class CallSession:
         if self._transcripts_enabled:
             self._record_transcript("assistant", text)
 
+    def _cancel_voice_output(self, reason: CancelReason) -> None:
+        """Best-effort output cancellation on the live voice session.
+
+        Cancelling must never break teardown or routing: legacy fakes
+        without `cancel_output` simply skip it (`close`/generation
+        invalidation still applies), and a raising backend is contained.
+        """
+        session = self._voice_session
+        if session is None:
+            return
+        cancel = getattr(session, "cancel_output", None)
+        if not callable(cancel):
+            return
+        try:
+            cancel(reason)
+        except Exception:
+            pass
+
+    def _provides_playback(self) -> bool:
+        """Whether the live voice session streams its own AssistantAudio.
+
+        Playback-capable backends (the cascaded TTS path) deliver audio
+        via `on_audio`; the session must not re-speak their sidecar
+        text. Legacy text-only sessions keep the `_speak` path.
+        """
+        session = self._voice_session
+        if session is None:
+            return False
+        return bool(getattr(session, "provides_playback", False))
+
     def _open_voice_attempt(self) -> None:
         """Close the previous attempt (cancelling it) and open a fresh
         voice attempt with a new generation identity."""
@@ -286,6 +380,7 @@ class CallSession:
         self._attempts_made = 0
         self._turn_started_at = self._clock.now()
         self._mode = ActiveMode.INFERENCE
+        self._audio_turn_open = False
 
     # -- admission --------------------------------------------------------
 
@@ -330,6 +425,7 @@ class CallSession:
     def handle_caller_hangup(self) -> None:
         if self._state in (CallState.TERMINATING, CallState.ENDED):
             return
+        self._cancel_voice_output(CancelReason.CALLER_HANGUP)
         if self._state is CallState.INCOMING:
             self._telephony.reject(self.call_id)
             self._finish(CallOutcome.CALLER_HANGUP)
@@ -354,6 +450,7 @@ class CallSession:
     def _terminate_if_over_limit(self) -> bool:
         """End the call when the hard deadline passed. True when it did."""
         if self._over_call_limit():
+            self._cancel_voice_output(CancelReason.CALL_LIMIT)
             self.end_call()
             return True
         return False
@@ -366,13 +463,14 @@ class CallSession:
         falls back after the second. Returns True when the call was
         terminated.
         """
-        if self._state in (CallState.TERMINATING, CallState.ENDED):
+        with self._lock:
+            if self._state in (CallState.TERMINATING, CallState.ENDED):
+                return False
+            if self._terminate_if_over_limit():
+                return True
+            self._enforce_capture_expiry()
+            self._enforce_no_input()
             return False
-        if self._terminate_if_over_limit():
-            return True
-        self._enforce_capture_expiry()
-        self._enforce_no_input()
-        return False
 
     def _enforce_no_input(self) -> None:
         """One short reprompt after the first silence window, PBX fallback
@@ -413,6 +511,10 @@ class CallSession:
         return False
 
     def on_transcript(self, text: str) -> None:
+        with self._lock:
+            self._on_transcript_locked(text)
+
+    def _on_transcript_locked(self, text: str) -> None:
         if self._state is not CallState.ACTIVE:
             return
         if self._transcripts_enabled:
@@ -424,18 +526,195 @@ class CallSession:
             # text arrives as a typed final event, never parsed from here.
             self._enforce_capture_expiry()
             return
+        if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
+            # Barge-in (enabled by default): caller speech over assistant
+            # audio cancels the current output, discards undelivered
+            # audio, invalidates the generation, and reopens listening as
+            # a fresh turn. Late events from the cancelled turn carry a
+            # stale epoch/turn and are ignored downstream.
+            if not self._barge_in_enabled:
+                return
+            self._barge_in(CancelReason.BARGE_IN, text_complete=True)
+            return
         if self._mode not in (ActiveMode.LISTENING, ActiveMode.INFERENCE):
-            # Barge-in is deferred: speech over the greeting or while the
-            # assistant is speaking does not open a turn in this slice.
             return
         if self._turn_count >= self._policy_engine.limits.max_turns:
             self.end_call()
             return
         self._last_input_at = self._clock.now()
         self._no_input_warned = False
+        # Text-driven turn: no PCM backs it, so any retained audio from
+        # an earlier turn must not leak into a retry of this one.
+        self._pending_turn_audio = []
+        self._pending_audio_bytes = 0
+        self._last_committed_audio = []
         self._open_turn()
 
+    def _barge_in(self, reason: CancelReason, *, text_complete: bool) -> None:
+        """Cancel assistant output and reopen the turn for new input.
+
+        Text barge-in carries the complete user input (transcript), so
+        the fresh turn opens straight into INFERENCE. Audio barge-in
+        caught only speech onset: the fresh turn opens into LISTENING
+        to accumulate caller audio until the app-owned end-of-turn.
+        """
+        self._cancel_voice_output(reason)
+        self._open_voice_attempt()
+        self._pending_turn_audio = []
+        self._pending_audio_bytes = 0
+        self._last_committed_audio = []
+        if self._turn_count >= self._policy_engine.limits.max_turns:
+            self.end_call()
+            return
+        self._last_input_at = self._clock.now()
+        self._no_input_warned = False
+        if text_complete:
+            self._audio_turn_open = False
+            self._open_turn()
+            return
+        self._turn += 1
+        self._turn_count += 1
+        self._attempts_made = 0
+        self._turn_started_at = self._clock.now()
+        self._mode = ActiveMode.LISTENING
+        self._audio_turn_open = True
+
+    def on_transcript_sidecar(self, text: str) -> None:
+        """Observational caller text (primary STT reuse). Recorded only
+        when transcripts are enabled; never opens a turn, never feeds
+        evidence, never authorizes anything."""
+        with self._lock:
+            if self._state is not CallState.ACTIVE:
+                return
+            if self._transcripts_enabled:
+                self._record_transcript("caller", text)
+
+    def push_caller_audio(self, frame: AudioFrame) -> None:
+        """Caller-facing PCM entry point for the media adapter (#25).
+
+        Frames carrying speech energy while the assistant is speaking
+        barge in; otherwise they are buffered for the current turn.
+        Silence frames never cancel output. Audio is transient: never
+        persisted here.
+        """
+        with self._lock:
+            self._push_caller_audio_locked(frame)
+
+    def _push_caller_audio_locked(self, frame: AudioFrame) -> None:
+        if self._state is not CallState.ACTIVE:
+            return
+        if not isinstance(frame, AudioFrame):
+            return
+        if self._mode is ActiveMode.MESSAGE_CAPTURE:
+            self._enforce_capture_expiry()
+            return
+        from receptionist.audio import is_speech
+
+        speech = is_speech(frame)
+        if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
+            if speech and self._barge_in_enabled:
+                self._barge_in(CancelReason.BARGE_IN, text_complete=False)
+                if self._voice_session is not None and self._state is CallState.ACTIVE:
+                    self._ingest_locked(frame)
+            return
+        if self._mode not in (ActiveMode.LISTENING, ActiveMode.INFERENCE):
+            return
+        if self._voice_session is not None:
+            self._ingest_locked(frame)
+
+    def _ingest_locked(self, frame: AudioFrame) -> None:
+        """Buffer one caller frame; ingest breakage is observable (log
+        + terminal commit), never a silent empty-turn retry loop."""
+        assert self._voice_session is not None
+        try:
+            self._voice_session.push_audio(frame)
+            self._retain_frame(frame)
+            self._ingest_failed = False
+        except Exception as error:
+            self._ingest_failed = True
+            LOG.warning(
+                "caller audio ingest failed call_id=%s turn=%s error=%s",
+                self.call_id,
+                self._turn,
+                type(error).__name__,
+            )
+
+    def _retain_frame(self, frame: AudioFrame) -> None:
+        """Keep transient PCM for a possible bounded retry re-commit."""
+        self._pending_turn_audio.append(frame)
+        self._pending_audio_bytes += len(frame.pcm)
+        while (len(self._pending_turn_audio) > _MAX_RETAINED_AUDIO_FRAMES
+               or self._pending_audio_bytes > _MAX_RETAINED_AUDIO_BYTES):
+            dropped = self._pending_turn_audio.pop(0)
+            self._pending_audio_bytes -= len(dropped.pcm)
+
+    def commit_caller_turn(self) -> None:
+        """App-owned end-of-user-turn: run the backend pipeline for the
+        buffered caller audio of a fresh turn. No-op outside listening.
+        The pipeline runs asynchronously; completion arrives as voice
+        events on the backend worker."""
+        with self._lock:
+            self._commit_caller_turn_locked()
+
+    def _commit_caller_turn_locked(self) -> None:
+        if self._state is not CallState.ACTIVE:
+            return
+        if self._mode is not ActiveMode.LISTENING:
+            return
+        if self._terminate_if_over_limit():
+            return
+        if self._ingest_failed and not self._pending_turn_audio:
+            # Media ingest is broken and nothing was buffered: fail the
+            # provider path terminally instead of retrying emptiness.
+            self._ingest_failed = False
+            self._fail_provider_path("caller_audio_unavailable")
+            return
+        if self._turn_count >= self._policy_engine.limits.max_turns:
+            self.end_call()
+            return
+        self._last_input_at = self._clock.now()
+        self._no_input_warned = False
+        if self._audio_turn_open:
+            # An audio barge-in already opened this turn into LISTENING;
+            # the end-of-turn commits it without opening another one.
+            self._audio_turn_open = False
+            self._mode = ActiveMode.INFERENCE
+            self._turn_started_at = self._clock.now()
+        else:
+            self._open_turn()
+        self._last_committed_audio = self._pending_turn_audio
+        self._pending_turn_audio = []
+        self._pending_audio_bytes = 0
+        assert self._voice_session is not None
+        try:
+            self._voice_session.commit_turn(self._turn)
+        except Exception:
+            self._fail_provider_path("provider_failed")
+
+    def on_audio(self, turn_id: int, frame: AudioFrame) -> None:
+        """AssistantAudio: TTS PCM for the live turn. Late frames from a
+        cancelled turn are ignored; audio is never persisted."""
+        with self._lock:
+            self._on_audio_locked(turn_id, frame)
+
+    def _on_audio_locked(self, turn_id: int, frame: AudioFrame) -> None:
+        if self._state is not CallState.ACTIVE:
+            return
+        if turn_id != self._turn:
+            return  # late audio from an obsolete turn: ignore
+        if self._terminate_if_over_limit():
+            return
+        if self._mode is ActiveMode.INFERENCE:
+            self._note_provider_evidence()
+            self._mode = ActiveMode.SPEAKING
+        elif self._mode is not ActiveMode.SPEAKING:
+            return
+
     def on_response(self, turn_id: int, text: str) -> None:
+        with self._lock:
+            self._on_response_locked(turn_id, text)
+
+    def _on_response_locked(self, turn_id: int, text: str) -> None:
         if self._state is not CallState.ACTIVE:
             return
         if self._mode is not ActiveMode.INFERENCE:
@@ -446,11 +725,19 @@ class CallSession:
             return
         self._note_provider_evidence()
         self._mode = ActiveMode.SPEAKING
+        if self._provides_playback():
+            # Playback-capable backend: AssistantAudio follows via
+            # on_audio; this text is a transcript/debug sidecar only and
+            # must not be re-spoken (no double synthesis).
+            if self._transcripts_enabled:
+                self._record_transcript("assistant", text)
+            return
         self._speak(text, turn_id)
 
     def on_playback_finished(self, turn_id: int) -> None:
-        if self._state is not CallState.ACTIVE:
-            return
+        with self._lock:
+            if self._state is not CallState.ACTIVE:
+                return
         if turn_id != self._turn:
             return  # late event from an obsolete turn: ignore
         if self._terminate_if_over_limit():
@@ -459,6 +746,10 @@ class CallSession:
             self._mode = ActiveMode.LISTENING
 
     def on_action_request(self, action: object) -> None:
+        with self._lock:
+            self._on_action_request_locked(action)
+
+    def _on_action_request_locked(self, action: object) -> None:
         if self._terminate_if_over_limit():
             return
         self._last_input_at = self._clock.now()
@@ -499,6 +790,12 @@ class CallSession:
         can arrive: the draft is discarded with no save and no ACK, and
         the call routes to fallback. Stale generations never reach here.
         """
+        with self._lock:
+            self._on_provider_failure_locked(turn_id, failure)
+
+    def _on_provider_failure_locked(
+        self, turn_id: int, failure: ProviderFailure
+    ) -> None:
         if not isinstance(failure.category, ProviderFailureCategory):
             return  # not a normalized failure: never reason about it
         if self._state is not CallState.ACTIVE:
@@ -531,8 +828,33 @@ class CallSession:
         ):
             self._attempts_made += 1
             self._open_voice_attempt()
+            self._recommit_audio_for_retry()
             return
         self._fail_provider_path("provider_failed")
+
+    def _recommit_audio_for_retry(self) -> None:
+        """Re-drive the failed audio turn on the fresh attempt.
+
+        The retry budget belongs to CallSession (#22); without this the
+        new attempt would idle with an empty buffer and the retry would
+        be fiction. Text-driven turns retain no audio and skip silently.
+        A re-commit that itself raises fails the provider path.
+        """
+        if not self._last_committed_audio:
+            return
+        session = self._voice_session
+        if session is None:
+            return
+        push = getattr(session, "push_audio", None)
+        commit = getattr(session, "commit_turn", None)
+        if not callable(push) or not callable(commit):
+            return
+        try:
+            for frame in self._last_committed_audio:
+                push(frame)
+            commit(self._turn)
+        except Exception:
+            self._fail_provider_path("provider_failed")
 
     def _fail_provider_path(self, failure_category: str) -> None:
         """Record one terminal conversational failure and leave the AI
@@ -571,6 +893,7 @@ class CallSession:
             AuditDecision.ALLOWED,
             detail=f"target {resolution.destination.target}",
         )
+        self._cancel_voice_output(CancelReason.TRANSFER_HANDOFF)
         self._transition(CallState.TRANSFER_HANDOFF)
         self._mode = None
         self._telephony.blind_transfer(self.call_id, resolution.destination.target)
@@ -715,6 +1038,7 @@ class CallSession:
         self._audit_action(
             fallback.id, AuditDecision.ALLOWED, detail=f"target {fallback.target}"
         )
+        self._cancel_voice_output(CancelReason.FALLBACK_HANDOFF)
         self._transition(CallState.FALLBACK_HANDOFF)
         self._mode = None
         self._telephony.blind_transfer(self.call_id, fallback.target)
@@ -780,6 +1104,7 @@ class CallSession:
         if self._state is CallState.INCOMING:
             self.reject()
             return
+        self._cancel_voice_output(CancelReason.SHUTDOWN)
         self._pending_outcome = CallOutcome.COMPLETED
         self._transition(CallState.TERMINATING)
         self._telephony.hangup(self.call_id)

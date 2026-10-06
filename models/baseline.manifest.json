@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "profile_id": "cascaded-cpu-baseline-v1",
+  "components": [
+    {
+      "component": "stt",
+      "runtime": "whisper.cpp",
+      "runtime_version": "",
+      "model_id": "whisper-base-multilingual",
+      "filename": "stt/ggml-base.bin",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0,
+      "arch_quant": "base",
+      "language": "multilingual",
+      "voice": "",
+      "source": "https://huggingface.co/ggerganov/whisper.cpp",
+      "license": "MIT (OpenAI Whisper model; check upstream terms)",
+      "required": true,
+      "files": ["stt/ggml-base.bin"],
+      "file_hashes": ["0000000000000000000000000000000000000000000000000000000000000000"]
+    },
+    {
+      "component": "llm",
+      "runtime": "llama.cpp",
+      "runtime_version": "",
+      "model_id": "qwen3-1.7b-q4_k_m",
+      "filename": "llm/Qwen3-1.7B-Q4_K_M.gguf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0,
+      "arch_quant": "GGUF Q4_K_M",
+      "language": "multilingual",
+      "voice": "",
+      "source": "https://huggingface.co/ggml-org/Qwen3-1.7B-GGUF",
+      "license": "Apache-2.0 (Qwen; check upstream terms)",
+      "required": true,
+      "files": ["llm/Qwen3-1.7B-Q4_K_M.gguf"],
+      "file_hashes": ["0000000000000000000000000000000000000000000000000000000000000000"]
+    },
+    {
+      "component": "tts",
+      "runtime": "sherpa-onnx",
+      "runtime_version": "",
+      "model_id": "tts-es-onnx",
+      "filename": "tts/es-female-1/model.onnx",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0,
+      "arch_quant": "ONNX VITS-compatible",
+      "language": "es",
+      "voice": "es-female-1",
+      "source": "operator-provisioned Spanish ONNX voice",
+      "license": "operator-provisioned (check voice license before use)",
+      "required": true,
+      "files": ["tts/es-female-1/model.onnx", "tts/es-female-1/tokens.txt"],
+      "file_hashes": ["0000000000000000000000000000000000000000000000000000000000000000", "0000000000000000000000000000000000000000000000000000000000000000"]
+    }
+  ]
+}

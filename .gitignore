@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+# Generated synthetic audio probes (see tests/fixtures/generate_fixtures.py).
+# Never committed: the NoAudioPersistenceTest guard forbids *.pcm/*.wav
+# anywhere in the repo, and audio must never be mistaken for records.
+tests/fixtures/*.pcm
+tests/fixtures/*.wav

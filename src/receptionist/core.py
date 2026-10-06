@@ -23,6 +23,7 @@ from receptionist.alerting import (
     CODE_CONFIG_UNAVAILABLE,
     CODE_HISTORY_UNAVAILABLE,
     CODE_TRANSCRIPT_UNAVAILABLE,
+    CODE_VOICE_BACKEND_NOT_READY,
     HealthComponent,
     HealthMonitor,
     HttpTransport,
@@ -49,6 +50,10 @@ _CIRCUIT_DEGRADED_DETAIL = "conversational provider circuit open"
 #: detects an unreadable config authority mid-run (mirroring startup);
 #: lifted when a later admission reads configuration trustworthily again.
 _CONFIG_DOWN_DETAIL = "configuration authority unavailable"
+
+#: Health detail marking a required voice backend that never became
+#: ready. Sanitized and stable: never paths, versions, or stderr.
+_VOICE_NOT_READY_DETAIL = "voice backend not ready"
 
 
 class ReceptionistCore:
@@ -142,6 +147,7 @@ class ReceptionistCore:
             self.monitor.report_recovered(
                 HealthComponent.CONFIGURATION, CODE_CONFIG_UNAVAILABLE
             )
+        self._sync_voice_readiness()
         self._reconcile_health()
         return self.health
 
@@ -212,9 +218,16 @@ class ReceptionistCore:
             monitor=self.monitor,
         )
         self._sessions[call_id] = session
+        # Voice readiness syncs BEFORE the admission decision, so a
+        # recovered backend re-admits without a manual start(), and a
+        # backend that died mid-run is observed on the next call. Ticks
+        # re-sync too, so recovery never waits for new traffic.
+        self._sync_voice_readiness()
         # No AI session may start while STARTING/NOT_READY. Refusing here
-        # acquires no voice resources (lazy open in request_answer); exact
-        # real-adapter fallback behavior belongs to a later ticket.
+        # acquires no voice resources (lazy open in request_answer).
+        # Deliberate AI-unadmission (distinct from service admission):
+        # a voice-only outage with otherwise usable configuration routes
+        # to PBX fallback exactly like an open circuit, opening nothing.
         admitted = self.health.status not in (HealthStatus.STARTING, HealthStatus.NOT_READY)
         if (
             admitted
@@ -223,7 +236,9 @@ class ReceptionistCore:
             and self._policy.should_answer(caller_id)
         ):
             self._sync_breaker_health()
-            if self.breaker.is_open:
+            if not self._voice_usable():
+                session.begin_fallback_only("provider_unavailable")
+            elif self.breaker.is_open:
                 session.begin_fallback_only("provider_unavailable")
             elif not self._acquire_ai_slot(call_id):
                 session.begin_fallback_only("capacity_saturated")
@@ -236,11 +251,40 @@ class ReceptionistCore:
                 self.monitor.report_recovered(
                     HealthComponent.CAPACITY, CODE_CAPACITY_SATURATED
                 )
+        elif (
+            config_trusted
+            and not missing
+            and self._voice_has_hook()
+            and not self._voice_usable()
+            and self._policy.should_answer(caller_id)
+        ):
+            # Voice-only outage (service config usable, AI path down):
+            # deliberate AI-unadmission to PBX fallback, no provider
+            # resources opened. Distinct from service-level refusal.
+            session.begin_fallback_only("provider_unavailable")
         else:
             session.reject()
             del self._sessions[call_id]
         self._reconcile_health()
         return session
+
+    def _voice_has_hook(self) -> bool:
+        """Whether the voice backend reports readiness at all. Legacy
+        backends without the hook never gate admission."""
+        return callable(getattr(self._voice, "check_ready", None))
+
+    def _voice_usable(self) -> bool:
+        """Whether the required voice backend may accept a call right
+        now. Backends without the readiness hook (legacy fakes) are
+        always usable; the cascaded backend gates on warmed models."""
+        check = getattr(self._voice, "check_ready", None)
+        if not callable(check):
+            return True
+        try:
+            ready, _detail = check()
+        except Exception:
+            return False
+        return bool(ready)
 
     def get_session(self, call_id: str) -> CallSession | None:
         return self._sessions.get(call_id)
@@ -281,6 +325,8 @@ class ReceptionistCore:
             self.health.mark_not_ready(_CONFIG_DOWN_DETAIL)
         elif (HealthComponent.CONFIGURATION, CODE_CONFIG_INCOMPLETE) in active:
             self.health.mark_not_ready("required configuration missing")
+        elif (HealthComponent.PROVIDER, CODE_VOICE_BACKEND_NOT_READY) in active:
+            self.health.mark_not_ready(_VOICE_NOT_READY_DETAIL)
         elif (HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN) in active:
             self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
         elif (HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE) in active or (
@@ -296,6 +342,31 @@ class ReceptionistCore:
     def close(self) -> None:
         """Shutdown: drain pending alert deliveries (bounded)."""
         self.monitor.close()
+
+    def _sync_voice_readiness(self) -> None:
+        """Reflect a required voice backend's readiness in the monitor.
+
+        Duck-typed: backends exposing `check_ready() -> (bool, str)`
+        (the cascaded backend) gate admission; legacy fakes without the
+        hook are skipped untouched. The sanitized detail never reaches
+        health or alerts: identity stays (PROVIDER, stable code).
+        """
+        check = getattr(self._voice, "check_ready", None)
+        if not callable(check):
+            return
+        try:
+            ready, _detail = check()
+        except Exception:
+            ready = False
+        if ready:
+            self.monitor.report_recovered(
+                HealthComponent.PROVIDER, CODE_VOICE_BACKEND_NOT_READY
+            )
+        else:
+            self.monitor.report_unhealthy(
+                HealthComponent.PROVIDER, CODE_VOICE_BACKEND_NOT_READY
+            )
+        self._reconcile_health()
 
     def _sync_breaker_health(self) -> None:
         """Report an open provider circuit. Aggregate follows via reconcile:
@@ -337,6 +408,7 @@ class ReceptionistCore:
             if session is not None:
                 session.check_timeouts()
         self._sync_breaker_health()
+        self._sync_voice_readiness()
         now = self._clock.now()
         if (
             self._last_prune is None

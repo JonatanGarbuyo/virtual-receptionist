@@ -89,12 +89,27 @@ class FakeTelephony:
 class FakeVoiceSession(VoiceSession):
     """Per-call voice stand-in. Records spoken audio, delivers scripted events."""
 
+    provides_playback = False
+
     def __init__(self, call_id: str, listener: VoiceListener) -> None:
         self.call_id = call_id
         self._listener = listener
         self.spoken: list[tuple[str, int]] = []
+        self.pushed_audio: list = []
+        self.committed_turns: list[int] = []
+        self.cancels: list = []
+        self.audio_frames: list[tuple[int, object]] = []
         self.closed = False
         self.fail_speak: Exception | None = None
+
+    def push_audio(self, frame) -> None:
+        self.pushed_audio.append(frame)
+
+    def commit_turn(self, turn_id: int) -> None:
+        self.committed_turns.append(turn_id)
+
+    def cancel_output(self, reason) -> None:
+        self.cancels.append(reason)
 
     def speak(self, text: str, turn_id: int) -> None:
         if self.fail_speak is not None:
@@ -113,6 +128,10 @@ class FakeVoiceSession(VoiceSession):
     def deliver_response(self, text: str, turn_id: int) -> None:
         """Test driver: the backend completes inference for a turn."""
         self._listener.on_response(turn_id, text)
+
+    def deliver_audio(self, turn_id: int, frame) -> None:
+        """Test driver: the backend streams one AssistantAudio frame."""
+        self._listener.on_audio(turn_id, frame)
 
     def finish_playback(self, turn_id: int) -> None:
         """Test driver: playout of a spoken turn completes."""
@@ -143,6 +162,20 @@ class FakeVoiceBackend:
         self.sessions[call_id] = session
         self.all_sessions.append(session)
         return session
+
+
+class FakeVoiceBackendWithReadiness(FakeVoiceBackend):
+    """Voice backend with a controllable readiness hook for admission
+    and recovery tests. Mirrors CascadedVoiceBackend.check_ready."""
+
+    def __init__(self, ready: bool = True) -> None:
+        super().__init__()
+        self.backend_ready = ready
+
+    def check_ready(self) -> tuple[bool, str]:
+        if self.backend_ready:
+            return True, "voice backend ready"
+        return False, "voice backend not ready"
 
 
 class FakeCallIds:
