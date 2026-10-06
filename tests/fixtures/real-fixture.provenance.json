@@ -1,0 +1,10 @@
+{
+  "fixture_id": "es-ventas-sintetica-v1",
+  "expected_text_approx": "Hola, quisiera hablar con ventas.",
+  "exact_match_required": false,
+  "provenance": "Synthesized locally with sherpa-onnx 1.13.8 + voice vits-piper-es_ES-sharvard-medium-int8 (sid 0, speed 1.0). No customer audio, no redistributed speech.",
+  "license": "Synthetic project-owned probe. Voice model: operator-provisioned sherpa-onnx TTS voice (check voice license before redistribution).",
+  "format": "WAV mono 16-bit, 22050 Hz, ~2.0 s",
+  "sha256": "7638c8fd4150062e3d0cbc90f4a0782b6ea4599cfd533fae5366621e6ea2d77e",
+  "note": "Audio bytes live outside the repo (NoAudioPersistenceTest forbids *.wav/*.pcm in-tree). Regenerate: run sherpa-onnx OfflineTts with the pinned voice over expected_text_approx."
+}

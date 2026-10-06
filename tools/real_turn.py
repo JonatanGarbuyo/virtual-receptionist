@@ -26,6 +26,36 @@ def fail(reason: str) -> int:
     return 3
 
 
+def _rss_kb(pid) -> int:
+    """Resident set size from /proc (Linux-only evidence runner)."""
+    try:
+        with open(f"/proc/{pid}/status") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
+def _measure_tree(backend) -> dict[str, int]:
+    """Composite RSS while every runtime is resident: this Python
+    process (sherpa TTS lives in-process) plus both server processes.
+    Sampled after the turn, servers still warm."""
+    whisper_pid = backend._stt._server.pid
+    llama_pid = backend._llm._server.pid
+    own = _rss_kb("self")
+    whisper = _rss_kb(whisper_pid) if whisper_pid else -1
+    llama = _rss_kb(llama_pid) if llama_pid else -1
+    parts = [value for value in (own, whisper, llama) if value > 0]
+    return {
+        "rss_kb_self": own,
+        "rss_kb_whisper_server": whisper,
+        "rss_kb_llama_server": llama,
+        "rss_kb_total_estimated": sum(parts) if parts else -1,
+    }
+
+
 def read_pcm_16k_mono(path: str) -> tuple[bytes, int]:
     """Accept raw PCM16 mono or .wav (converted via stdlib wave)."""
     with open(path, "rb") as handle:
@@ -153,34 +183,7 @@ def main() -> int:
     memory = _measure_tree(backend)
     backend.shutdown()
 
-    def _rss_kb(pid: int | str) -> int:
-    """Resident set size from /proc (Linux-only evidence runner)."""
-    try:
-        with open(f"/proc/{pid}/status") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return -1
-
-
-def _measure_tree(backend) -> dict[str, int]:
-    """Composite RSS while every runtime is resident: this Python
-    process (sherpa TTS lives in-process) plus both server processes.
-    Sampled after the turn, servers still warm."""
-    whisper_pid = backend._stt._server.pid
-    llama_pid = backend._llm._server.pid
-    own = _rss_kb("self")
-    whisper = _rss_kb(whisper_pid) if whisper_pid else -1
-    llama = _rss_kb(llama_pid) if llama_pid else -1
-    parts = [value for value in (own, whisper, llama) if value > 0]
-    return {
-        "rss_kb_self": own,
-        "rss_kb_whisper_server": whisper,
-        "rss_kb_llama_server": llama,
-        "rss_kb_total_estimated": sum(parts) if parts else -1,
-    }
+    stt_text = events["sidecars"][0] if events["sidecars"] else ""
 
     try:
         with open("/proc/meminfo") as handle:
@@ -193,6 +196,23 @@ def _measure_tree(backend) -> dict[str, int]:
     stt_text = events["sidecars"][0] if events["sidecars"] else ""
     out_bytes = sum(n for _, n, _ in events["audios"])
     out_rate = events["audios"][0][2] if events["audios"] else 16000
+
+    def _stage_ms(start: float, end: float) -> float | None:
+        if start > 0.0 and end >= start:
+            return round((end - start) * 1000.0, 1)
+        return None
+
+    stages = (
+        {
+            "stt_ms": _stage_ms(timings.stt_started_at, timings.stt_finished_at),
+            "llm_ms": _stage_ms(timings.llm_started_at, timings.llm_finished_at),
+            "tts_to_first_audio_ms": _stage_ms(
+                timings.tts_started_at, timings.first_audio_at
+            ),
+        }
+        if timings
+        else {}
+    )
     evidence = {
         "ok": bool(drained) and not events["failures"] and bool(events["audios"]),
         "cpu_arch": platform.machine(),
@@ -233,6 +253,7 @@ def _measure_tree(backend) -> dict[str, int]:
             if timings and timings.eou_to_first_audio_ms is not None
             else None
         ),
+        "stage_ms": stages,
         "total_turn_ms": round(total_ms, 1),
         "latency_band": timings.latency_band() if timings else "unknown",
         **memory,
