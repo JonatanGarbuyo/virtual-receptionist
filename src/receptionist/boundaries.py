@@ -85,6 +85,75 @@ class MessageRejected:
     """The caller rejected the draft. Discard it."""
 
 
+#: Baseline sample format for every AudioFrame crossing the seam.
+#: Signed 16-bit little-endian PCM. Telephony line codecs are converted
+#: to/from this form by the telephony/media adapter (#25); this
+#: contract never assumes any line codec.
+AUDIO_SAMPLE_FORMAT_PCM16 = "pcm16"
+
+#: Baseline channel count: mono. Multi-channel audio is mixed down
+#: before crossing the seam.
+AUDIO_CHANNELS_MONO = 1
+
+
+@dataclass(frozen=True)
+class AudioFrame:
+    """One chunk of generic caller or assistant PCM.
+
+    Project-owned media type: no codec, container, vendor, or runtime
+    concepts appear here. Raw PCM bytes only, never base64, never a
+    file path. Frames are transient: neither the session nor the
+    backend persists them.
+
+    ``call_id``/``turn_id`` identify ownership when known (empty/zero
+    when the producer cannot know yet); ``sequence`` orders frames
+    inside one turn; ``timestamp`` comes from the session clock.
+    """
+
+    pcm: bytes
+    sample_rate: int
+    channels: int = AUDIO_CHANNELS_MONO
+    sample_format: str = AUDIO_SAMPLE_FORMAT_PCM16
+    call_id: str = ""
+    turn_id: int = 0
+    sequence: int = 0
+    timestamp: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pcm, (bytes, bytearray)) or len(self.pcm) == 0:
+            raise ValueError("audio frame needs non-empty PCM bytes")
+        if self.sample_rate <= 0:
+            raise ValueError(f"audio frame needs a sample rate, got {self.sample_rate!r}")
+        if self.channels != AUDIO_CHANNELS_MONO:
+            raise ValueError(f"audio frame must be mono, got {self.channels!r}")
+        if self.sample_format != AUDIO_SAMPLE_FORMAT_PCM16:
+            raise ValueError(
+                f"audio frame must be {AUDIO_SAMPLE_FORMAT_PCM16}, "
+                f"got {self.sample_format!r}"
+            )
+        if len(self.pcm) % 2 != 0:
+            raise ValueError("pcm16 audio frame needs an even byte count")
+        if self.sequence < 0:
+            raise ValueError(f"audio frame sequence must be >= 0, got {self.sequence!r}")
+
+
+class CancelReason(Enum):
+    """Typed app-owned cancellation reasons for assistant output.
+
+    The backend stops synthesis/playback, discards undelivered audio,
+    and invalidates the corresponding generation/attempt. Late output
+    from the cancelled turn must never cross the seam afterwards.
+    """
+
+    BARGE_IN = "barge_in"
+    CALLER_HANGUP = "caller_hangup"
+    TURN_TIMEOUT = "turn_timeout"
+    TRANSFER_HANDOFF = "transfer_handoff"
+    FALLBACK_HANDOFF = "fallback_handoff"
+    CALL_LIMIT = "call_limit"
+    SHUTDOWN = "shutdown"
+
+
 class VoiceListener(Protocol):
     """Events flowing from the voice backend into one call session.
 
@@ -92,10 +161,15 @@ class VoiceListener(Protocol):
     per-attempt listener, so late events from a superseded attempt never
     reach these methods as current. `on_provider_failure` carries the
     normalized taxonomy below, never vendor exceptions or strings.
+
+    `on_audio` carries assistant PCM (TTS output) as a separate event:
+    audio is never hidden inside `on_response`, which stays an optional
+    assistant-text sidecar (transcript/debugging/deterministic tests).
     """
 
     def on_transcript(self, text: str) -> None: ...
     def on_response(self, turn_id: int, text: str) -> None: ...
+    def on_audio(self, turn_id: int, frame: AudioFrame) -> None: ...
     def on_playback_finished(self, turn_id: int) -> None: ...
     def on_action_request(self, action: object) -> None: ...
     def on_provider_failure(self, turn_id: int, failure: ProviderFailure) -> None: ...
@@ -104,10 +178,9 @@ class VoiceListener(Protocol):
 class ProviderFailureCategory(Enum):
     """Project-owned failure taxonomy for conversational providers.
 
-    Future adapters (whisper.cpp, llama.cpp, sherpa, HTTP backends)
-    translate their errors into exactly these categories. The core only
-    ever reasons about these values, never vendor exceptions, payloads,
-    or strings.
+    Future STT/LLM/TTS runtimes translate their errors into exactly
+    these categories. The core only ever reasons about these values,
+    never vendor exceptions, payloads, or strings.
     """
 
     TIMEOUT = "timeout"
@@ -133,8 +206,20 @@ class ProviderFailure:
 
 
 class VoiceSession(Protocol):
-    """One backend voice stream for one call."""
+    """One backend voice stream for one call.
 
+    `push_audio` buffers transient caller PCM (never persisted);
+    `commit_turn` marks the app-owned end-of-user-turn and starts the
+    STT -> LLM -> TTS pipeline for the buffered audio; `cancel_output`
+    stops assistant output for the given app-owned reason and discards
+    undelivered audio; `speak` plays a fixed application text (greeting,
+    reprompt, apology) through the same output path; `close` cancels
+    all session work, frees buffers/processes, and is idempotent.
+    """
+
+    def push_audio(self, frame: AudioFrame) -> None: ...
+    def commit_turn(self, turn_id: int) -> None: ...
+    def cancel_output(self, reason: CancelReason) -> None: ...
     def speak(self, text: str, turn_id: int) -> None: ...
     def close(self) -> None: ...
 

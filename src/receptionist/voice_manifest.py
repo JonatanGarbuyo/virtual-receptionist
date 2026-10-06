@@ -1,0 +1,308 @@
+"""Reproducible model-pack manifest for the local cascaded backend (#24).
+
+The manifest identifies every model artifact by logical id plus
+integrity metadata (SHA-256, size, architecture/quantization,
+language/voice, source/provenance, license). It never contains model
+bytes, never triggers downloads, and never accepts mutable tags like
+``latest.gguf`` as identity. Paths resolve only under a trusted model
+root: absolute paths and ``..`` traversal fail closed, and the
+filename is never executed as a shell command anywhere.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+
+#: Manifest schema versions this code understands.
+MANIFEST_SCHEMA_VERSION = 1
+
+#: Required components of the approved CPU baseline profile.
+BASELINE_PROFILE_ID = "cascaded-cpu-baseline-v1"
+REQUIRED_BASELINE_COMPONENTS = ("stt", "llm", "tts")
+
+
+@dataclass(frozen=True)
+class ModelComponent:
+    """One model artifact in a pack. ``filename`` is relative to the
+    trusted model root; ``required`` marks startup-blocking artifacts."""
+
+    component: str
+    runtime: str
+    runtime_version: str
+    model_id: str
+    filename: str
+    sha256: str
+    size: int = 0
+    arch_quant: str = ""
+    language: str = ""
+    voice: str = ""
+    source: str = ""
+    license: str = ""
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class ModelManifest:
+    """Project-owned manifest: schema version, profile id, components."""
+
+    schema_version: int
+    profile_id: str
+    components: tuple[ModelComponent, ...] = field(default_factory=tuple)
+
+
+def _component_from_dict(raw: dict) -> ModelComponent:
+    try:
+        component = str(raw["component"])
+        runtime = str(raw["runtime"])
+        runtime_version = str(raw.get("runtime_version", ""))
+        model_id = str(raw["model_id"])
+        filename = str(raw["filename"])
+        sha256 = str(raw["sha256"]).lower()
+    except KeyError as error:
+        raise ValueError(f"manifest component missing key: {error}") from error
+    size = raw.get("size", 0)
+    if not isinstance(size, int) or size < 0:
+        raise ValueError(f"manifest component has invalid size: {size!r}")
+    digest_len = len(sha256)
+    if digest_len != 64 or any(c not in "0123456789abcdef" for c in sha256):
+        raise ValueError(f"manifest component has invalid sha256: {sha256!r}")
+    _check_relative_filename(filename)
+    return ModelComponent(
+        component=component,
+        runtime=runtime,
+        runtime_version=runtime_version,
+        model_id=model_id,
+        filename=filename,
+        sha256=sha256,
+        size=size,
+        arch_quant=str(raw.get("arch_quant", "")),
+        language=str(raw.get("language", "")),
+        voice=str(raw.get("voice", "")),
+        source=str(raw.get("source", "")),
+        license=str(raw.get("license", "")),
+        required=bool(raw.get("required", True)),
+    )
+
+
+def _check_relative_filename(filename: str) -> None:
+    """Reject absolute paths, traversal, and empty names fail-closed."""
+    if not filename or not filename.strip():
+        raise ValueError("manifest filename must be non-empty")
+    candidate = PurePosixPath(filename)
+    if candidate.is_absolute():
+        raise ValueError(f"manifest filename must be relative: {filename!r}")
+    if ".." in candidate.parts:
+        raise ValueError(f"manifest filename must not traverse: {filename!r}")
+    if filename != str(candidate):
+        raise ValueError(f"manifest filename is not normalized: {filename!r}")
+
+
+def load_manifest(raw: dict) -> ModelManifest:
+    """Parse an already-loaded manifest document. Raises ValueError."""
+    try:
+        schema_version = int(raw["schema_version"])
+        profile_id = str(raw["profile_id"])
+        raw_components = raw["components"]
+    except KeyError as error:
+        raise ValueError(f"manifest missing key: {error}") from error
+    if schema_version != MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported manifest schema: {schema_version!r}")
+    if not profile_id.strip():
+        raise ValueError("manifest profile_id must be non-empty")
+    if not isinstance(raw_components, list) or not raw_components:
+        raise ValueError("manifest needs a non-empty components list")
+    components = tuple(
+        _component_from_dict(item) for item in raw_components
+    )
+    seen = [c.component for c in components]
+    if len(set(seen)) != len(seen):
+        raise ValueError(f"manifest has duplicate components: {seen!r}")
+    return ModelManifest(
+        schema_version=schema_version,
+        profile_id=profile_id,
+        components=components,
+    )
+
+
+def load_manifest_file(path: str) -> ModelManifest:
+    """Read and parse a manifest JSON file. Raises ValueError/OSError."""
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("manifest document must be a JSON object")
+    return load_manifest(raw)
+
+
+def manifest_to_dict(manifest: ModelManifest) -> dict:
+    """Serialize a manifest back to a plain JSON-compatible document."""
+    return {
+        "schema_version": manifest.schema_version,
+        "profile_id": manifest.profile_id,
+        "components": [
+            {
+                "component": c.component,
+                "runtime": c.runtime,
+                "runtime_version": c.runtime_version,
+                "model_id": c.model_id,
+                "filename": c.filename,
+                "sha256": c.sha256,
+                "size": c.size,
+                "arch_quant": c.arch_quant,
+                "language": c.language,
+                "voice": c.voice,
+                "source": c.source,
+                "license": c.license,
+                "required": c.required,
+            }
+            for c in manifest.components
+        ],
+    }
+
+
+def resolve_trusted_path(model_root: str, filename: str) -> str:
+    """Join a manifest filename under the trusted model root.
+
+    The manifest/profile is operator configuration; caller text, LLM
+    output, knowledge content, and transcripts can never reach this
+    path: only values validated by `_check_relative_filename` resolve.
+    """
+    _check_relative_filename(filename)
+    import os
+
+    joined = os.path.normpath(os.path.join(model_root, filename))
+    root = os.path.normpath(model_root)
+    if joined != root and not joined.startswith(root + os.sep):
+        raise ValueError(f"model path escapes trusted root: {filename!r}")
+    return joined
+
+
+def sha256_file(path: str) -> str:
+    """Hex SHA-256 of a file, streamed (no whole-file buffering)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class IntegrityProblem:
+    """One failed integrity check. Sanitized identity only: component
+    plus a stable reason; never raw stderr, bytes, or file content."""
+
+    component: str
+    reason: str
+
+
+def verify_manifest(model_root: str, manifest: ModelManifest) -> list[IntegrityProblem]:
+    """Check every required component: file exists, expected type/path,
+    size matches when declared, SHA-256 matches. Optional components
+    that are absent are skipped; present-but-corrupt optional ones are
+    still reported. Never raises for content problems (returns them);
+    never downloads anything."""
+    import os
+
+    problems: list[IntegrityProblem] = []
+    for component in manifest.components:
+        try:
+            path = resolve_trusted_path(model_root, component.filename)
+        except ValueError:
+            problems.append(IntegrityProblem(component.component, "unsafe_path"))
+            continue
+        if not os.path.isfile(path):
+            if component.required:
+                problems.append(IntegrityProblem(component.component, "missing_file"))
+            continue
+        try:
+            actual_size = os.path.getsize(path)
+        except OSError:
+            problems.append(IntegrityProblem(component.component, "unreadable_file"))
+            continue
+        if actual_size == 0:
+            problems.append(IntegrityProblem(component.component, "empty_file"))
+            continue
+        if component.size and actual_size != component.size:
+            problems.append(IntegrityProblem(component.component, "size_mismatch"))
+            continue
+        try:
+            actual_digest = sha256_file(path)
+        except OSError:
+            problems.append(IntegrityProblem(component.component, "unreadable_file"))
+            continue
+        if actual_digest != component.sha256:
+            problems.append(IntegrityProblem(component.component, "hash_mismatch"))
+    return problems
+
+
+def baseline_manifest(
+    *,
+    whisper_sha256: str,
+    llama_sha256: str,
+    tts_sha256: str,
+    whisper_size: int = 0,
+    llama_size: int = 0,
+    tts_size: int = 0,
+    whisper_runtime_version: str = "",
+    llama_runtime_version: str = "",
+    tts_runtime_version: str = "",
+    tts_voice: str = "es-female-1",
+) -> ModelManifest:
+    """Build the approved CPU baseline profile manifest.
+
+    Caller supplies the artifact checksums measured at install time
+    (pinned per deployment); logical ids, runtimes, and provenance are
+    fixed by this function so the default can never silently drift to
+    a different model.
+    """
+    return ModelManifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        profile_id=BASELINE_PROFILE_ID,
+        components=(
+            ModelComponent(
+                component="stt",
+                runtime="whisper.cpp",
+                runtime_version=whisper_runtime_version,
+                model_id="whisper-base-multilingual",
+                filename="stt/ggml-model-base.bin",
+                sha256=whisper_sha256.lower(),
+                size=whisper_size,
+                arch_quant="base",
+                language="multilingual",
+                source="https://huggingface.co/ggerganov/whisper.cpp",
+                license="MIT (OpenAI Whisper model; check upstream terms)",
+                required=True,
+            ),
+            ModelComponent(
+                component="llm",
+                runtime="llama.cpp",
+                runtime_version=llama_runtime_version,
+                model_id="qwen3-1.7b-q4_k_m",
+                filename="llm/qwen3-1.7b-q4_k_m.gguf",
+                sha256=llama_sha256.lower(),
+                size=llama_size,
+                arch_quant="GGUF Q4_K_M",
+                language="multilingual",
+                source="https://huggingface.co/Qwen/Qwen3-1.7B-GGUF",
+                license="Apache-2.0 (Qwen; check upstream terms)",
+                required=True,
+            ),
+            ModelComponent(
+                component="tts",
+                runtime="sherpa-onnx",
+                runtime_version=tts_runtime_version,
+                model_id="tts-es-onnx",
+                filename="tts/es-voice.onnx",
+                sha256=tts_sha256.lower(),
+                size=tts_size,
+                arch_quant="ONNX VITS-compatible",
+                language="es",
+                voice=tts_voice,
+                source="operator-provisioned Spanish ONNX voice",
+                license="operator-provisioned (check voice license before use)",
+                required=True,
+            ),
+        ),
+    )
