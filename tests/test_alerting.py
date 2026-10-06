@@ -345,7 +345,7 @@ class FanOutIsolationTest(unittest.TestCase):
         self.assertEqual(kinds, [TransitionKind.UNHEALTHY, TransitionKind.RECOVERED])
         self.assertEqual(received, [TransitionKind.UNHEALTHY, TransitionKind.RECOVERED])
 
-    def test_queue_saturation_drops_external_only_and_keeps_order(self) -> None:
+    def test_backlog_preserves_full_sequence_without_drops(self) -> None:
         import threading
 
         release = threading.Event()
@@ -356,12 +356,12 @@ class FanOutIsolationTest(unittest.TestCase):
 
             def send(self, transition: HealthTransition) -> None:
                 release.wait(timeout=10.0)
-                received.append(transition.code)
+                received.append(f"{transition.code}:{transition.kind.value}")
 
         monitor = make_monitor(BlockingSink())
-        first = monitor.report_unhealthy(HealthComponent.PROVIDER, "provider.circuit_open")
-        assert first is not None
-        # Flood while the worker is stuck: all reports return immediately.
+        monitor.report_unhealthy(HealthComponent.PROVIDER, "provider.circuit_open")
+        # Flood while the worker is stuck: every report still returns fast
+        # and nothing emitted is ever dropped.
         import time
 
         started = time.monotonic()
@@ -371,13 +371,78 @@ class FanOutIsolationTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
         release.set()
         monitor.drain()
-        diagnostics = monitor.delivery_diagnostics()
-        self.assertTrue(
-            any(d.error_kind == "QueueSaturated" for d in diagnostics)
+        # External stream equals local history exactly: no gaps, no reorder.
+        self.assertEqual(
+            received,
+            [f"{t.code}:{t.kind.value}" for t in monitor.history()],
         )
-        # Local history kept everything; external order stayed FIFO.
-        self.assertGreater(len(monitor.history()), len(received))
-        self.assertEqual(received, [t.code for t in monitor.history()][: len(received)])
+        self.assertEqual(
+            [d for d in monitor.delivery_diagnostics()], []
+        )
+
+    def test_concurrent_reports_of_one_condition_emit_once(self) -> None:
+        import threading
+
+        sink = RecordingSink()
+        monitor = make_monitor(sink)
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def report() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                monitor.report_unhealthy(
+                    HealthComponent.PROVIDER, "provider.circuit_open"
+                )
+            except Exception as error:  # noqa: BLE001 (asserted empty below)
+                errors.append(error)
+
+        threads = [threading.Thread(target=report) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        self.assertEqual(errors, [])
+        unhealthy = [
+            t
+            for t in monitor.history()
+            if t.kind == TransitionKind.UNHEALTHY
+        ]
+        self.assertEqual(len(unhealthy), 1)
+        monitor.drain()
+        self.assertEqual(len(sink.received), 1)
+        self.assertLessEqual(monitor.started_workers, 1)
+
+    def test_concurrent_recoveries_emit_at_most_once(self) -> None:
+        import threading
+
+        sink = RecordingSink()
+        monitor = make_monitor(sink)
+        monitor.report_unhealthy(HealthComponent.PROVIDER, "provider.circuit_open")
+        barrier = threading.Barrier(2)
+        errors: list[Exception] = []
+
+        def recover() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                monitor.report_recovered(
+                    HealthComponent.PROVIDER, "provider.circuit_open"
+                )
+            except Exception as error:  # noqa: BLE001 (asserted empty below)
+                errors.append(error)
+
+        threads = [threading.Thread(target=recover) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        self.assertEqual(errors, [])
+        recoveries = [
+            t for t in monitor.history() if t.kind == TransitionKind.RECOVERED
+        ]
+        self.assertEqual(len(recoveries), 1)
+        monitor.drain()
+        self.assertEqual(len(sink.received), 2)
 
 
 class FakeSmtpTransport:

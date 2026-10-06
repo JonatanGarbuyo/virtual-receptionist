@@ -125,11 +125,10 @@ class AlertSink(Protocol):
     def send(self, transition: HealthTransition) -> None: ...
 
 
-#: Upper bound on queued undelivered transitions. Beyond it, transitions
-#: are still recorded locally but external fan-out for the excess is
-#: skipped with a local diagnostic: saturation never blocks reporters
-#: and never reorders the transitions already accepted.
-MAX_PENDING_DELIVERIES = 32
+#: Delivery queue policy: the monitor FIFO is intentionally unbounded.
+#: Edge-triggering means it never holds one entry per failed call, so no
+#: emitted transition is ever dropped and the external stream always
+#: preserves the full unhealthy/recovery sequence per condition.
 
 _LOGGER = logging.getLogger("virtual-receptionist.health")
 
@@ -176,13 +175,17 @@ class HealthMonitor:
     is recorded locally and emitted as a structured log line before any
     sink runs, so the local record exists even when all sinks fail.
 
-    External delivery never blocks reporters: emitted transitions wait
-    on one bounded FIFO queue drained by a single daemon worker, so the
-    external order always matches history() order while slow endpoints
-    cannot stall call admission. Use drain() in tests and close() at
-    shutdown for explicit lifecycle. Sink exceptions (and hostile sink
-    objects) are contained per sink and diagnosed locally without
-    recursion.
+    Thread-safe: one small lock guards condition state, history appends,
+    and worker lifecycle, and is never held during sink.send(). External
+    delivery never blocks reporters: emitted transitions wait on one
+    unbounded FIFO queue drained by a single worker, so the external
+    order always matches history() order while slow endpoints cannot
+    stall call admission. The queue is unbounded by design: the monitor
+    is edge-triggered, so it never holds one entry per failed call, and
+    no emitted transition is ever dropped. Use drain() in tests and
+    close() at shutdown for explicit lifecycle. Sink exceptions (and
+    hostile sink objects) are contained per sink and diagnosed locally
+    without recursion.
     """
 
     clock: Clock
@@ -191,53 +194,62 @@ class HealthMonitor:
 
     def __post_init__(self) -> None:
         self.sinks = [sink for sink in self.sinks if sink is not None]
+        self._lock = threading.Lock()
         self._active: dict[tuple[HealthComponent, str], ActiveCondition] = {}
         self._history: list[HealthTransition] = []
         self._diagnostics: list[DeliveryDiagnostic] = []
-        self._queue: queue.Queue = queue.Queue(maxsize=MAX_PENDING_DELIVERIES)
+        self._queue: queue.Queue = queue.Queue()
         self._worker: threading.Thread | None = None
+        self._started_workers = 0
         self._closed = False
+
+    @property
+    def started_workers(self) -> int:
+        """How many delivery workers were ever started. Lifecycle
+        observability: concurrent reporters must never start more than
+        one effective worker."""
+        with self._lock:
+            return self._started_workers
 
     def active_conditions(self) -> tuple[ActiveCondition, ...]:
         """Currently-unhealthy conditions, with stable identities."""
-        return tuple(self._active.values())
+        with self._lock:
+            return tuple(self._active.values())
 
     def history(self) -> tuple[HealthTransition, ...]:
         """Every locally recorded transition, oldest first."""
-        return tuple(self._history)
+        with self._lock:
+            return tuple(self._history)
 
     def delivery_diagnostics(self) -> tuple[DeliveryDiagnostic, ...]:
         """Local-only delivery failure records. Never fanned out."""
-        return tuple(self._diagnostics)
+        with self._lock:
+            return tuple(self._diagnostics)
 
     def drain(self, timeout: float = 5.0) -> None:
         """Wait (bounded) until every accepted transition is delivered.
         Deterministic tests call this before asserting what sinks
         received. Delivery order always matches history() order."""
-        if self._worker is None:
+        with self._lock:
+            worker = self._worker
+        if worker is None:
             return
         done = threading.Event()
         deadline = time.monotonic() + timeout
-        try:
-            self._queue.put(("flush", done), timeout=max(deadline - time.monotonic(), 0))
-        except queue.Full:
-            return
+        self._queue.put(("flush", done))
         remaining = deadline - time.monotonic()
         if remaining > 0:
             done.wait(timeout=remaining)
 
     def close(self) -> None:
         """Shutdown: no further external deliveries; drain what is queued,
-        bounded. Never leaves one thread per transition behind: there is
-        a single worker at most, and joining it drains everything ahead
-        of the stop marker."""
-        self._closed = True
-        worker, self._worker = self._worker, None
+        bounded. Single worker at most; joining it drains everything
+        ahead of the stop marker."""
+        with self._lock:
+            self._closed = True
+            worker, self._worker = self._worker, None
         if worker is not None:
-            try:
-                self._queue.put(("stop", None), timeout=5.0)
-            except queue.Full:
-                pass
+            self._queue.put(("stop", None))
             worker.join(timeout=5.0)
 
     def _now(self) -> float:
@@ -251,72 +263,67 @@ class HealthMonitor:
     ) -> HealthTransition | None:
         """Report a subsystem problem. Returns the emitted transition, or
         None when this (component, code) is already active (no re-alert).
-        Detail comes from the project-owned registry, never arguments."""
-        key = (component, code)
-        if key in self._active:
-            return None
-        now = self._now()
-        self._active[key] = ActiveCondition(
-            component=component,
-            code=code,
-            detail=DETAIL_BY_CODE.get(code, ""),
-            first_seen=now,
-        )
-        return self._emit(
-            HealthTransition(
+        Detail comes from the project-owned registry, never arguments.
+        Atomic: concurrent reporters of one condition emit exactly once."""
+        with self._lock:
+            key = (component, code)
+            if key in self._active:
+                return None
+            now = self._now()
+            self._active[key] = ActiveCondition(
+                component=component,
+                code=code,
+                detail=DETAIL_BY_CODE.get(code, ""),
+                first_seen=now,
+            )
+            transition = HealthTransition(
                 timestamp=now,
                 component=component,
                 code=code,
                 kind=TransitionKind.UNHEALTHY,
                 detail=DETAIL_BY_CODE.get(code, ""),
             )
-        )
+            self._history.append(transition)
+            _log_transition(transition)
+            self._enqueue_locked(transition)
+            return transition
 
     def report_recovered(
         self, component: HealthComponent, code: str
     ) -> HealthTransition | None:
         """Clear one active condition. Returns the recovery transition, or
-        None when nothing was active (no recovery is fabricated)."""
-        key = (component, code)
-        if key not in self._active:
-            return None
-        del self._active[key]
-        transition = HealthTransition(
-            timestamp=self._now(),
-            component=component,
-            code=code,
-            kind=TransitionKind.RECOVERED,
-        )
-        self._history.append(transition)
-        _log_transition(transition)
-        if self.notify_recovery:
-            self._fan_out_async(transition)
-        return transition
+        None when nothing was active (no recovery is fabricated). Atomic:
+        concurrent recoveries of one condition emit at most once."""
+        with self._lock:
+            key = (component, code)
+            if key not in self._active:
+                return None
+            del self._active[key]
+            transition = HealthTransition(
+                timestamp=self._now(),
+                component=component,
+                code=code,
+                kind=TransitionKind.RECOVERED,
+            )
+            self._history.append(transition)
+            _log_transition(transition)
+            if self.notify_recovery:
+                self._enqueue_locked(transition)
+            return transition
 
-    def _emit(self, transition: HealthTransition) -> HealthTransition:
-        self._history.append(transition)
-        _log_transition(transition)
-        self._fan_out_async(transition)
-        return transition
-
-    def _fan_out_async(self, transition: HealthTransition) -> None:
+    def _enqueue_locked(self, transition: HealthTransition) -> None:
+        """Queue one accepted transition. Runs under the state lock so
+        external order always matches history order. Never blocks: the
+        queue is unbounded and no emitted transition is ever dropped."""
         if self._closed or not self.sinks:
             return
         if self._worker is None or not self._worker.is_alive():
             self._worker = threading.Thread(
                 target=self._drain_queue, daemon=True, name="health-alerts"
             )
+            self._started_workers += 1
             self._worker.start()
-        try:
-            self._queue.put_nowait(("transition", transition))
-        except queue.Full:
-            diagnostic = DeliveryDiagnostic(
-                timestamp=self._now(),
-                sink_name="dispatcher",
-                error_kind="QueueSaturated",
-            )
-            self._diagnostics.append(diagnostic)
-            _log_diagnostic(diagnostic)
+        self._queue.put_nowait(("transition", transition))
 
     def _drain_queue(self) -> None:
         while True:
