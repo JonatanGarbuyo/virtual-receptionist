@@ -167,6 +167,11 @@ class STTAdapter(Protocol):
     def transcribe(
         self, pcm: bytes, sample_rate: int, cancel: CancelToken
     ) -> STTResult: ...
+    def abort_inflight(self) -> bool:
+        """Recycle the runtime iff a request is actually in flight
+        (frees single-slot servers client-close cannot preempt).
+        Idle calls are a no-op returning False."""
+        ...
     def warmup(self) -> None: ...
     def close(self) -> None: ...
 
@@ -181,6 +186,10 @@ class LLMAdapter(Protocol):
     @property
     def component(self) -> str: ...
     def generate(self, prompt: str, cancel: CancelToken) -> str: ...
+    def abort_inflight(self) -> bool:
+        """Recycle the runtime iff a request is actually in flight.
+        Idle calls are a no-op returning False."""
+        ...
     def warmup(self) -> None: ...
     def close(self) -> None: ...
 
@@ -644,7 +653,26 @@ class CascadedVoiceSession:
         LOG.debug(
             "voice cancel call_id=%s reason=%s", self._call_id, reason.value
         )
+        # Output-stop is immediate via the token; then free single-slot
+        # runtimes that a socket close cannot preempt. The recycle runs
+        # only when a request was actually in flight (bounded seconds),
+        # otherwise it is a no-op.
         token.set()
+        self._abort_runtimes()
+
+    def _abort_runtimes(self) -> None:
+        for adapter in (self._stt, self._llm):
+            abort = getattr(adapter, "abort_inflight", None)
+            if not callable(abort):
+                continue
+            try:
+                abort()
+            except Exception as error:
+                LOG.warning(
+                    "voice abort failed call_id=%s error=%s",
+                    self._call_id,
+                    type(error).__name__,
+                )
 
     def speak(self, text: str, turn_id: int) -> None:
         """Fixed application text (greeting/reprompt/apology) via TTS."""
@@ -675,6 +703,9 @@ class CascadedVoiceSession:
             token = self._token
             self._buffer.clear()
         token.set()
+        # A dying call frees the shared runtimes for the next one when
+        # it preempts real in-flight work; idle closes recycle nothing.
+        self._abort_runtimes()
 
     def wait_until_idle(self, timeout: float = 5.0) -> bool:
         """Block (bounded) until every queued job finished. Test seam:
@@ -1095,7 +1126,18 @@ class CascadedVoiceBackend:
     def warm(self) -> list[str]:
         """Minimal real warmup per component: each adapter must prove
         it can actually run, not merely that its files exist. Returns
-        sanitized problem ids; empty means every component warmed."""
+        sanitized problem ids; empty means every component warmed.
+
+        Fail-closed ordering: without a positive verification (content
+        or version problems recorded, or never verified at all), no
+        adapter is touched — warmup spawns/loads nothing unverified.
+        """
+        with self._lock:
+            if not self._verified or self._integrity_problems:
+                if "backend:unverified" not in self._integrity_problems:
+                    self._integrity_problems.append("backend:unverified")
+                self._warmed = False
+                return ["backend:unverified"]
         problems: list[str] = []
         for adapter in (self._stt, self._llm, self._tts):
             try:

@@ -241,6 +241,13 @@ class VoiceSession(Protocol):
     events arrive asynchronously on that worker. Media input, hangup,
     and barge-in can therefore be processed while a turn is in flight:
     inference never blocks a media-adapter thread.
+
+    Cancellation is two-phase: output-stop is immediate (token +
+    generation), then runtimes with a request actually in flight are
+    recycled synchronously so single-slot servers (`-np 1`) cannot trap
+    the next turn behind an abandoned tail. That recycle runs only on
+    real preemption and stays bounded (seconds); idle cancels never
+    block.
     """
 
     def push_audio(self, frame: AudioFrame) -> None: ...

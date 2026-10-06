@@ -60,6 +60,9 @@ class FakeSTTAdapter:
     def probe_version(self) -> str:
         return self.version
 
+    def abort_inflight(self) -> bool:
+        return False
+
     def warmup(self) -> None:
         self.warmups += 1
 
@@ -99,6 +102,9 @@ class FakeLLMAdapter:
 
     def probe_version(self) -> str:
         return self.version
+
+    def abort_inflight(self) -> bool:
+        return False
 
     def warmup(self) -> None:
         self.warmups += 1
@@ -178,6 +184,9 @@ class FakeTTSAdapter:
     def probe_version(self) -> str:
         return self.version
 
+    def abort_inflight(self) -> bool:
+        return False
+
     def warmup(self) -> None:
         self.warmups += 1
 
@@ -214,6 +223,9 @@ class FailingAdapter:
         on_chunk: Callable[[bytes, int], None],
     ) -> int:
         raise AdapterError(self._category, "failing adapter")
+
+    def abort_inflight(self) -> bool:
+        return False
 
     def warmup(self) -> None:
         raise AdapterError(self._category, "warmup failed")

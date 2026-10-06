@@ -135,5 +135,83 @@ class RealModelTurnTest(unittest.TestCase):
             backend.shutdown()
 
 
+@unittest.skipIf(_reasons(), f"real-model gate closed: {'; '.join(_reasons())}")
+class RealSlotRecycleTest(unittest.TestCase):
+    """MAJOR-1 proof against pinned llama-server: aborting an
+    in-flight generation frees the single slot (restart), so the next
+    request completes without waiting out the abandoned tail."""
+
+    def test_cancel_recycles_llm_slot_on_real_server(self) -> None:
+        import threading
+        import time
+
+        from receptionist.cascaded import CancelToken, VoiceProfile  # noqa: E402
+        from receptionist.local_runtimes import build_cascaded_backend  # noqa: E402
+        from receptionist.voice_manifest import (  # noqa: E402
+            load_manifest_file,
+            verify_manifest,
+        )
+
+        manifest = load_manifest_file(MANIFEST)
+        self.assertEqual(verify_manifest(MODEL_ROOT, manifest), [])
+        profile = VoiceProfile(
+            profile_id=manifest.profile_id,
+            model_root=MODEL_ROOT,
+            manifest_path=MANIFEST,
+            stt_executable=os.environ.get("STT_EXE", "whisper-server"),
+            llm_executable=os.environ.get("LLM_EXE", "llama-server"),
+            tts_voice=os.environ.get("TTS_VOICE", "es-female-1"),
+        )
+        backend = build_cascaded_backend(profile)
+        backend.start()
+        try:
+            self.assertEqual(backend.warm(), [])
+            adapter = backend._llm
+            token = CancelToken()
+            outcome: dict = {}
+
+            def long_gen() -> None:
+                try:
+                    adapter.generate(
+                        "Cuenta del 1 al 300 escribiendo cada numero en "
+                        "una linea separada. " * 4,
+                        token,
+                    )
+                    outcome["done"] = True
+                except Exception as error:
+                    outcome["error"] = type(error).__name__
+
+            worker = threading.Thread(target=long_gen, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 60.0
+            while adapter._inflight == 0 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertGreater(adapter._inflight, 0)
+            # Session order: token first (immediate output-stop), then
+            # recycle (frees the single slot).
+            token.set()
+            recycled = adapter.abort_inflight()
+            self.assertTrue(recycled)
+            worker.join(timeout=30.0)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(outcome.get("error"), "CancelledError")
+            restarts = adapter._server.restarts
+            t0 = time.monotonic()
+            text = adapter.generate(
+                '{"spoken_text": "Hola.", "action": null}', CancelToken()
+            )
+            short_ms = (time.monotonic() - t0) * 1000.0
+            self.assertTrue(text.strip())
+            print(
+                f"\nreal slot: restarts={restarts} "
+                f"short_gen_ms={short_ms:.0f}"
+            )
+            # Slot freed by recycle: far below the 60 s client timeout
+            # the abandoned tail would otherwise force.
+            self.assertLess(short_ms, 30000.0)
+        finally:
+            backend.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

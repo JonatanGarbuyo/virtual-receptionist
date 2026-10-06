@@ -38,16 +38,14 @@ def measured_versions(stt_exe: str, llm_exe: str) -> dict[str, str]:
     from receptionist.local_runtimes import (
         format_version,
         parse_llama_version,
-        parse_whisper_version,
+        probe_whisper_exe,
         query_version,
         sherpa_version,
     )
 
     versions: dict[str, str] = {}
     if stt_exe:
-        raw = query_version(stt_exe, name="stt")
-        parsed = parse_whisper_version(raw)
-        versions["stt"] = format_version(parsed)
+        versions["stt"] = probe_whisper_exe(stt_exe)
     if llm_exe:
         raw = query_version(llm_exe, name="llm")
         parsed = parse_llama_version(raw)
@@ -129,16 +127,6 @@ def main(argv: list[str] | None = None) -> int:
     if failed:
         print("pin_manifest FAILED: see problems above; manifest not written")
         return 1
-    pinned = manifest.__class__(
-        schema_version=manifest.schema_version,
-        profile_id=manifest.profile_id,
-        components=tuple(components),
-    )
-    with open(args.out, "w", encoding="utf-8") as handle:
-        json.dump(manifest_to_dict(pinned), handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
-    print(f"pinned manifest: {args.out}")
-    return 0
     pinned = manifest.__class__(
         schema_version=manifest.schema_version,
         profile_id=manifest.profile_id,

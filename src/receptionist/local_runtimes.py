@@ -36,7 +36,6 @@ import json
 import logging
 import mimetypes
 import os
-import queue
 import re
 import shutil
 import socket
@@ -92,6 +91,37 @@ def parse_llama_version(output: str) -> tuple[int, int, int] | None:
 
 def format_version(version: tuple[int, int, int] | None) -> str:
     return ".".join(str(part) for part in version) if version else "unknown"
+
+
+def _sibling_cli(executable: str) -> str | None:
+    """Same-build `whisper-cli` next to a server binary, if present."""
+    sibling = os.path.join(os.path.dirname(executable), "whisper-cli")
+    if sibling != executable and os.path.isfile(sibling):
+        return sibling
+    return None
+
+
+def probe_whisper_exe(executable: str) -> str:
+    """Version identity for a whisper runtime executable.
+
+    `whisper-server` answers no usable `--version`, so a same-directory
+    `whisper-cli` sibling (same build) is accepted as its identity
+    source — the exact strategy production probing uses, shared here
+    so pin tooling and adapters can never disagree.
+    """
+    for candidate in (executable, _sibling_cli(executable)):
+        if candidate is None:
+            continue
+        try:
+            raw = query_version(candidate, name="stt")
+        except AdapterError:
+            continue
+        parsed = parse_whisper_version(raw)
+        if parsed is not None:
+            return format_version(parsed)
+    raise AdapterError(
+        ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
+    )
 
 
 def sherpa_version() -> str:
@@ -510,12 +540,23 @@ def _wav_16k_mono_bytes(pcm: bytes) -> bytes:
 
 class _ServerProcess:
     """One long-lived loopback runtime server. Spawned once, resident
-    until `stop()` (terminate, then kill past a bounded grace)."""
+    until `stop()` (terminate, then kill past a bounded grace).
+
+    `restart()` recycles the process deterministically (stop → spawn →
+    bounded readiness wait) and counts recycles: it is the only
+    reliable preemption for single-slot runtimes (`-np 1`), where
+    closing the client socket does NOT abort server-side work and a
+    new turn would otherwise queue behind the abandoned tail.
+    Restarts happen only when a request was actually in flight —
+    never per barge-in, never speculatively.
+    """
 
     def __init__(self, *, name: str) -> None:
         self._name = name
         self._process: subprocess.Popen[bytes] | None = None
+        self._argv: list[str] | None = None
         self._lock = threading.Lock()
+        self.restarts = 0
 
     @property
     def running(self) -> bool:
@@ -543,6 +584,7 @@ class _ServerProcess:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                self._argv = list(argv)
             except OSError as error:
                 raise AdapterError(
                     ProviderFailureCategory.UNAVAILABLE,
@@ -565,6 +607,40 @@ class _ServerProcess:
                 process.kill()
             except Exception:
                 pass
+
+    def restart(self, ready, *, deadline_seconds: float = 60.0) -> None:
+        """Stop, respawn the stored argv, and wait for `ready()` (a
+        zero-arg callable raising AdapterError while not ready).
+        Raises AdapterError when the server does not come back inside
+        the deadline — the adapter then fails closed UNAVAILABLE."""
+        with self._lock:
+            argv = self._argv
+        if argv is None:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE,
+                f"{self._name} was never started",
+            )
+        self.stop()
+        self.spawn(argv)
+        with self._lock:
+            self.restarts += 1
+        end = time.monotonic() + deadline_seconds
+        last: Exception | None = None
+        while time.monotonic() < end:
+            try:
+                ready()
+                return
+            except AdapterError as error:
+                last = error
+                time.sleep(0.2)
+        try:
+            self.stop()
+        except Exception:
+            pass
+        raise AdapterError(
+            ProviderFailureCategory.UNAVAILABLE,
+            f"{self._name} did not recover",
+        ) from last
 
 
 class WhisperServerSTT:
@@ -605,37 +681,37 @@ class WhisperServerSTT:
         self._version = "unknown"
         self._lock = threading.Lock()
         self._closed = False
+        self._inflight = 0
 
     def version_info(self) -> str:
         return self._version
 
-    def probe_version(self) -> str:
-        """Lightweight runtime identity (no serving): query `--version`
-        and parse the real upstream format (`whisper.cpp version:
-        X.Y.Z`). `whisper-server` itself answers no `--version`, so a
-        same-directory `whisper-cli` sibling (same build) is accepted
-        as its identity source. Raises AdapterError when malformed."""
-        for candidate in (self._executable, self._sibling_cli()):
-            if candidate is None:
-                continue
-            try:
-                raw = query_version(candidate, name="stt")
-            except AdapterError:
-                continue
-            parsed = parse_whisper_version(raw)
-            if parsed is not None:
-                self._version = format_version(parsed)
-                return self._version
-        raise AdapterError(
-            ProviderFailureCategory.UNAVAILABLE, "stt version unsupported"
-        )
+    def abort_inflight(self) -> bool:
+        """Preempt a request actually in flight by recycling the server
+        process (the only reliable cancel for runtimes that keep
+        working after a client disconnect). Returns True when a recycle
+        happened; idle cancels are a no-op returning False. Failures
+        fail closed: the adapter reports UNAVAILABLE afterwards."""
+        with self._lock:
+            active = self._inflight > 0
+        if not active:
+            return False
+        try:
+            self._server.restart(
+                lambda: wait_for_port(self._host, self._port, deadline_seconds=5.0),
+                deadline_seconds=60.0,
+            )
+        except AdapterError as error:
+            LOG.warning("stt recycle failed: %s", error.category.value)
+            raise
+        return True
 
-    def _sibling_cli(self) -> str | None:
-        """Same-build `whisper-cli` next to the server binary, if any."""
-        sibling = os.path.join(os.path.dirname(self._executable), "whisper-cli")
-        if sibling != self._executable and os.path.isfile(sibling):
-            return sibling
-        return None
+    def probe_version(self) -> str:
+        """Lightweight runtime identity (no serving): shared whisper
+        probe (server → same-build `whisper-cli` sibling fallback).
+        Raises AdapterError when malformed."""
+        self._version = probe_whisper_exe(self._executable)
+        return self._version
 
     def start(self) -> None:
         """Spawn the resident server (idempotent). The model loads here,
@@ -682,15 +758,21 @@ class WhisperServerSTT:
                 ProviderFailureCategory.INVALID_OUTPUT, "empty turn audio"
             )
         wav_bytes = _wav_16k_mono_bytes(pcm)
-        status, document = http_post_multipart(
-            self.base_url() + "/inference",
-            {"temperature": "0.0", "response_format": "json"},
-            "file",
-            "turn.wav",
-            wav_bytes,
-            timeout_seconds=self._timeout,
-            cancel=cancel,
-        )
+        with self._lock:
+            self._inflight += 1
+        try:
+            status, document = http_post_multipart(
+                self.base_url() + "/inference",
+                {"temperature": "0.0", "response_format": "json"},
+                "file",
+                "turn.wav",
+                wav_bytes,
+                timeout_seconds=self._timeout,
+                cancel=cancel,
+            )
+        finally:
+            with self._lock:
+                self._inflight -= 1
         if status != 200:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, "stt inference failed"
@@ -762,9 +844,29 @@ class LlamaServerLLM:
         self._version = "unknown"
         self._lock = threading.Lock()
         self._closed = False
+        self._inflight = 0
 
     def version_info(self) -> str:
         return self._version
+
+    def abort_inflight(self) -> bool:
+        """Preempt a request actually in flight by recycling the server
+        process. Single-slot runtimes (`-np 1`) keep generating after a
+        client disconnect, so socket-close alone would leave turn B
+        queued behind the abandoned tail; the recycle frees the slot
+        deterministically. Idle cancels are a no-op returning False."""
+        with self._lock:
+            active = self._inflight > 0
+        if not active:
+            return False
+        try:
+            self._server.restart(
+                lambda: self._check_healthy_once(), deadline_seconds=120.0
+            )
+        except AdapterError as error:
+            LOG.warning("llm recycle failed: %s", error.category.value)
+            raise
+        return True
 
     def probe_version(self) -> str:
         """Lightweight runtime identity (no serving): query `--version`
@@ -807,21 +909,27 @@ class LlamaServerLLM:
     def base_url(self) -> str:
         return f"http://{self._host}:{self._port}"
 
+    def _check_healthy_once(self) -> None:
+        """Single health probe: raises AdapterError unless serving."""
+        status, document = http_get_json(
+            self.base_url() + "/health",
+            timeout_seconds=5.0,
+            cancel=CancelToken(),
+        )
+        if status != 200 or document.get("status") != "ok":
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "llm server not ready"
+            )
+
     def _wait_healthy(self, *, deadline_seconds: float) -> None:
         end = time.monotonic() + deadline_seconds
         while time.monotonic() < end:
             try:
-                status, document = http_get_json(
-                    self.base_url() + "/health",
-                    timeout_seconds=5.0,
-                    cancel=CancelToken(),
-                )
-            except AdapterError:
-                time.sleep(0.1)
-                continue
-            if status == 200 and document.get("status") == "ok":
+                self._check_healthy_once()
                 return
-            time.sleep(0.2)
+            except AdapterError:
+                time.sleep(0.2)
+                continue
         raise AdapterError(
             ProviderFailureCategory.TIMEOUT, "llm server did not warm"
         )
@@ -837,19 +945,25 @@ class LlamaServerLLM:
             raise AdapterError(
                 ProviderFailureCategory.UNAVAILABLE, "llm server not running"
             )
-        status, document = http_post_json(
-            self.base_url() + "/completion",
-            {
-                "prompt": prompt,
-                "n_predict": self._max_tokens,
-                "temperature": 0.4,
-                "cache_prompt": False,
-                "stream": False,
-                "json_schema": MODEL_OUTPUT_SCHEMA,
-            },
-            timeout_seconds=self._timeout,
-            cancel=cancel,
-        )
+        with self._lock:
+            self._inflight += 1
+        try:
+            status, document = http_post_json(
+                self.base_url() + "/completion",
+                {
+                    "prompt": prompt,
+                    "n_predict": self._max_tokens,
+                    "temperature": 0.4,
+                    "cache_prompt": False,
+                    "stream": False,
+                    "json_schema": MODEL_OUTPUT_SCHEMA,
+                },
+                timeout_seconds=self._timeout,
+                cancel=cancel,
+            )
+        finally:
+            with self._lock:
+                self._inflight -= 1
         if status != 200:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, "llm completion failed"
@@ -955,10 +1069,15 @@ def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
         stt_model = resolve_trusted_path(root, stt_files[0][0])
         llm_model = resolve_trusted_path(root, llm_files[0][0])
         tts_names = [name for name, _ in tts_files]
-        tts_model_name = next(
-            (name for name in tts_names if name.endswith("model.onnx")), tts_names[0]
-        )
-        voice_dir = os.path.dirname(resolve_trusted_path(root, tts_model_name))
+        tts_models = [name for name in tts_names if name.endswith(".onnx")]
+        tts_tokens = [name for name in tts_names if "token" in name.lower()]
+        # The executed TTS files are exactly the verified manifest
+        # entries — no conventional filenames are reconstructed here.
+        if len(tts_models) != 1 or len(tts_tokens) != 1:
+            raise ValueError("tts entry must list one model and one tokens file")
+        tts_voice_dir = os.path.dirname(resolve_trusted_path(root, tts_models[0]))
+        if os.path.dirname(resolve_trusted_path(root, tts_tokens[0])) != tts_voice_dir:
+            raise ValueError("tts entry files must share one voice directory")
     except (ValueError, IndexError) as error:
         raise AdapterError(
             ProviderFailureCategory.UNAVAILABLE, "voice manifest invalid entry"
@@ -977,7 +1096,13 @@ def build_cascaded_backend(profile, knowledge_lookup=None, clock=None):
         timeout_seconds=profile.llm_timeout_seconds,
     )
     tts = SherpaOnnxTTS(
-        model_dir=voice_dir,
+        model_dir=tts_voice_dir,
+        model_file=os.path.basename(
+            next(name for name in tts_names if name.endswith(".onnx"))
+        ),
+        tokens_file=os.path.basename(
+            next(name for name in tts_names if "token" in name.lower())
+        ),
         voice=selected_voice,
         speaker_id=profile.tts_speaker_id,
         timeout_seconds=profile.tts_timeout_seconds,
@@ -1047,11 +1172,17 @@ class SherpaOnnxTTS:
         self,
         *,
         model_dir: str,
+        model_file: str = "model.onnx",
+        tokens_file: str = "tokens.txt",
         voice: str = "es-female-1",
         speaker_id: int = 0,
         sample_rate: int = 16000,
         timeout_seconds: float = 60.0,
     ) -> None:
+        """The executed files come from the verified manifest entry —
+        `model_dir` is only the trusted root they were resolved under.
+        Layouts without exactly these files fail closed in composition,
+        never silently here."""
         if not model_dir or not os.path.isdir(model_dir):
             raise AdapterError(
                 ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
@@ -1059,16 +1190,17 @@ class SherpaOnnxTTS:
         if speaker_id < 0:
             raise ValueError("speaker_id must be >= 0")
         self._model_dir = model_dir
+        self._model_file = model_file
+        self._tokens_file = tokens_file
         self._voice = voice
         self._speaker_id = speaker_id
         self._sample_rate = sample_rate
         self._timeout = timeout_seconds
         self._lock = threading.Lock()
         self._closed = False
-        self._engine = None
+        self._child = None
+        self._conn = None
         self._version = "unknown"
-        self._jobs: queue.Queue = queue.Queue()
-        self._worker: threading.Thread | None = None
 
     def version_info(self) -> str:
         return self._version
@@ -1090,6 +1222,136 @@ class SherpaOnnxTTS:
             ) from error
         return sherpa_onnx
 
+def _tts_child_main(conn, model_path: str, tokens_path: str, data_dir: str) -> None:
+    """TTS worker subprocess: owns the engine exclusively, serves one
+    sentence at a time. Termination is the cancellation primitive —
+    the parent kills this process on timeout/cancel/close, so no
+    synthesis can ever outlive its turn or wedge shutdown."""
+    import struct
+    import traceback
+
+    try:
+        import sherpa_onnx  # type: ignore[import-not-found]
+    except Exception as error:
+        conn.send(("error", f"tts runtime unavailable: {type(error).__name__}"))
+        return
+    try:
+        vits = sherpa_onnx.OfflineTtsVitsModelConfig(
+            model=model_path,
+            lexicon="",
+            tokens=tokens_path,
+            data_dir=data_dir,
+        )
+        config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=vits,
+                provider="cpu",
+                debug=False,
+                num_threads=2,
+            )
+        )
+        engine = sherpa_onnx.OfflineTts(config)
+    except Exception as error:
+        conn.send(("error", f"tts voice unavailable: {type(error).__name__}"))
+        return
+    conn.send(("ready", engine.sample_rate if hasattr(engine, "sample_rate") else 0))
+    while True:
+        try:
+            message = conn.recv()
+        except EOFError:
+            return
+        if message is None:
+            return
+        kind = message[0]
+        if kind == "synth":
+            _, text, speaker_id = message
+            try:
+                audio = engine.generate(text, sid=speaker_id, speed=1.0)
+                samples = list(getattr(audio, "samples", []) or [])
+                rate = int(getattr(audio, "sample_rate", 0) or 0)
+                clipped = [max(-1.0, min(1.0, s)) for s in samples]
+                pcm = struct.pack(
+                    f"<{len(clipped)}h", *(int(s * 32767) for s in clipped)
+                )
+                conn.send(("audio", rate, pcm))
+            except Exception as error:
+                conn.send(("error", f"tts synthesis failed: {type(error).__name__}"))
+                traceback.clear_frames(traceback.extract_stack())
+
+
+class SherpaOnnxTTS:
+    """sherpa-onnx TTS in a dedicated terminable worker subprocess.
+
+    The engine lives and runs exclusively in the child: `generate()`
+    can never overlap with another `generate()` (serial loop), and
+    termination is real cancellation — on timeout, barge-in cancel,
+    hangup, fallback, or shutdown the parent terminates the child, so
+    no synthesis survives its turn and `close()` leaves zero workers
+    behind. A terminated worker is respawned lazily on next use (fresh
+    engine load, documented recycle cost, only on the abort path).
+
+    Synthesis is sentence-chunked: first audio emits after the first
+    sentence (never after the whole utterance) and cancel is observed
+    between sentences. `sherpa_onnx` is never a hard dependency:
+    without it (or without the voice files) every call fails closed
+    UNAVAILABLE. Voice files resolve only under `<model_root>/tts/
+    <voice>/` as listed in the manifest: `voice` selects the directory
+    (exact entries via `model_file`/`tokens_file`), `speaker_id` the
+    voice inside it.
+    """
+
+    component = "tts"
+
+    def __init__(
+        self,
+        *,
+        model_dir: str,
+        model_file: str = "model.onnx",
+        tokens_file: str = "tokens.txt",
+        voice: str = "es-female-1",
+        speaker_id: int = 0,
+        sample_rate: int = 16000,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        """The executed files come from the verified manifest entry —
+        `model_dir` is only the trusted root they were resolved under.
+        Layouts without exactly these files fail closed in composition,
+        never silently here."""
+        if not model_dir or not os.path.isdir(model_dir):
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
+            )
+        if speaker_id < 0:
+            raise ValueError("speaker_id must be >= 0")
+        self._model_dir = model_dir
+        self._model_file = model_file
+        self._tokens_file = tokens_file
+        self._voice = voice
+        self._speaker_id = speaker_id
+        self._sample_rate = sample_rate
+        self._timeout = timeout_seconds
+        self._lock = threading.Lock()
+        self._closed = False
+        self._child = None
+        self._conn = None
+        self._version = "unknown"
+
+    def version_info(self) -> str:
+        return self._version
+
+    def probe_version(self) -> str:
+        """Lightweight runtime identity (no engine load): package
+        metadata, else the module attribute, else `unknown`.
+        `unknown` never passes the manifest compat gate."""
+        self._version = sherpa_version()
+        try:
+            import sherpa_onnx  # type: ignore[import-not-found]  # noqa: F401
+        except Exception as error:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "tts runtime unavailable"
+            ) from error
+        return self._version
+
     def _voice_file(self, name: str) -> str:
         path = os.path.join(self._model_dir, name)
         if not os.path.isfile(path):
@@ -1098,106 +1360,117 @@ class SherpaOnnxTTS:
             )
         return path
 
-    def _create_engine(self):
-        sherpa_onnx = self._load()
-        try:
-            data_dir = os.path.join(self._model_dir, "espeak-ng-data")
-            vits = sherpa_onnx.OfflineTtsVitsModelConfig(
-                model=self._voice_file("model.onnx"),
-                lexicon="",
-                tokens=self._voice_file("tokens.txt"),
-                data_dir=data_dir if os.path.isdir(data_dir) else "",
-            )
-            config = sherpa_onnx.OfflineTtsConfig(
-                model=sherpa_onnx.OfflineTtsModelConfig(
-                    vits=vits,
-                    provider="cpu",
-                    debug=False,
-                    num_threads=2,
-                )
-            )
-            return sherpa_onnx.OfflineTts(config)
-        except AdapterError:
-            raise
-        except Exception as error:
-            raise AdapterError(
-                ProviderFailureCategory.UNAVAILABLE, "tts voice unavailable"
-            ) from error
+    def _child_paths(self) -> tuple[str, str, str]:
+        model_path = self._voice_file(self._model_file)
+        tokens_path = self._voice_file(self._tokens_file)
+        data_dir = os.path.join(self._model_dir, "espeak-ng-data")
+        return model_path, tokens_path, data_dir if os.path.isdir(data_dir) else ""
 
-    def _ensure_worker(self) -> None:
+    def _ensure_child(self) -> None:
+        import multiprocessing
+
         with self._lock:
             if self._closed:
                 raise AdapterError(
                     ProviderFailureCategory.UNAVAILABLE, "tts runtime closed"
                 )
-            if self._worker is not None and self._worker.is_alive():
+            if self._child is not None and self._child.is_alive():
                 return
-            worker = threading.Thread(
-                target=self._serve, name=f"sherpa-tts-{id(self):x}", daemon=True
+            self._terminate_locked()
+            model_path, tokens_path, data_dir = self._child_paths()
+            parent_conn, child_conn = multiprocessing.Pipe(duplex=True)
+            child = multiprocessing.get_context("fork").Process(
+                target=_tts_child_main,
+                args=(child_conn, model_path, tokens_path, data_dir),
+                name=f"sherpa-tts-{id(self):x}",
+                daemon=True,
             )
-            self._worker = worker
-            worker.start()
+            child.start()
+            child_conn.close()
+            self._child = child
+            self._conn = parent_conn
+        if not parent_conn.poll(180.0):
+            self._terminate()
+            raise AdapterError(
+                ProviderFailureCategory.TIMEOUT, "tts worker did not start"
+            )
+        try:
+            message = parent_conn.recv()
+        except EOFError as error:
+            self._terminate()
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "tts worker unavailable"
+            ) from error
+        if not (isinstance(message, tuple) and message[0] == "ready"):
+            self._terminate()
+            detail = message[1] if isinstance(message, tuple) else "unavailable"
+            raise AdapterError(ProviderFailureCategory.UNAVAILABLE, f"tts {detail}")
 
-    def _serve(self) -> None:
-        while True:
-            job = self._jobs.get()
+    def _terminate(self) -> None:
+        with self._lock:
+            self._terminate_locked()
+
+    def _terminate_locked(self) -> None:
+        child, conn = self._child, self._conn
+        self._child, self._conn = None, None
+        if conn is not None:
             try:
-                if job is None:  # shutdown sentinel
-                    return
-                kind = job[0]
-                if kind == "load":
-                    _, done, outcome = job
-                    try:
-                        if self._engine is None:
-                            self._engine = self._create_engine()
-                        outcome["engine"] = self._engine
-                    except Exception as error:
-                        outcome["error"] = error
-                    finally:
-                        done.set()
-                else:
-                    _, done, outcome, text, speaker_id = job
-                    try:
-                        if self._engine is None:
-                            self._engine = self._create_engine()
-                        audio = self._engine.generate(
-                            text, sid=speaker_id, speed=1.0
-                        )
-                        outcome["audio"] = audio
-                    except Exception as error:
-                        outcome["error"] = error
-                    finally:
-                        done.set()
-            finally:
-                self._jobs.task_done()
+                conn.close()
+            except Exception:
+                pass
+        if child is not None:
+            if child.is_alive():
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+            child.join(timeout=5.0)
+            if child.is_alive():
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+                child.join(timeout=5.0)
 
-    def _submit(self, job: tuple) -> tuple[threading.Event, dict]:
-        done = threading.Event()
-        outcome: dict = {}
-        self._jobs.put(job[:1] + (done, outcome) + job[1:])
-        return done, outcome
-
-    def _await(
-        self, done: threading.Event, outcome: dict, cancel: CancelToken,
-        deadline: float, description: str,
+    def _request(
+        self, message: tuple, cancel: CancelToken, deadline: float, description: str
     ):
-        while not done.wait(0.02):
-            if cancel.cancelled:
-                outcome["abandoned"] = True
-                raise CancelledError()
-            if time.monotonic() >= deadline:
-                outcome["abandoned"] = True
-                raise AdapterError(
-                    ProviderFailureCategory.TIMEOUT, f"{description} timed out"
-                )
-        error = outcome.get("error")
-        if error is not None:
-            if isinstance(error, AdapterError):
-                raise error
+        with self._lock:
+            conn = self._conn
+        if conn is None:
+            raise AdapterError(
+                ProviderFailureCategory.UNAVAILABLE, "tts worker unavailable"
+            )
+        try:
+            conn.send(message)
+        except (EOFError, OSError) as error:
             raise AdapterError(
                 ProviderFailureCategory.INTERNAL, f"{description} failed"
             ) from error
-        return outcome
+        while not conn.poll(0.02):
+            if cancel.cancelled:
+                self._terminate()
+                raise CancelledError()
+            if time.monotonic() >= deadline:
+                self._terminate()
+                raise AdapterError(
+                    ProviderFailureCategory.TIMEOUT, f"{description} timed out"
+                )
+        try:
+            reply = conn.recv()
+        except EOFError as error:
+            self._terminate()
+            raise AdapterError(
+                ProviderFailureCategory.INTERNAL, f"{description} failed"
+            ) from error
+        if not isinstance(reply, tuple) or not reply:
+            self._terminate()
+            raise AdapterError(
+                ProviderFailureCategory.INTERNAL, f"{description} failed"
+            )
+        if reply[0] == "error":
+            raise AdapterError(ProviderFailureCategory.INTERNAL, "tts synthesis failed")
+        return reply
 
     def synthesize(
         self,
@@ -1205,10 +1478,8 @@ class SherpaOnnxTTS:
         cancel: CancelToken,
         on_chunk,
     ) -> int:
-        import struct
-
         cancel.throw_if_cancelled()
-        self._ensure_worker()
+        self._ensure_child()
         sentences = split_sentences(text)
         if not sentences:
             raise AdapterError(
@@ -1218,22 +1489,14 @@ class SherpaOnnxTTS:
         total = 0
         for sentence in sentences:
             cancel.throw_if_cancelled()
-            done, outcome = self._submit(("synth", sentence, self._speaker_id))
-            try:
-                self._await(done, outcome, cancel, deadline, "tts synthesis")
-            except (CancelledError, AdapterError):
-                raise
-            audio = outcome.get("audio")
-            samples = getattr(audio, "samples", []) if audio is not None else []
-            if not samples:
+            reply = self._request(
+                ("synth", sentence, self._speaker_id), cancel, deadline, "tts synthesis"
+            )
+            _, rate, pcm = reply
+            if not pcm:
                 raise AdapterError(
                     ProviderFailureCategory.INVALID_OUTPUT, "tts produced no audio"
                 )
-            rate = getattr(audio, "sample_rate", self._sample_rate)
-            clipped = [max(-1.0, min(1.0, s)) for s in samples]
-            pcm = struct.pack(
-                f"<{len(clipped)}h", *(int(s * 32767) for s in clipped)
-            )
             stride = 1600 * 2
             for index in range(0, len(pcm), stride):
                 cancel.throw_if_cancelled()
@@ -1244,9 +1507,7 @@ class SherpaOnnxTTS:
 
     def warmup(self) -> None:
         self.probe_version()
-        self._ensure_worker()
-        done, outcome = self._submit(("load",))
-        self._await(done, outcome, CancelToken(), time.monotonic() + 120.0, "tts load")
+        self._ensure_child()
         # Tiny synthesis through the resident voice: proves it speaks.
         generated: list[bool] = []
 
@@ -1261,17 +1522,10 @@ class SherpaOnnxTTS:
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
-                worker = self._worker
-                self._worker = None
-            else:
-                self._closed = True
-                worker = self._worker
-                self._worker = None
-                self._engine = None
-        if worker is not None:
-            try:
-                self._jobs.put(None)
-            except Exception:
-                pass
-            worker.join(timeout=5.0)
+            if self._closed and self._child is None:
+                return
+            self._closed = True
+        self._terminate()
+        with self._lock:
+            self._child = None
+            self._conn = None

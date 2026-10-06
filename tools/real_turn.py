@@ -167,7 +167,10 @@ def main() -> int:
             events["playbacks"].append(turn_id)
 
         def on_action_request(self, action: object) -> None:
-            events["actions"].append(type(action).__name__)
+            detail = getattr(action, "destination_id", "")
+            events["actions"].append(
+                f"{type(action).__name__}:{detail}" if detail else type(action).__name__
+            )
 
         def on_provider_failure(self, turn_id: int, failure: ProviderFailure) -> None:
             events["failures"].append((turn_id, failure.category.value))

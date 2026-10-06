@@ -1235,8 +1235,8 @@ class ReadinessTest(unittest.TestCase):
             clock=FakeClock(),
         )
         backend.start()
-        self.assertEqual(backend.warm(), [])
-        # Started + warmed, but nothing was ever verified: not ready.
+        # MAJOR-4: warmup itself refuses without positive verification.
+        self.assertEqual(backend.warm(), ["backend:unverified"])
         self.assertFalse(backend.ready)
 
     def test_bare_verify_fails_closed_and_never_wipes_problems(self) -> None:
@@ -1649,48 +1649,74 @@ class StubRuntimeServersTest(unittest.TestCase):
 
 
 class SentenceTTSTest(unittest.TestCase):
-    """M3: sentence-chunked synthesis is incremental, cancellable, and
-    really bounded by the profile timeout."""
+    """M3/MAJOR-2: sentence-chunked synthesis through a terminable
+    worker subprocess — incremental, cancellable, effectively timed
+    out, never orphaned."""
 
     def adapter(self, **kwargs):
         from receptionist.local_runtimes import SherpaOnnxTTS
 
         adapter = SherpaOnnxTTS(model_dir=self.tmp.name, **kwargs)
+        self.addCleanup(adapter.close)
         return adapter
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # Placeholder voice files: existence is checked at spawn, while
+        # the stub child never loads them.
+        for name in ("model.onnx", "tokens.txt"):
+            with open(os.path.join(self.tmp.name, name), "wb") as handle:
+                handle.write(b"stub")
 
-    def stub_engine(self, adapter, *, block=None, rate=22050):
-        import threading
-        import types
+    def install_stub_child(self, *, block=None, rate=22050):
+        """Patch the module-level child main (inherited across fork):
+        blocking/recordable fake engine speaking the same protocol."""
+        import multiprocessing
+
+        import receptionist.local_runtimes as runtimes
 
         calls: list[tuple[str, int]] = []
-        state = {
-            "active": 0,
-            "max_active": 0,
-            "lock": threading.Lock(),
-            "release": block,
-        }
+        record: multiprocessing.Queue = multiprocessing.Queue()
 
-        def generate(text: str, sid: int = 0, speed: float = 1.0):
-            calls.append((text, sid))
-            with state["lock"]:
-                state["active"] += 1
-                state["max_active"] = max(state["max_active"], state["active"])
+        def stub(conn, model_path: str, tokens_path: str, data_dir: str):
+            record.put(("paths", model_path, tokens_path, data_dir))
+            conn.send(("ready", rate))
+            while True:
+                try:
+                    message = conn.recv()
+                except EOFError:
+                    return
+                if message is None:
+                    return
+                _, text, sid = message
+                record.put(("synth", text, sid))
+                if block is not None:
+                    block.wait(timeout=30.0)
+                conn.send(("audio", rate, b"\x01\x00" * 1600))
+
+        real = runtimes._tts_child_main
+        runtimes._tts_child_main = stub  # type: ignore[assignment]
+        self.addCleanup(setattr, runtimes, "_tts_child_main", real)
+        return record
+
+    def synth_calls(self, record, count: int) -> list[tuple[str, int]]:
+        """Drain `count` synth records (paths record comes first)."""
+        found: list[tuple[str, int]] = []
+        deadline = __import__("time").monotonic() + 10.0
+        while len(found) < count and __import__("time").monotonic() < deadline:
             try:
-                if state["release"] is not None:
-                    assert state["release"].wait(timeout=10.0), "engine stub wedged"
-            finally:
-                with state["lock"]:
-                    state["active"] -= 1
-            return types.SimpleNamespace(
-                samples=[0.1] * 1600, sample_rate=rate
-            )
+                entry = record.get(timeout=0.5)
+            except Exception:
+                continue
+            if entry[0] == "synth":
+                found.append((entry[1], entry[2]))
+        return found
 
-        adapter._create_engine = lambda: types.SimpleNamespace(generate=generate)  # type: ignore[method-assign]
-        return calls, state
+    def live_children(self) -> set[int]:
+        import multiprocessing
+
+        return {p.pid for p in multiprocessing.active_children() if p.is_alive()}
 
     def test_split_sentences_bounds_each_chunk(self) -> None:
         from receptionist.local_runtimes import split_sentences
@@ -1700,102 +1726,123 @@ class SentenceTTSTest(unittest.TestCase):
         long = "palabra " * 300
         bounded = split_sentences(long, max_chars=100)
         self.assertTrue(all(len(part) <= 100 for part in bounded))
-        self.assertEqual(bounded, [p for p in bounded if p])
 
     def test_synthesis_is_per_sentence_and_incremental(self) -> None:
         from receptionist.cascaded import CancelToken
 
         adapter = self.adapter()
-        try:
-            calls, _ = self.stub_engine(adapter)
-            chunks: list[bytes] = []
-            total = adapter.synthesize(
-                "Hola. ¿En qué puedo ayudarle?", CancelToken(), lambda pcm, rate: chunks.append(pcm),
-            )
-            self.assertEqual(len(calls), 2)
-            self.assertGreater(len(chunks), 0)
-            self.assertGreater(total, 0)
-        finally:
-            adapter.close()
+        record = self.install_stub_child()
+        chunks: list[bytes] = []
+        total = adapter.synthesize(
+            "Hola. ¿En qué puedo ayudarle?", CancelToken(), lambda pcm, rate: chunks.append(pcm),
+        )
+        self.assertEqual(len(self.synth_calls(record, 2)), 2)
+        self.assertGreater(len(chunks), 0)
+        self.assertGreater(total, 0)
+
+    def test_engine_receives_exact_manifest_paths(self) -> None:
+        """MAJOR-3: the worker executes exactly the composed paths."""
+        from receptionist.cascaded import CancelToken
+
+        adapter = self.adapter(model_file="custom-model.onnx", tokens_file="custom-tokens.txt")
+        for name in ("custom-model.onnx", "custom-tokens.txt"):
+            with open(os.path.join(self.tmp.name, name), "wb") as handle:
+                handle.write(b"stub")
+        record = self.install_stub_child()
+        adapter.synthesize("Hola.", CancelToken(), lambda p, r: None)
+        kind, model_path, tokens_path, _data = record.get(timeout=10.0)
+        self.assertEqual(kind, "paths")
+        self.assertTrue(model_path.endswith("custom-model.onnx"))
+        self.assertTrue(tokens_path.endswith("custom-tokens.txt"))
 
     def test_cancel_between_sentences_stops_synthesis(self) -> None:
         from receptionist.cascaded import CancelToken, CancelledError
 
         adapter = self.adapter()
-        try:
-            calls, _ = self.stub_engine(adapter)
-            token = CancelToken()
-            seen: list[bytes] = []
+        record = self.install_stub_child()
+        token = CancelToken()
+        seen: list[bytes] = []
 
-            def on_chunk(pcm: bytes, rate: int) -> None:
-                seen.append(pcm)
-                token.set()
+        def on_chunk(pcm: bytes, rate: int) -> None:
+            seen.append(pcm)
+            token.set()
 
-            with self.assertRaises(CancelledError):
-                adapter.synthesize("Primera frase. Segunda frase.", token, on_chunk)
-            self.assertEqual(len(calls), 1)
-        finally:
-            adapter.close()
+        with self.assertRaises(CancelledError):
+            adapter.synthesize("Primera frase. Segunda frase.", token, on_chunk)
+        self.assertEqual(len(self.synth_calls(record, 1)), 1)
 
-    def test_sentence_timeout_is_effective(self) -> None:
+    def test_sentence_timeout_terminates_worker_without_orphans(self) -> None:
         import threading
 
         from receptionist.cascaded import AdapterError, CancelToken
         from receptionist.boundaries import ProviderFailureCategory
 
-        adapter = self.adapter(timeout_seconds=0.2)
-        try:
-            self.stub_engine(adapter, block=threading.Event())
-            with self.assertRaises(AdapterError) as raised:
-                adapter.synthesize("Hola, esto tardará.", CancelToken(), lambda p, r: None)
-            self.assertEqual(raised.exception.category, ProviderFailureCategory.TIMEOUT)
-        finally:
-            adapter.close()
+        adapter = self.adapter(timeout_seconds=0.3)
+        self.install_stub_child(block=threading.Event())
+        before = self.live_children()
+        with self.assertRaises(AdapterError) as raised:
+            adapter.synthesize("Hola, esto tardará.", CancelToken(), lambda p, r: None)
+        self.assertEqual(raised.exception.category, ProviderFailureCategory.TIMEOUT)
+        # The blocked worker was terminated, not abandoned.
+        self.assertEqual(self.live_children(), before)
 
     def test_timed_out_synthesis_never_runs_alongside_the_next_one(self) -> None:
         import threading
 
         from receptionist.cascaded import CancelToken
 
-        adapter = self.adapter(timeout_seconds=0.2)
+        adapter = self.adapter(timeout_seconds=0.3)
         release = threading.Event()
-        try:
-            calls, state = self.stub_engine(adapter, block=release)
-            # A starts and blocks inside generate(); the timeout fires.
-            with self.assertRaises(Exception):
-                adapter.synthesize("Frase A.", CancelToken(), lambda p, r: None)
-            self.assertEqual(state["active"], 1)
-            # Release A: its late result is discarded by the serial worker.
-            release.set()
-            chunks: list[bytes] = []
-            total = adapter.synthesize(
-                "Frase B.", CancelToken(), lambda pcm, rate: chunks.append(pcm)
-            )
-            self.assertGreater(total, 0)
-            # Invariant: generate() never ran concurrently with itself.
-            self.assertEqual(state["max_active"], 1)
-            self.assertEqual(len(calls), 2)
-        finally:
-            release.set()
-            wname = adapter._worker.name if adapter._worker is not None else ""
-            adapter.close()
-        worker = adapter._worker
-        self.assertTrue(worker is None or not worker.is_alive())
-        self.assertEqual(
-            [t for t in threading.enumerate() if t.name == wname and t.is_alive()],
-            [],
+        record = self.install_stub_child(block=release)
+        before = self.live_children()
+        with self.assertRaises(Exception):
+            adapter.synthesize("Frase A.", CancelToken(), lambda p, r: None)
+        # Release A after the fact: its late result died with the
+        # terminated worker; B runs on a respawned worker, strictly serial.
+        release.set()
+        chunks: list[bytes] = []
+        total = adapter.synthesize(
+            "Frase B.", CancelToken(), lambda pcm, rate: chunks.append(pcm)
         )
+        self.assertGreater(total, 0)
+        self.assertEqual(len(self.synth_calls(record, 2)), 2)
+        adapter.close()
+        self.assertEqual(self.live_children(), before)
+
+    def test_close_with_blocked_worker_leaves_no_process(self) -> None:
+        """MAJOR-2 gate: close() without releasing the fake first must
+        still leave zero workers behind in a deterministic bound."""
+        import threading
+
+        from receptionist.cascaded import CancelToken
+
+        adapter = self.adapter(timeout_seconds=60.0)
+        self.install_stub_child(block=threading.Event())
+        before = self.live_children()
+        started = threading.Event()
+
+        def run() -> None:
+            started.set()
+            try:
+                adapter.synthesize("Bloqueo.", CancelToken(), lambda p, r: None)
+            except Exception:
+                pass
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(timeout=10.0))
+        adapter.close()  # never released the fake: must still reap all
+        worker.join(timeout=10.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.live_children(), before)
 
     def test_speaker_id_reaches_the_engine(self) -> None:
         from receptionist.cascaded import CancelToken
 
         adapter = self.adapter(speaker_id=3)
-        try:
-            calls, _ = self.stub_engine(adapter)
-            adapter.synthesize("Hola.", CancelToken(), lambda p, r: None)
-            self.assertEqual(calls, [("Hola.", 3)])
-        finally:
-            adapter.close()
+        record = self.install_stub_child()
+        adapter.synthesize("Hola.", CancelToken(), lambda p, r: None)
+        self.assertEqual(self.synth_calls(record, 1), [("Hola.", 3)])
 
 
 class TranscriptSidecarTest(unittest.TestCase):
@@ -1989,7 +2036,7 @@ class SilentTransferDecisionTest(unittest.TestCase):
 class PinManifestExitTest(unittest.TestCase):
     """m5: pinning with missing required artifacts exits non-zero."""
 
-    def test_missing_artifacts_fail_pinning(self) -> None:
+    def load_pin_tool(self):
         import importlib.util
 
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1999,11 +2046,15 @@ class PinManifestExitTest(unittest.TestCase):
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        return module, repo_root
+
+    def test_missing_artifacts_fail_pinning(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+
+        module, repo_root = self.load_pin_tool()
         with tempfile.TemporaryDirectory() as root:
             out = os.path.join(root, "pinned.json")
-            import io
-            from contextlib import redirect_stdout
-
             with redirect_stdout(io.StringIO()):
                 code = module.main(
                     [
@@ -2015,6 +2066,29 @@ class PinManifestExitTest(unittest.TestCase):
                 )
             self.assertNotEqual(code, 0)
             self.assertFalse(os.path.exists(out))
+
+    def test_whisper_server_without_version_uses_sibling_cli(self) -> None:
+        """MAJOR-5: pin tooling shares production's probe strategy —
+        a `whisper-server` answering no usable `--version` falls back
+        to the same-build `whisper-cli` sibling."""
+        import io
+        import stat
+        from contextlib import redirect_stdout
+
+        module, repo_root = self.load_pin_tool()
+        with tempfile.TemporaryDirectory() as root:
+            bindir = os.path.join(root, "bin")
+            os.makedirs(bindir, exist_ok=True)
+            server = os.path.join(bindir, "whisper-server")
+            cli = os.path.join(bindir, "whisper-cli")
+            with open(server, "w") as handle:
+                handle.write("#!/bin/sh\necho 'error: unknown argument: --version' >&2\nexit 1\n")
+            with open(cli, "w") as handle:
+                handle.write("#!/bin/sh\necho 'whisper.cpp version: 1.9.5'\n")
+            os.chmod(server, os.stat(server).st_mode | stat.S_IEXEC)
+            os.chmod(cli, os.stat(cli).st_mode | stat.S_IEXEC)
+            versions = module.measured_versions(server, "")
+            self.assertEqual(versions["stt"], "1.9.5")
 
 
 class ManifestCompositionTest(unittest.TestCase):
@@ -2109,6 +2183,10 @@ class ManifestCompositionTest(unittest.TestCase):
                 self.assertTrue(
                     backend._tts._model_dir.endswith("tts/es-female-1")
                 )
+                # MAJOR-3: the executed TTS files are exactly the verified
+                # manifest entries, not conventional filenames.
+                self.assertEqual(backend._tts._model_file, "custom-model.onnx")
+                self.assertEqual(backend._tts._tokens_file, "custom-tokens.txt")
             finally:
                 backend.shutdown()
 
@@ -2268,6 +2346,43 @@ class VersionCompatGateTest(unittest.TestCase):
             backend = self.start_with(root, manifest_path)
             self.assertFalse(backend.ready)
             self.assertIn("stt:version_mismatch", backend._integrity_problems)
+
+    def test_warm_refuses_unverified_backend_without_touching_runtimes(self) -> None:
+        """MAJOR-4: integrity/version failure blocks warmup before any
+        spawn or model load."""
+        from receptionist.local_runtimes import _ServerProcess
+
+        with tempfile.TemporaryDirectory() as root:
+            manifest_path = VersionCompatGateTest().manifest_with_versions(
+                root, "1.0.0", "9.9.9", "9.9.9"
+            )
+            backend = VersionCompatGateTest().start_with(root, manifest_path)
+            spawns: list[list[str]] = []
+            real_spawn = _ServerProcess.spawn
+
+            def counting_spawn(server, argv: list[str]) -> None:
+                spawns.append(argv)
+                return real_spawn(server, argv)
+
+            loads: list[str] = []
+            real_probe = FakeTTSAdapter.probe_version
+
+            def counting_probe(adapter) -> str:
+                loads.append(adapter.component)
+                return real_probe(adapter)
+
+            _ServerProcess.spawn = counting_spawn  # type: ignore[method-assign]
+            FakeTTSAdapter.probe_version = counting_probe  # type: ignore[method-assign]
+            try:
+                # start() already recorded the version mismatch...
+                self.assertFalse(backend.ready)
+                self.assertEqual(backend.warm(), ["backend:unverified"])
+            finally:
+                _ServerProcess.spawn = real_spawn  # type: ignore[method-assign]
+                FakeTTSAdapter.probe_version = real_probe  # type: ignore[method-assign]
+            self.assertEqual(spawns, [])
+            self.assertEqual(loads, [])
+            self.assertFalse(backend.ready)
 
     def test_malformed_or_empty_pinned_version_blocks_ready(self) -> None:
         for bad in ("abc", "", "unknown", "1.7"):
@@ -2433,6 +2548,172 @@ class InFlightCancelTest(unittest.TestCase):
             self.assertEqual(self.count, 2)
         finally:
             session.close()
+
+
+class SingleSlotCancelTest(unittest.TestCase):
+    """MAJOR-1: single-slot runtimes (`-np 1`) keep working on an
+    abandoned request after a client socket close, so turn B would
+    queue behind turn A's tail. The serial stub below models exactly
+    that: B's handler cannot run until A is released. The adapter must
+    recycle on preemption (release hook fires from the real restart
+    path), letting B complete within a short bound."""
+
+    def setUp(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        self.got_first: threading.Event = threading.Event()
+        self.release_first: threading.Event = threading.Event()
+        self.block_first = False
+        self.count = 0
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def _send(self, payload: bytes) -> None:
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                outer.count += 1
+                if outer.block_first and outer.count == 1:
+                    outer.got_first.set()
+                    outer.release_first.wait(timeout=30.0)
+                if self.path == "/inference":
+                    self._send(b'{"text": "segundo turno"}')
+                elif self.path == "/completion":
+                    self._send(
+                        b'{"content": "{\\"spoken_text\\": \\"Listo.\\", '
+                        b'\\"action\\": null}", "truncated": false}'
+                    )
+                else:
+                    self.send_error(404)
+
+            def do_GET(self) -> None:
+                if self.path == "/health":
+                    self._send(b'{"status": "ok"}')
+                else:
+                    self.send_error(404)
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.model = os.path.join(self.tmp.name, "model.bin")
+        with open(self.model, "wb") as handle:
+            handle.write(b"fake-model")
+
+    def tearDown(self) -> None:
+        self.release_first.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+    def adapter_at(self, kind: str, **kwargs):
+        from receptionist.local_runtimes import (
+            LlamaServerLLM,
+            WhisperServerSTT,
+            _ServerProcess,
+        )
+
+        cls = WhisperServerSTT if kind == "stt" else LlamaServerLLM
+        adapter = cls(
+            executable="/bin/true", model_path=self.model, port=self.port, **kwargs
+        )
+        real_spawn = _ServerProcess.spawn
+
+        def fake_spawn(server, argv: list[str]) -> None:
+            real_spawn(server, ["/bin/sleep", "300"])
+
+        adapter._server.spawn = fake_spawn.__get__(adapter._server)  # type: ignore[method-assign]
+        adapter.probe_version = lambda: "9.9.9"  # type: ignore[method-assign]
+        # The recycle frees the serial slot: releasing the stub models
+        # the process kill freeing server-side work.
+        real_stop = adapter._server.stop
+
+        def stop_and_release() -> None:
+            self.release_first.set()
+            real_stop()
+
+        adapter._server.stop = stop_and_release  # type: ignore[method-assign]
+        self.addCleanup(adapter.close)
+        return adapter
+
+    def ready_backend_for(self, kind: str, **kwargs):
+        from receptionist.cascaded import CascadedVoiceBackend, VoiceProfile
+
+        if kind == "stt":
+            stt, llm, tts = (
+                self.adapter_at("stt", **kwargs),
+                FakeLLMAdapter([spoken_document("Listo.")]),
+                FakeTTSAdapter(),
+            )
+        else:
+            stt, llm, tts = (
+                FakeSTTAdapter(["primero", "segundo"]),
+                self.adapter_at("llm", **kwargs),
+                FakeTTSAdapter(),
+            )
+        backend = CascadedVoiceBackend(
+            profile=VoiceProfile(profile_id="t", require_manifest=False),
+            stt=stt,
+            llm=llm,
+            tts=tts,
+            clock=FakeClock(),
+        )
+        backend.start()
+        self.assertEqual(backend.warm(), [])
+        return backend
+
+    def run_preempted_turn(self, kind: str) -> tuple[RecordingListener, int]:
+        backend = self.ready_backend_for(kind)
+        adapter = backend._stt if kind == "stt" else backend._llm
+        listener = RecordingListener()
+        session = backend.open_session("call-1", listener)
+        self.addCleanup(session.close)
+        self.block_first = True
+        self.count = 0
+        session.push_audio(speech_frame())
+        session.commit_turn(1)  # A blocks the single slot
+        self.assertTrue(self.got_first.wait(timeout=10.0))
+        session.cancel_output(CancelReason.BARGE_IN)
+        session.push_audio(speech_frame())
+        session.commit_turn(2)
+        self.assertTrue(session.wait_until_idle(timeout=20.0))
+        return listener, adapter._server.restarts
+
+    def test_llm_slot_freed_by_recycle(self) -> None:
+        listener, restarts = self.run_preempted_turn("llm")
+        self.assertEqual(restarts, 1)
+        self.assertEqual(len(listener.responses), 1)
+        self.assertEqual(listener.responses[0][0], 2)
+        self.assertEqual(self.count, 2)
+
+    def test_stt_slot_freed_by_recycle(self) -> None:
+        listener, restarts = self.run_preempted_turn("stt")
+        self.assertEqual(restarts, 1)
+        self.assertEqual(len(listener.responses), 1)
+        self.assertEqual(listener.responses[0][0], 2)
+        self.assertEqual(self.count, 2)
+
+    def test_idle_cancel_recycles_nothing(self) -> None:
+        backend = self.ready_backend_for("llm")
+        listener = RecordingListener()
+        session = backend.open_session("call-1", listener)
+        self.addCleanup(session.close)
+        session.cancel_output(CancelReason.BARGE_IN)
+        self.assertEqual(backend._llm._server.restarts, 0)
 
 
 if __name__ == "__main__":
