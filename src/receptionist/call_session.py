@@ -340,15 +340,17 @@ class CallSession:
         invalidation still applies), and a raising backend is contained.
         """
         session = self._voice_session
-        if session is None:
-            return
-        cancel = getattr(session, "cancel_output", None)
-        if not callable(cancel):
-            return
-        try:
-            cancel(reason)
-        except Exception:
-            pass
+        if session is not None:
+            cancel = getattr(session, "cancel_output", None)
+            if callable(cancel):
+                try:
+                    cancel(reason)
+                except Exception:
+                    pass
+        # Telephony playout always flushes, even when there is no voice
+        # session (or it lacks cancel_output): queued RTP media for a
+        # cancelled turn must never keep playing.
+        self._flush_telephony_playout()
 
     def _provides_playback(self) -> bool:
         """Whether the live voice session streams its own AssistantAudio.
@@ -709,6 +711,45 @@ class CallSession:
             self._mode = ActiveMode.SPEAKING
         elif self._mode is not ActiveMode.SPEAKING:
             return
+        # Close the playout seam (#25): valid assistant audio for the live
+        # turn flows to the telephony media path. Late/cancelled audio was
+        # already discarded above, so everything reaching here plays. The
+        # adapter owns resampling/codec conversion; the session never
+        # re-synthesizes text and never opens a second playback path.
+        self._playout_to_telephony(frame)
+
+    def _playout_to_telephony(self, frame: AudioFrame) -> None:
+        """Forward one validated assistant frame to telephony playout.
+
+        Best-effort and contained: a telephony failure must never break
+        the conversational state machine (the mode transition above
+        already happened). Adapters without a media path (legacy doubles
+        in older tests) simply skip via duck-typing.
+        """
+        send = getattr(self._telephony, "send_audio", None)
+        if not callable(send):
+            return
+        try:
+            send(self.call_id, frame)
+        except Exception:
+            LOG.warning(
+                "assistant playout failed call_id=%s turn=%s",
+                self.call_id,
+                self._turn,
+            )
+
+    def _flush_telephony_playout(self) -> None:
+        """Discard queued TTS/RTP playout for this call (barge-in,
+        hangup, handoff, failure). The voice-backend cancellation stops
+        synthesis; this stops audio already handed to telephony so a
+        cancelled turn cannot keep playing for seconds."""
+        flush = getattr(self._telephony, "flush_audio", None)
+        if not callable(flush):
+            return
+        try:
+            flush(self.call_id)
+        except Exception:
+            pass
 
     def on_response(self, turn_id: int, text: str) -> None:
         with self._lock:
@@ -1052,6 +1093,9 @@ class CallSession:
         depends on the broken component. TERMINATING -> ENDED happens
         exactly once either way.
         """
+        # Discard any stale queued assistant audio before the apology so
+        # only the apology itself can play.
+        self._flush_telephony_playout()
         if self._voice_session is not None:
             try:
                 self._speak(EXIT_APOLOGY, self._turn)
@@ -1113,6 +1157,7 @@ class CallSession:
 
     def _finish(self, outcome: CallOutcome) -> None:
         self._transition(CallState.ENDED)
+        self._flush_telephony_playout()
         if self._voice_session is not None:
             self._voice_session.close()
         try:

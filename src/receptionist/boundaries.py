@@ -37,20 +37,101 @@ class TransferResult(Enum):
 
 
 class TelephonyListener(Protocol):
+    """Normalized telephony events into the application.
+
+    Threading: the adapter may invoke these from SIP/media threads. The
+    core dispatches them onto its own serialization; listener
+    implementations must be thread-safe and must never run LLM/STT/TTS,
+    SQLite, or network I/O inline. Callbacks are lightweight: they record
+    and return.
+    """
+
     def on_answered(self, call_id: str) -> None: ...
     def on_caller_hangup(self, call_id: str) -> None: ...
     def on_hangup_completed(self, call_id: str) -> None: ...
     def on_transfer_result(self, call_id: str, result: TransferResult) -> None: ...
+    def on_caller_audio(self, call_id: str, frame: AudioFrame) -> None: ...
+    def on_dtmf(self, call_id: str, digit: str) -> None: ...
+    def on_remote_hold(self, call_id: str, held: bool) -> None: ...
+
+
+class InboundCallHandler(Protocol):
+    """Synchronous inbound-call admission seam (project-owned).
+
+    The adapter invokes this from its SIP thread when a native INVITE
+    arrives, holding the native call object internally in a pending
+    slot. The handler (composition layer) admits the call through
+    ``ReceptionistCore.incoming_call(...)`` and returns the application
+    ``call_id`` so the adapter can bind native <-> application id.
+
+    Re-entrancy contract: ``incoming_call`` synchronously calls back
+    into the adapter (``answer``/``reject``/``blind_transfer``) for the
+    returned id while this handler is still on the stack. The adapter
+    therefore binds a pending native call to the id demanded by that
+    re-entrant call instead of requiring the binding to pre-exist.
+
+    Returns the application call id to bind, or ``None`` to decline at
+    the SIP level (the adapter rejects the native call). Never receives
+    or returns native handles, pointers, SIP dialogs, or binding
+    objects: only untrusted caller metadata in and an opaque
+    application id out.
+    """
+
+    def handle_incoming_call(
+        self, caller_id: str, caller_name: str | None
+    ) -> str | None: ...
+
+
+class TelephonyRegistrationState(Enum):
+    """Explicit telephony lifecycle. The service is READY only when the
+    state is REGISTERED; any other state keeps or moves health away
+    from READY through the project-owned status hook."""
+
+    STARTING = "starting"
+    REGISTERED = "registered"
+    REGISTRATION_FAILED = "registration_failed"
+    REGISTRATION_LOST = "registration_lost"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+
+class TelephonyStatusListener(Protocol):
+    """Project-owned registration/health hook. States only, never SIP
+    internals, never credentials, never auth headers."""
+
+    def on_registration_state(
+        self, state: TelephonyRegistrationState, detail: str = ""
+    ) -> None: ...
 
 
 class TelephonyAdapter(Protocol):
-    """Call-control boundary. No dial-by-URI capability exists on this contract."""
+    """Call-control + media boundary. No dial-by-URI capability exists
+    on this contract: the only outbound primitive is ``blind_transfer``
+    to a ``pbx_target`` already resolved/trusted by the application.
+
+    Execution contract (all methods): synchronous, non-blocking, never
+    raise vendor/native exceptions to the core. SIP failures surface as
+    normalized listener events (``on_transfer_result`` with
+    ``TransferResult``; hangup completion via ``on_hangup_completed``).
+    Every method is safe to call from listener callbacks (no re-entrant
+    deadlock) and ``send_audio``/``flush_audio`` are safe from any
+    thread, including media threads.
+    """
 
     def set_listener(self, listener: TelephonyListener) -> None: ...
+    def set_inbound_handler(self, handler: InboundCallHandler | None) -> None: ...
+    def set_status_listener(self, listener: TelephonyStatusListener | None) -> None: ...
+    def start(self) -> None: ...
+    def shutdown(self) -> None: ...
     def answer(self, call_id: str) -> None: ...
     def reject(self, call_id: str) -> None: ...
     def hangup(self, call_id: str) -> None: ...
     def blind_transfer(self, call_id: str, pbx_target: str) -> None: ...
+    def send_audio(self, call_id: str, frame: AudioFrame) -> None: ...
+    def flush_audio(self, call_id: str) -> None: ...
+    def send_dtmf(self, call_id: str, digits: str) -> None: ...
+    def hold(self, call_id: str) -> None: ...
+    def resume(self, call_id: str) -> None: ...
 
 
 @dataclass(frozen=True)

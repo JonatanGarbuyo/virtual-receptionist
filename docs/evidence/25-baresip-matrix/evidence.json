@@ -1,0 +1,874 @@
+{
+  "checks": [
+    {
+      "id": "img-asterisk",
+      "name": "asterisk image builds",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "img-sipp",
+      "name": "sipp image builds",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "pbx-start",
+      "name": "asterisk container starts",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "pbx-ready",
+      "name": "asterisk PJSIP ready with 700",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "reg-initial",
+      "name": "REGISTER 200 OK against Asterisk",
+      "result": "pass",
+      "detail": "registered"
+    },
+    {
+      "id": "ready-telephony",
+      "name": "service READY once registered",
+      "result": "pass",
+      "detail": "ready"
+    },
+    {
+      "id": "reg-badcreds",
+      "name": "invalid credentials fail cleanly",
+      "result": "pass",
+      "detail": "STATE=registration_failed\nSHUTDOWN_OK\n"
+    },
+    {
+      "id": "reg-pbxdown",
+      "name": "unreachable PBX fails cleanly, no password leak",
+      "result": "pass",
+      "detail": "STATE=registration_failed\nSHUTDOWN_OK\n"
+    },
+    {
+      "id": "sipp-answer-bye",
+      "name": "INVITE answered, remote BYE completed",
+      "result": "pass",
+      "detail": "---------------------- Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-07\t13:39:33.763244\t1791380373.763244: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 200 Answering\n> ACK sip:127.0.0.1:5070 SIP/2.0\n< INVITE sip:sipp@127.0.0.1:5061 SIP/2.0\n> SIP/2.0 200 OK\n< ACK sip:sipp@127.0.0.1:5061 SIP/2.0\n> BYE sip:127.0.0.1:5070 SIP/2.0\n< SIP/2.0 200 OK"
+    },
+    {
+      "id": "evt-remote-bye",
+      "name": "caller_hangup exactly once per SIPp call",
+      "result": "pass",
+      "detail": "caller_hangup total=1"
+    },
+    {
+      "id": "evt-cleanup",
+      "name": "session evicted after remote BYE",
+      "result": "pass",
+      "detail": "sessions=0"
+    },
+    {
+      "id": "sipp-reject",
+      "name": "declined INVITE released promptly (200+BYE path)",
+      "result": "pass",
+      "detail": " \n  Call Length            | 00:00:00:000000           | 00:00:00:000000          \n------------------------------ Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-07\t13:39:35.376646\t1791380375.376646: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 200 Answering\n> ACK sip:127.0.0.1:5070 SIP/2.0\n< BYE sip:sipp@127.0.0.1:5062 SIP/2.0\n> SIP/2.0 200 OK"
+    },
+    {
+      "id": "sipp-hold",
+      "name": "re-INVITE hold/resume answered + observed",
+      "result": "pass",
+      "detail": "rc=0 holds=[('call-2', True), ('call-2', False)]"
+    },
+    {
+      "id": "caller-reg",
+      "name": "counterparty REGISTERs as 701",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "invite-routed",
+      "name": "INVITE via Asterisk answered + established",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "evt-answered",
+      "name": "adapter on_answered with app call id",
+      "result": "pass",
+      "detail": "app=call-3"
+    },
+    {
+      "id": "pcm-rx",
+      "name": "caller PCM reaches app seam (pcmu)",
+      "result": "pass",
+      "detail": "bytes=138880 rms=0.156 voice_pushed=138240"
+    },
+    {
+      "id": "pcm-rx-format",
+      "name": "inbound normalized to 16kHz mono pcm16",
+      "result": "pass",
+      "detail": "frames=217"
+    },
+    {
+      "id": "pcm-tx-primed",
+      "name": "assistant turn reaches SPEAKING + playout",
+      "result": "pass",
+      "detail": "mode=ActiveMode.SPEAKING epoch=1 live_current=True"
+    },
+    {
+      "id": "pcm-tx",
+      "name": "assistant PCM reaches the caller over RTP",
+      "result": "pass",
+      "detail": "rms_tail=0.2808 rms=0.2758 bytes=64000 rx_cap=32768 adapter={'tx_bytes': 0, 'tx_dropped': 0, 'tx_rate': 8000, 'established': True, 'native': {'tx_silence': 279, 'tx_starved': 0, 'tx_buffered': 0, 'tx_rejected': 0, 'tx_flushed': 0}, 'accepted_total': 64320, 'restarts': 0, 'first_tx_at': 1791380384.7249634}"
+    },
+    {
+      "id": "dtmf-rx",
+      "name": "caller DTMF reaches app with call id",
+      "result": "pass",
+      "detail": "dtmf=[('call-3', '5')]"
+    },
+    {
+      "id": "dtmf-tx",
+      "name": "adapter DTMF reaches the caller",
+      "result": "pass",
+      "detail": "{'event': 'dtmf', 'tag': 'A', 'digit': '8'}"
+    },
+    {
+      "id": "hold-local",
+      "name": "local hold pauses TX, resume drains, no errors",
+      "result": "pass",
+      "detail": "held=True queued=8000 drained=True resumed=False"
+    },
+    {
+      "id": "hold-remote-leg",
+      "name": "re-INVITE hold/resume through PBX succeeds",
+      "result": "pass",
+      "detail": "hold_done=True resume_done=True"
+    },
+    {
+      "id": "two-calls",
+      "name": "two simultaneous call objects, distinct app ids",
+      "result": "pass",
+      "detail": "a=call-3 b=call-4"
+    },
+    {
+      "id": "two-calls-audio",
+      "name": "per-call audio routing stays separate",
+      "result": "pass",
+      "detail": "b_bytes=19200"
+    },
+    {
+      "id": "two-calls-hangup",
+      "name": "hangup A keeps B alive",
+      "result": "pass",
+      "detail": "a_hangups=1 b_alive=True"
+    },
+    {
+      "id": "direct-leg",
+      "name": "direct INVITE answered with app call id",
+      "result": "pass",
+      "detail": "app=call-5"
+    },
+    {
+      "id": "hold-remote-direct",
+      "name": "remote re-INVITE observed end to end",
+      "result": "pass",
+      "detail": "hold=True resume=True"
+    },
+    {
+      "id": "xfer-target-ready",
+      "name": "transfer target 702 registered + answering",
+      "result": "pass",
+      "detail": "reg=True armed=True"
+    },
+    {
+      "id": "transfer",
+      "name": "PBX transfer completes -> ACCEPTED_BY_PBX",
+      "result": "pass",
+      "detail": "result=TransferResult.ACCEPTED_BY_PBX target_up=True b_gone=True"
+    },
+    {
+      "id": "transfer-rejected",
+      "name": "real PBX failure normalizes to REJECTED",
+      "result": "pass",
+      "detail": "result=TransferResult.REJECTED"
+    },
+    {
+      "id": "reg-reregister",
+      "name": "re-REGISTER 200 OK against Asterisk",
+      "result": "pass",
+      "detail": "register_hits=0"
+    },
+    {
+      "id": "pbx-call-up",
+      "name": "outage leg established before PBX stop",
+      "result": "pass",
+      "detail": "app=call-7"
+    },
+    {
+      "id": "pbx-restart-call",
+      "name": "PBX outage closes the live call (RTP timeout)",
+      "result": "pass",
+      "detail": "app=call-7"
+    },
+    {
+      "id": "reg-lost",
+      "name": "registration loss surfaces + health leaves READY",
+      "result": "pass",
+      "detail": "state=registration_lost health=not_ready"
+    },
+    {
+      "id": "reg-recovery",
+      "name": "PBX back -> re-registered + READY",
+      "result": "pass",
+      "detail": "recovered=True health=ready"
+    },
+    {
+      "id": "shutdown",
+      "name": "shutdown ends media call, joins threads, idempotent",
+      "result": "pass",
+      "detail": "leftovers=[] call_closed=True app=call-8"
+    },
+    {
+      "id": "no-zombies",
+      "name": "counterparty processes exit cleanly",
+      "result": "pass",
+      "detail": "alive_pids=[]"
+    }
+  ],
+  "sip_timelines": {
+    "s1": [
+      "0 :      INVITE ---------->         1         0         0",
+      "4 :         ACK ---------->         1         0",
+      "5 :      INVITE <----------  E-RTD1 1         0         0         0",
+      "7 :         ACK <----------         1         0         0         0",
+      "9 :         BYE ---------->         1         0         0",
+      "> INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 180 Ringing",
+      "< SIP/2.0 200 Answering",
+      "> ACK sip:127.0.0.1:5070 SIP/2.0",
+      "< INVITE sip:sipp@127.0.0.1:5061 SIP/2.0",
+      "> SIP/2.0 200 OK",
+      "< ACK sip:sipp@127.0.0.1:5061 SIP/2.0",
+      "> BYE sip:127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 200 OK"
+    ],
+    "s2": [
+      "0 :      INVITE ---------->         1         0         0",
+      "4 :         ACK ---------->         1         0",
+      "5 :         BYE <----------  E-RTD1 1         0         0         0",
+      "> INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 180 Ringing",
+      "< SIP/2.0 200 Answering",
+      "> ACK sip:127.0.0.1:5070 SIP/2.0",
+      "< BYE sip:sipp@127.0.0.1:5062 SIP/2.0",
+      "> SIP/2.0 200 OK"
+    ],
+    "s3": [
+      "0 :      INVITE ---------->         1         0         0",
+      "4 :         ACK ---------->         1         0",
+      "5 :      INVITE <----------  E-RTD1 1         0         0         0",
+      "7 :         ACK <----------         1         0         0         0",
+      "9 :      INVITE ---------->         1         0         0",
+      "11:         ACK ---------->         1         0",
+      "13:      INVITE ---------->         1         0         0",
+      "15:         ACK ---------->         1         0",
+      "17:         BYE ---------->         1         0         0",
+      "> INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 180 Ringing",
+      "< SIP/2.0 200 Answering",
+      "> ACK sip:127.0.0.1:5070 SIP/2.0",
+      "< INVITE sip:sipp@127.0.0.1:5063 SIP/2.0",
+      "> SIP/2.0 200 OK",
+      "< ACK sip:sipp@127.0.0.1:5063 SIP/2.0",
+      "> INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 200 OK",
+      "> ACK sip:127.0.0.1:5070 SIP/2.0",
+      "> INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 200 OK",
+      "> ACK sip:127.0.0.1:5070 SIP/2.0",
+      "> BYE sip:127.0.0.1:5070 SIP/2.0",
+      "< SIP/2.0 200 OK"
+    ],
+    "adapter_trace": [
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "INVITE sip:sipp@127.0.0.1:5061 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:sipp@127.0.0.1:5061 SIP/2.0",
+      "BYE sip:127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "BYE sip:sipp@127.0.0.1:5062 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "INVITE sip:sipp@127.0.0.1:5063 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:sipp@127.0.0.1:5063 SIP/2.0",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "BYE sip:127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK"
+    ]
+  },
+  "threads": {
+    "call-1": [
+      "baresip-loop"
+    ],
+    "declined-1": [
+      "baresip-loop"
+    ],
+    "call-2": [
+      "baresip-loop"
+    ],
+    "call-3": [
+      "baresip-loop",
+      "baresip-media"
+    ],
+    "call-4": [
+      "baresip-loop",
+      "baresip-media"
+    ],
+    "call-5": [
+      "baresip-loop"
+    ],
+    "call-6": [
+      "baresip-loop"
+    ],
+    "call-7": [
+      "baresip-loop",
+      "baresip-media"
+    ],
+    "call-8": [
+      "baresip-loop",
+      "baresip-media"
+    ]
+  },
+  "keep": false,
+  "meta": {
+    "os": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "arch": "x86_64",
+    "python": "3.12.3",
+    "codec_run": "pcmu",
+    "baresip_python": "0.5.2a3",
+    "asterisk": "Asterisk 20.6.0~dfsg+~cs6.13.40431414-2build5",
+    "sipp": [
+      "SIPp v3.7.2-TLS-SCTP-PCAP."
+    ]
+  },
+  "tx_debug": {
+    "tx_bytes": 0,
+    "tx_dropped": 0,
+    "tx_rate": 8000,
+    "established": true,
+    "native": {
+      "tx_silence": 279,
+      "tx_starved": 0,
+      "tx_buffered": 0,
+      "tx_rejected": 0,
+      "tx_flushed": 0
+    },
+    "accepted_total": 64320,
+    "restarts": 0,
+    "first_tx_at": 1791380384.7249634
+  },
+  "adapter_events": [
+    {
+      "t": 1791380370.64,
+      "call": "call-1",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380370.64,
+      "call": "call-1",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380370.64,
+      "call": "call-1",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380370.76,
+      "call": "call-1",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380370.76,
+      "call": "call-1",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380370.76,
+      "call": "call-1",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380373.8,
+      "call": "call-1",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380375.36,
+      "call": "declined-1",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380375.36,
+      "call": "declined-1",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380375.37,
+      "call": "declined-1",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380375.4,
+      "call": "declined-1",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380375.82,
+      "call": "call-2",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380375.82,
+      "call": "call-2",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380375.82,
+      "call": "call-2",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380375.89,
+      "call": "call-2",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380375.89,
+      "call": "call-2",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380375.89,
+      "call": "call-2",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380376.9,
+      "call": "call-2",
+      "kind": "stack:CALL_HOLD"
+    },
+    {
+      "t": 1791380376.9,
+      "call": "call-2",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380376.9,
+      "call": "call-2",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380376.9,
+      "call": "call-2",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380377.9,
+      "call": "call-2",
+      "kind": "stack:CALL_RESUME"
+    },
+    {
+      "t": 1791380377.9,
+      "call": "call-2",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380377.9,
+      "call": "call-2",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380377.9,
+      "call": "call-2",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380378.94,
+      "call": "call-2",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380380.19,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380380.19,
+      "call": "call-3",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380380.19,
+      "call": "call-3",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380380.2,
+      "call": "call-3",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791380380.32,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380380.32,
+      "call": "call-3",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380380.32,
+      "call": "call-3",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380385.2,
+      "call": "call-3",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380389.8,
+      "call": "call-3",
+      "kind": "stack:CALL_DTMF_START"
+    },
+    {
+      "t": 1791380389.98,
+      "call": "call-3",
+      "kind": "stack:CALL_DTMF_END"
+    },
+    {
+      "t": 1791380390.18,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380390.18,
+      "call": "call-3",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380390.19,
+      "call": "call-3",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380392.19,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380392.19,
+      "call": "call-3",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380392.19,
+      "call": "call-3",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380393.2,
+      "call": "call-4",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380393.2,
+      "call": "call-4",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380393.2,
+      "call": "call-4",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380393.2,
+      "call": "call-4",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791380393.3,
+      "call": "call-4",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380393.3,
+      "call": "call-4",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380393.3,
+      "call": "call-4",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380395.25,
+      "call": "call-3",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "stack:CALL_HOLD"
+    },
+    {
+      "t": 1791380396.49,
+      "call": "call-5",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380396.51,
+      "call": "call-5",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380396.51,
+      "call": "call-5",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380396.51,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380396.51,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380396.57,
+      "call": "call-5",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380396.57,
+      "call": "call-5",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380396.57,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380396.57,
+      "call": "call-5",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "stack:CALL_RESUME"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380398.0,
+      "call": "call-5",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380398.03,
+      "call": "call-5",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380398.2,
+      "call": "call-4",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791380398.33,
+      "call": "call-4",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380398.4,
+      "call": "call-6",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380398.4,
+      "call": "call-6",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380398.4,
+      "call": "call-6",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380398.47,
+      "call": "call-6",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380398.47,
+      "call": "call-6",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380398.47,
+      "call": "call-6",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380398.5,
+      "call": "call-6",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380398.65,
+      "call": "call-7",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380398.65,
+      "call": "call-7",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380398.65,
+      "call": "call-7",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380398.66,
+      "call": "call-7",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791380398.77,
+      "call": "call-7",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380398.77,
+      "call": "call-7",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380398.77,
+      "call": "call-7",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380400.21,
+      "call": "call-7",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791380434.98,
+      "call": "call-8",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380434.98,
+      "call": "call-8",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791380434.98,
+      "call": "call-8",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791380434.98,
+      "call": "call-8",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791380435.07,
+      "call": "call-8",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791380435.07,
+      "call": "call-8",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791380435.08,
+      "call": "call-8",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791380436.02,
+      "call": "call-8",
+      "kind": "stack:CALL_CLOSED"
+    }
+  ],
+  "reg_history_sample": "No.   Timestamp  (Dir) Address                  SIP Message                        \n===== ========== ============================== ===================================\n",
+  "adapter_calls_left": [],
+  "summary": {
+    "total": 39,
+    "failed": 0
+  }
+}
