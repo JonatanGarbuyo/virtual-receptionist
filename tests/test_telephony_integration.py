@@ -31,7 +31,11 @@ MATRIX_CODECS = os.getenv("VR_SIP_CODECS", "pcmu")
 @unittest.skipUnless(RUN_SIP, "needs docker/Asterisk/SIPp (VR_RUN_SIP=1)")
 class TelephonyMatrixTest(unittest.TestCase):
     def test_real_sip_matrix(self) -> None:
-        """Run the matrix; every check must pass (see evidence.json)."""
+        """Run the matrix; the runner must exit 0 and every check pass.
+
+        Both gates matter: a green evidence file with a failed runner
+        (stale artifact) must fail, and vice versa.
+        """
         env = dict(os.environ, PYTHONPATH=f"src{os.pathsep}tests")
         proc = subprocess.run(
             [sys.executable, RUN_MATRIX, "--codecs", MATRIX_CODECS],
@@ -45,7 +49,10 @@ class TelephonyMatrixTest(unittest.TestCase):
             with open(EVIDENCE) as handle:
                 evidence = json.load(handle)
         except (OSError, ValueError) as error:
-            self.fail(f"no evidence written: {error}\n{proc.stdout[-2000:]}")
+            self.fail(
+                f"no evidence written (runner rc={proc.returncode}): "
+                f"{error}\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+            )
         failed = [
             item for item in evidence.get("checks", []) if item.get("result") != "pass"
         ]
@@ -53,10 +60,15 @@ class TelephonyMatrixTest(unittest.TestCase):
             f"FAILED {item['id']}: {item.get('detail', '')}" for item in failed
         )
         self.assertEqual(
+            proc.returncode,
+            0,
+            f"matrix runner failed (rc={proc.returncode}):\n{summary}\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}",
+        )
+        self.assertEqual(
             failed,
             [],
-            f"matrix failed ({len(failed)} checks):\n{summary}\n"
-            f"runner rc={proc.returncode}",
+            f"matrix failed ({len(failed)} checks):\n{summary}",
         )
 
 

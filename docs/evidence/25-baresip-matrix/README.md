@@ -3,9 +3,16 @@
 `evidence.json` is written by `tools/sip/run_matrix.py` (one file per
 run). Pinned artifacts of the final code:
 
-- `evidence-pcmu.json` — full matrix, PCMU-forced: **39/39 pass**.
-- `evidence-pcma.json` — full matrix, PCMA-forced: **39/39 pass**.
-- `evidence.json` — copy of the latest run (PCMU 39/39).
+- `evidence-pcmu.json` — full matrix, PCMU-forced: **42/42 pass**.
+- `evidence-pcma.json` — full matrix, PCMA-forced: **42/42 pass**.
+- `evidence.json` — copy of the latest run.
+
+42 checks per run: imaging/pbx/registration (9), SIPp scenarios +
+events (6: answer/BYE, 486 decline, hold/resume, CANCEL-equivalent at
+session level), media both directions + negotiated codec (6), DTMF (2),
+hold local/remote/direct (4), local hangup + 2-call isolation (4),
+direct leg (1), transfers ACCEPTED/REJECTED (3), re-registration
+verified + outage + media health + recovery (5), shutdown + zombies (2).
 
 Each check carries its detail; the SIP timelines are redacted (no
 Authorization, no secrets). The gated unittest
@@ -34,16 +41,17 @@ leaking native types past the project-owned boundary:
 No thin libbaresip shim was needed. No contract term was lowered to
 fit the binding.
 
-## Known upstream limitation (worked around, not patched)
+## Decline path (corrected during review)
 
-`Call.reject()`/`hangup()` on a just-arrived inbound leg always raise
-`StaleHandleError` (verified immediate and delayed, raw binding, no
-adapter involved). SIP decline therefore releases via public
-answer+BYE (`BaresipTelephonyAdapter.reject`, documented in code):
-same observable outcome for the core (released, slot freed,
-exactly-once close, no AI resources), wire shows 200+BYE instead of
-486. To be reported upstream; the scenario (`uac_expect_reject.xml`)
-upgrades to 486 when fixed, with no contract change.
+An earlier revision claimed `Call.reject()`/`hangup()` on a fresh
+inbound leg always raise `StaleHandleError` and released declines via
+answer+BYE. Independent raw-binding probes (4/4 variants) disproved
+that: native `reject()`/`hangup()` answer `486` deterministically, so
+`BaresipTelephonyAdapter.reject()` attempts the native rejection first
+and the scenario (`uac_expect_reject.xml`) asserts the `486` the caller
+receives. Answer-then-release remains only as a fallback for a
+genuinely lost race (`StaleHandleError`, e.g. a simultaneous remote
+CANCEL) so the slot never leaks.
 
 ## Interop notes (all observed, all encoded in scenarios/harness)
 

@@ -282,8 +282,9 @@ async def amain() -> int:
                 target = event.text
                 emit({"event": "transfer_request", "tag": tag, "target": target})
                 wanted = (accept_next or {}).get("target_contains", "")
-                if wanted and wanted in target:
-                    asyncio.run_coroutine_threadsafe(accept(call), loop)
+                target_call = calls.get(tag)
+                if wanted and wanted in target and target_call is not None:
+                    asyncio.run_coroutine_threadsafe(accept(target_call), loop)
 
         return listener
 

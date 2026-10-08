@@ -68,9 +68,11 @@ class FakeTelephony:
         self.flushed: list[str] = []
         self.sent_dtmf: dict[str, list[str]] = {}
         self.held: set[str] = set()
+        self.remote_held: set[str] = set()
         self.closed: set[str] = set()
         self.registration_state = TelephonyRegistrationState.STOPPING
         self.registration_transitions: list[TelephonyRegistrationState] = []
+        self.refreshes = 0
         self.started = False
         self.shut_down = False
         self.shutdown_count = 0
@@ -89,6 +91,12 @@ class FakeTelephony:
     def start(self) -> None:
         self.started = True
 
+    def refresh_registration(self) -> tuple[TelephonyRegistrationState, bool]:
+        """Project-owned refresh seam: counts refreshes, keeps state,
+        always fresh (the fake registrar answers immediately)."""
+        self.refreshes += 1
+        return self.registration_state, True
+
     def shutdown(self) -> None:
         self.shutdown_count += 1
         self.shut_down = True
@@ -101,6 +109,13 @@ class FakeTelephony:
         self.registration_transitions.append(state)
         if self._status is not None:
             self._status.on_registration_state(state, detail)
+
+    def report_media(self, healthy: bool, call_id: str = "") -> None:
+        """Test driver: the media path is lost / verified again."""
+        if self._status is not None:
+            report = getattr(self._status, "on_media_state", None)
+            if callable(report):
+                report(healthy, call_id)
 
     def answer(self, call_id: str) -> None:
         self.answered.append(call_id)
@@ -146,8 +161,9 @@ class FakeTelephony:
 
     def send_audio(self, call_id: str, frame: AudioFrame) -> None:
         """Record assistant playout. Late frames for closed calls drop,
-        mirroring production exactly-once close semantics."""
-        if call_id in self.closed:
+        mirroring production exactly-once close semantics. After
+        shutdown everything drops (the stack is gone)."""
+        if self.shut_down or call_id in self.closed:
             return
         self.playout.setdefault(call_id, []).append(frame)
         self.playout_bytes[call_id] = self.playout_bytes.get(call_id, 0) + len(
@@ -160,13 +176,43 @@ class FakeTelephony:
         self.playout.pop(call_id, None)
         self.playout_bytes.pop(call_id, None)
 
+    def playout_pending_bytes(self, call_id: str) -> int:
+        """Bytes still queued for playout (0 when none/unknown)."""
+        return self.playout_bytes.get(call_id, 0)
+
+    def drain_playout(self, call_id: str, max_bytes: int) -> int:
+        """Test driver: playout consumes up to max_bytes (RTP drain).
+
+        Returns bytes drained. Deterministic stand-in for the transmit
+        clock: tests advance playout explicitly instead of sleeping.
+        """
+        pending = self.playout_bytes.get(call_id, 0)
+        drained = min(pending, max(0, max_bytes))
+        if drained:
+            frames = self.playout.get(call_id, [])
+            remaining = drained
+            while frames and remaining > 0:
+                head = len(frames[0].pcm)
+                if head <= remaining:
+                    remaining -= head
+                    frames.pop(0)
+                else:
+                    break
+            left = self.playout_bytes.get(call_id, 0) - drained
+            if left <= 0:
+                self.playout.pop(call_id, None)
+                self.playout_bytes.pop(call_id, None)
+            else:
+                self.playout_bytes[call_id] = left
+        return drained
+
     def simulate_caller_audio(self, call_id: str, frame: AudioFrame) -> None:
         """Test driver: decoded caller PCM arrives from the line."""
         assert self._listener is not None
-        if call_id in self.closed:
+        if self.shut_down or call_id in self.closed:
             return
-        if call_id in self.held:
-            return  # on hold: no caller speech leaks through
+        if call_id in self.held or call_id in self.remote_held:
+            return  # on hold either way: no caller speech leaks through
         self._listener.on_caller_audio(call_id, frame)
 
     def send_dtmf(self, call_id: str, digits: str) -> None:
@@ -183,12 +229,22 @@ class FakeTelephony:
         self.held.add(call_id)
 
     def resume(self, call_id: str) -> None:
-        self.held.discard(call_id)
+        """Resume from local hold, discarding playout queued while held
+        (mirrors the adapter flushing stale media on resume)."""
+        if call_id in self.held:
+            self.held.discard(call_id)
+            self.flush_audio(call_id)
 
     def simulate_remote_hold(self, call_id: str, held: bool) -> None:
         assert self._listener is not None
         if call_id in self.closed:
             return
+        if held:
+            self.remote_held.add(call_id)
+        else:
+            if call_id in self.remote_held:
+                self.remote_held.discard(call_id)
+                self.flush_audio(call_id)
         self._listener.on_remote_hold(call_id, held)
 
     def simulate_incoming(

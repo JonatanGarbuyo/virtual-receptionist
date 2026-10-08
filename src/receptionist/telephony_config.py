@@ -15,15 +15,14 @@ SIP_AUTH_USER_KEY = "sip.auth_user"
 SIP_PASSWORD_KEY = "sip.password"  # nosec: key name only, never a value
 SIP_DOMAIN_KEY = "sip.domain"
 SIP_REGISTRAR_KEY = "sip.registrar"
-SIP_DISPLAY_NAME_KEY = "sip.display_name"
 SIP_TRANSPORT_KEY = "sip.transport"
 SIP_REG_INTERVAL_KEY = "sip.reg_interval"
 SIP_CODECS_KEY = "sip.codecs"
 SIP_DTMF_MODE_KEY = "sip.dtmf_mode"
 SIP_BIND_KEY = "sip.bind"
+SIP_LISTEN_KEY = "sip.listen"
 SIP_MAX_CALLS_KEY = "sip.max_calls"
 SIP_RTP_TIMEOUT_KEY = "sip.rtp_timeout"
-SIP_EXTRA_CONFIG_KEY = "sip.extra_config"
 
 _VALID_TRANSPORTS = ("udp", "tcp", "tls")
 _VALID_DTMF_MODES = ("rtpevent", "info", "auto")
@@ -40,6 +39,9 @@ class TelephonyConfig:
     ``audio_codecs`` is the preference-ordered allowlist (subset of PCMU/
     PCMA in v0.1). ``bind`` pins the local interface (required for
     loopback benches); ``None`` uses normal interface discovery.
+    ``sip_listen`` pins the local SIP listener (``"addr:port"``);
+    ``None`` uses the stack default. ``rtp_timeout`` bounds silence
+    without received RTP before the call is declared dead (0 disables).
     """
 
     username: str
@@ -47,15 +49,14 @@ class TelephonyConfig:
     password: str = field(repr=False, default="")
     auth_user: str | None = None
     registrar: str | None = None
-    display_name: str = ""
     transport: str = "udp"
     reg_interval: int = 600
     audio_codecs: tuple[str, ...] = ("pcmu", "pcma")
     dtmf_mode: str = "rtpevent"
     bind: str | None = None
+    sip_listen: str | None = None
     max_calls: int = 2
-    rtp_timeout: int = 0
-    extra_config_text: str = ""
+    rtp_timeout: int = 30
     sip_trace: bool = False
 
     def __post_init__(self) -> None:
@@ -102,14 +103,16 @@ def telephony_config_from_mapping(get: object) -> TelephonyConfig:
         return (value or "").strip() if isinstance(value, str) else ""
 
     def _int(key: str, default: int) -> int:
+        """Strict integer read: blank means default, but a present
+        non-numeric value fails loudly (fail-closed config: a typo'd
+        ``sip.max_calls="x"`` must never silently become 2)."""
         text = raw(key)
         if not text:
             return default
         try:
-            value = int(text)
+            return int(text)
         except ValueError:
-            return default
-        return value
+            raise ValueError(f"{key} must be an integer, got {text!r}")
 
     codecs_raw = raw(SIP_CODECS_KEY) or "pcmu,pcma"
     codecs = tuple(
@@ -122,13 +125,12 @@ def telephony_config_from_mapping(get: object) -> TelephonyConfig:
         password=raw(SIP_PASSWORD_KEY),
         auth_user=raw(SIP_AUTH_USER_KEY) or None,
         registrar=raw(SIP_REGISTRAR_KEY) or None,
-        display_name=raw(SIP_DISPLAY_NAME_KEY),
         transport=(raw(SIP_TRANSPORT_KEY) or "udp").lower(),
         reg_interval=_int(SIP_REG_INTERVAL_KEY, 600),
         audio_codecs=codecs,  # type: ignore[arg-type]
         dtmf_mode=(raw(SIP_DTMF_MODE_KEY) or "rtpevent").lower(),
         bind=raw(SIP_BIND_KEY) or None,
+        sip_listen=raw(SIP_LISTEN_KEY) or None,
         max_calls=_int(SIP_MAX_CALLS_KEY, 2),
-        rtp_timeout=_int(SIP_RTP_TIMEOUT_KEY, 0),
-        extra_config_text=raw(SIP_EXTRA_CONFIG_KEY),
+        rtp_timeout=_int(SIP_RTP_TIMEOUT_KEY, 30),
     )

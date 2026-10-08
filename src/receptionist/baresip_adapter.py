@@ -26,10 +26,13 @@ Threading model (this decides whether the binding is usable):
   10 ms. It never runs inference: it resamples, builds frames, and hands
   them to the listener.
 - SIP/stack callbacks land on the loop thread; media callbacks on the
-  media thread. All listener invocations are serialized through one
-  callback lock, are lightweight (record + return), and never call back
-  into blocking adapter methods while holding native locks (public
-  methods only take the adapter lock briefly and never await the loop).
+  media thread; inbound admission runs on a serial worker thread (never
+  the SIP thread). All listener invocations are serialized per call,
+  are lightweight (record + return), and never call back into blocking
+  adapter methods while holding native locks (public methods only take
+  the adapter lock briefly and never await the loop). Lock order is
+  always adapter-lock then at most one per-call callback lock, never
+  the reverse.
 
 Backpressure policy (explicit): each call owns a bounded TX queue of
 ``TX_QUEUE_MAX_BYTES`` (about 2 s at 8 kHz mono16). ``send_audio`` never
@@ -44,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
@@ -51,6 +55,7 @@ from typing import Any, Callable
 
 from receptionist.audio import make_frame, resample_pcm16
 from receptionist.boundaries import (
+    VALID_DTMF_DIGITS,
     AudioFrame,
     InboundCallHandler,
     TelephonyAdapter,
@@ -66,7 +71,37 @@ LOG = logging.getLogger("receptionist.telephony")
 #: Binding accepted for v0.1 after the #25 matrix review (see
 #: docs/evidence/25-baresip-matrix/). Pinned at install time; the wheel
 #: statically bundles libre/libbaresip so no system SIP stack is needed.
+#: Enforced at startup (fail fast on drift) and declared in
+#: tools/sip/requirements-telephony.txt.
 BARESIP_PYTHON_PIN = "baresip-python==0.5.2a3"
+
+#: Settle window for refresh_registration() (see its docstring): the
+#: stack answers both the unregister leg and the re-register leg with
+#: 200 OK, and ua.register() resolves on the first outcome. Waiting for
+#: outcome quiescence keeps callers from observing the registrar in the
+#: transient contact-deleted state. _SETTLE_QUIET_S of silence ends the
+#: wait early; _SETTLE_CAP_S bounds it (an auto-refresh firing mid-settle
+#: only extends the wait up to the cap, never fails the call).
+_REFRESH_SETTLE_QUIET_S = 1.0
+_REFRESH_SETTLE_CAP_S = 5.0
+_REFRESH_SETTLE_POLL_S = 0.05
+
+
+def _check_binding_version(module: Any) -> None:
+    """Fail fast when the installed binding is not the validated one.
+
+    The matrix evidence describes exactly one binding build; running
+    production telephony against another is an unvalidated
+    configuration, so refuse loudly instead of degrading silently.
+    """
+    expected = BARESIP_PYTHON_PIN.split("==", 1)[1]
+    actual = str(getattr(module, "__version__", ""))
+    if actual != expected:
+        raise RuntimeError(
+            f"unsupported baresip-python {actual!r}: "
+            f"this adapter is validated against {expected!r} "
+            f"({BARESIP_PYTHON_PIN})"
+        )
 
 #: App-side PCM rate: inbound line audio is normalized here for the STT
 #: path; outbound assistant audio is converted to the negotiated line
@@ -87,8 +122,6 @@ RX_READ_BYTES = 640
 
 #: Media pump period in seconds.
 MEDIA_PERIOD = 0.01
-
-_VALID_DTMF = frozenset("0123456789ABCD*#")
 
 
 @dataclass
@@ -119,10 +152,15 @@ class _CallRecord:
     remote_closed: bool = False
     established: bool = False
     listeners_attached: bool = False
-    negotiated_codec: str = ""
     audio_restarts: int = 0
     tx_accepted_total: int = 0
     first_tx_at: float | None = None
+    # Media failure counters: every TX write / RX read-or-resample
+    # failure increments exactly one of these. They never raise, never
+    # block, and feed the media-health hook; silence here would be a
+    # live call with dead media and no signal.
+    tx_errors: int = 0
+    rx_errors: int = 0
 
 
 class BaresipTelephonyAdapter(TelephonyAdapter):
@@ -139,12 +177,20 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
     def __init__(self, config: TelephonyConfig) -> None:
         self._config = config
         self._lock = threading.RLock()
-        # Re-entrant: the core synchronously calls back into the adapter
-        # (hangup/flush) from inside listener delivery on the same thread
-        # (remote BYE -> caller_hangup -> hangup -> hangup_completed).
-        # Cross-thread delivery stays serialized. Never take _lock while
-        # holding _cb_lock: snapshots happen before delivery.
-        self._cb_lock = threading.RLock()
+        # Per-call callback locks: listener delivery for one call never
+        # blocks another call's SIP/media callbacks. Re-entrant delivery
+        # on the same thread stays safe (RLock: remote BYE ->
+        # caller_hangup -> hangup -> hangup_completed). Lock order is
+        # one-way only: a callback lock may be followed by _lock
+        # (listener re-entrancy into adapter methods), but _lock is
+        # never held across delivery -- snapshots happen first, then
+        # the lock is released and _deliver() runs lock-free apart from
+        # the per-call serializer. Entries are dropped with their call
+        # record.
+        self._cb_locks: dict[str, threading.RLock] = {}
+        self._admit_queue: queue.Queue | None = None
+        self._admit_thread: threading.Thread | None = None
+        self._admit_inflight = 0
         self._listener: TelephonyListener | None = None
         self._inbound: InboundCallHandler | None = None
         self._status: TelephonyStatusListener | None = None
@@ -159,6 +205,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         self._runtime: Any = None
         self._ua: Any = None
         self._declined_total = 0
+        self._register_ok_count = 0
         # Bounded native-event timeline (diagnostics): (t, app_id, kind).
         self._event_log: collections.deque = collections.deque(maxlen=200)
 
@@ -263,7 +310,76 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 self._set_reg_state(TelephonyRegistrationState.REGISTRATION_FAILED)
             return self.registration_state
         self._start_media_thread()
+        self._start_admit_thread()
         return self.registration_state
+
+    def refresh_registration(
+        self, *, timeout: float = 15.0
+    ) -> tuple[TelephonyRegistrationState, bool]:
+        """Send one REGISTER refresh on the loop thread (bounded wait).
+
+        This is the same stack path as automatic expiry refresh, exposed
+        so operators and tests can verify re-registration deterministically
+        without waiting out ``reg_interval``. Returns ``(state, fresh)``
+        where ``fresh`` is True only if the registrar confirmed *this*
+        refresh (a REGISTER_OK arrived while waiting) -- never a stale
+        previous state. The outcome also surfaces through the status
+        listener (REGISTERED, or REGISTRATION_FAILED/LOST); transport
+        errors never propagate to the caller as vendor types.
+
+        Stack note: the native ``ua_register()`` refreshes by first
+        unregistering the old dialog (expires-0 REGISTER, itself answered
+        with 200 OK and therefore a REGISTER_OK event) and then
+        registering a new dialog (challenged, retried with auth, answered
+        200 OK -- a second REGISTER_OK). ``ua.register()`` resolves on the
+        *first* outcome, so this method additionally waits for outcome
+        quiescence (no new REGISTER_OK for ``_SETTLE_QUIET_S``) bounded by
+        ``_SETTLE_CAP_S`` before returning. Without the settle, a caller
+        querying the registrar immediately after ``fresh=True`` can catch
+        the contact deleted (unregister processed, re-register still in
+        flight) -- a real, registrar-observable race, not a stale read.
+        """
+        loop = self._current_loop()
+        with self._lock:
+            ua = self._ua
+            mark = self._register_ok_count
+        if loop is None or ua is None or not self._is_running():
+            return self.registration_state, False
+
+        async def run() -> None:
+            try:
+                await ua.register()
+            except Exception as error:
+                name = type(error).__name__
+                LOG.debug("registration refresh failed: %s", name)
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(run(), loop)
+            future.result(timeout=timeout)
+        except Exception:
+            pass
+        # Settle past the re-register outcome(s): the first REGISTER_OK
+        # may belong to the unregister leg. Quiescence (no new REGISTER_OK
+        # for _SETTLE_QUIET_S, bounded by _SETTLE_CAP_S) is behaviour
+        # agnostic -- it works whether the stack sends one outcome or
+        # several -- and never fails the call, it only delays it.
+        settle_end = time.monotonic() + _REFRESH_SETTLE_CAP_S
+        last_change = time.monotonic()
+        with self._lock:
+            last_count = self._register_ok_count
+        while time.monotonic() < settle_end:
+            time.sleep(_REFRESH_SETTLE_POLL_S)
+            with self._lock:
+                count = self._register_ok_count
+            if count != last_count:
+                last_count = count
+                last_change = time.monotonic()
+            elif time.monotonic() - last_change >= _REFRESH_SETTLE_QUIET_S:
+                break
+        with self._lock:
+            fresh = self._register_ok_count > mark
+            state = self._reg_state
+        return state, fresh
 
     def shutdown(self) -> None:
         """Idempotent shutdown: stop accepting, drop media queues, hang
@@ -279,6 +395,8 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             loop = self._loop
             loop_thread = self._loop_thread
             media_thread = self._media_thread
+            admit_thread = self._admit_thread
+            admit_queue = self._admit_queue
             calls = list(self._calls.values())
             self._pending.clear()
         for record in calls:
@@ -311,14 +429,25 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             loop_thread.join(timeout=10)
         if media_thread is not None and media_thread is not threading.current_thread():
             media_thread.join(timeout=5)
+        if admit_queue is not None:
+            try:
+                admit_queue.put(None)
+            except Exception:
+                pass
+        if admit_thread is not None and admit_thread is not threading.current_thread():
+            admit_thread.join(timeout=5)
         with self._lock:
             self._loop = None
             self._loop_thread = None
             self._media_thread = None
+            self._admit_thread = None
+            self._admit_queue = None
+            self._admit_inflight = 0
             self._runtime = None
             self._ua = None
             self._calls.clear()
             self._pending.clear()
+            self._cb_locks.clear()
             self._set_reg_state_locked(TelephonyRegistrationState.STOPPED)
 
     # -- call control (non-blocking, never raise to the core) ----------
@@ -331,23 +460,23 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             return
         self._submit(record, lambda call: call.answer())
 
-    def reject(self, call_id: str) -> None:
-        """Decline an inbound call.
+    #: Decline retry schedule (seconds): the native call handle
+    #: registers asynchronously after CALL_INCOMING, so an immediate
+    #: reject can lose the race even on a healthy dialog. Retries make
+    #: 486 the deterministic outcome; only a genuinely gone leg (remote
+    #: CANCEL winning every round) falls through to answer+release.
+    _REJECT_RETRY_DELAYS = (0.1, 0.5, 2.0)
 
-        Upstream limitation (baresip-python 0.5.2a3, to be reported):
-        ``Call.reject()``/``hangup()`` on a just-arrived inbound leg
-        raise ``StaleHandleError`` -- the native handle does not
-        validate for END commands before establishment (verified
-        immediate and delayed) -- so a direct 486 is not obtainable
-        deterministically through public APIs today. Decline is
-        therefore always released via public primitives only: answer
-        the leg and BYE it immediately (answer-then-release). Observable
-        outcome is identical for the core (call released, slot freed,
-        exactly-once close, no AI resources opened); the SIP trace
-        shows 200+BYE instead of 486 until upstream fixes decline. No
-        patching, no unsafe handles, no vendor types cross the boundary
-        either way. Deterministic by construction: no first-try-486
-        race that would make the wire outcome vary run to run.
+    def reject(self, call_id: str) -> None:
+        """Decline an inbound call with a SIP rejection (486).
+
+        The native ``reject()`` is attempted first, retried with
+        backoff on ``StaleHandleError``; only a leg that never validates
+        is released via public answer+BYE (:meth:`_answer_then_release`)
+        so the slot never leaks. Either way the core outcome is
+        identical (released, slot freed, exactly-once close, no AI
+        resources opened). No patching, no unsafe handles, no vendor
+        types cross the boundary either way.
         """
         record = self._bind_pending_if_needed(call_id)
         with self._lock:
@@ -358,12 +487,46 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 # Far end already gone (CANCEL before answer): the core
                 # finishes on reject() alone; drop the closed record.
                 self._calls.pop(call_id, None)
+                self._drop_cb_lock(call_id)
                 return
             record.local_close = True
             record.decline_release = True
-        self._answer_then_release(record)
+        loop = self._current_loop()
+        if loop is None or not self._is_running():
+            return
+
+        async def run() -> None:
+            for attempt, delay in enumerate(
+                (0.0,) + self._REJECT_RETRY_DELAYS
+            ):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    result = record.native.reject()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    return
+                except Exception as error:
+                    if type(error).__name__ != "StaleHandleError":
+                        LOG.debug(
+                            "telephony op failed: %s", type(error).__name__
+                        )
+                        return
+                    LOG.debug("decline reject race, attempt %d", attempt)
+            # Genuinely gone (or never validated): release via
+            # answer+BYE so no slot leaks.
+            self._answer_then_release(record)
+
+        try:
+            asyncio.run_coroutine_threadsafe(run(), loop)
+        except Exception:
+            pass
 
     def hangup(self, call_id: str) -> None:
+        # Lock discipline: never hold _lock while delivering (listener
+        # callbacks re-enter the adapter and take _lock; holding it
+        # across delivery would ABBA-deadlock with the media thread).
+        complete_now = False
         with self._lock:
             record = self._calls.get(call_id)
             if record is None:
@@ -375,8 +538,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             if record.remote_closed:
                 # Far end already closed: our BYE would be meaningless;
                 # local cleanup is trivially complete.
-                self._emit_hangup_completed(call_id)
-                return
+                complete_now = True
+        if complete_now:
+            self._emit_hangup_completed(call_id)
+            return
         self._submit(record, lambda call: call.hangup())
 
     def blind_transfer(self, call_id: str, pbx_target: str) -> None:
@@ -440,13 +605,38 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             if record is None or not record.local_hold:
                 return
             record.local_hold = False
+        # Fresh media after resume: discard anything queued or buffered
+        # while held (stale TTS / pre-resume line audio must not blast
+        # out post-hold).
+        self._flush_record(record)
         self._submit(record, lambda call: call.resume(), revert_hold=True)
+
+    def _flush_record(self, record: _CallRecord) -> None:
+        """Discard queued TX and buffered RX for one call (hold/resume,
+        barge-in paths). Best-effort, never raises."""
+        with self._lock:
+            record.tx.clear()
+            record.tx_bytes = 0
+            native = record.native
+        if native is None:
+            return
+        try:
+            native.audio.flush_tx()
+        except Exception:
+            pass
+        for _ in range(64):
+            try:
+                chunk = native.audio.read(RX_READ_BYTES)
+            except Exception:
+                break
+            if not chunk:
+                break
 
     def send_dtmf(self, call_id: str, digits: str) -> None:
         if not isinstance(digits, str) or not digits:
             return
         clean = digits.upper()
-        if any(ch not in _VALID_DTMF for ch in clean):
+        if any(ch not in VALID_DTMF_DIGITS for ch in clean):
             return
         with self._lock:
             record = self._calls.get(call_id)
@@ -493,26 +683,94 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         except Exception:
             pass
 
+    def playout_pending_bytes(self, call_id: str) -> int:
+        """Bytes queued but not yet transmitted for one call (0 when
+        unknown/closed). The session uses this to keep barge-in armed
+        until RTP actually drains, instead of trusting generation end."""
+        with self._lock:
+            record = self._calls.get(call_id)
+            if record is None:
+                return 0
+            return record.tx_bytes
+
     # -- native event ingress (loop thread) ------------------------------
 
     def _on_native_incoming(self, native_call: Any) -> None:
-        """A native INVITE arrived. Hold it in the pending slot, extract
-        untrusted caller metadata, and synchronously admit through the
-        project-owned handler. The handler's re-entrant answer/reject
-        binds the pending call (see _bind_pending_if_needed)."""
+        """A native INVITE arrived (loop thread, returns immediately).
+
+        The native call is stashed in the pending slot (reserving one
+        admission unit toward ``max_calls``) and admission runs on the
+        serial admission worker, never on the SIP thread: handler work
+        (core admission, voice session setup) must not stall SIP
+        dispatch. The re-entrant answer/reject inside the handler still
+        binds the pending call (see _bind_pending_if_needed), which is
+        thread-safe; FIFO worker order keeps bindings aligned.
+        """
         if not self._is_running():
             self._decline_native(native_call)
             return
         with self._lock:
-            if len(self._calls) >= max(1, self._config.max_calls):
+            queue_ = self._admit_queue
+            if (
+                queue_ is None
+                or len(self._calls) + self._admit_inflight
+                >= max(1, self._config.max_calls)
+            ):
                 over_limit = True
             else:
                 over_limit = False
                 self._pending.append(native_call)
-            handler = self._inbound
+                self._admit_inflight += 1
         if over_limit:
             self._decline_native(native_call)
             return
+        try:
+            queue_.put(native_call)  # type: ignore[union-attr]
+        except Exception:
+            with self._lock:
+                try:
+                    self._pending.remove(native_call)
+                except ValueError:
+                    pass
+                self._admit_inflight = max(0, self._admit_inflight - 1)
+            self._decline_native(native_call)
+
+    def _admission_worker(self) -> None:
+        """Serial admission worker (one daemon thread, FIFO).
+
+        Runs the project-owned inbound handler off the SIP thread.
+        Exactly one admission runs at a time, in arrival order, so each
+        re-entrant answer binds the oldest pending native call (its
+        own), never a sibling's.
+        """
+        while True:
+            with self._lock:
+                queue_ = self._admit_queue
+            if queue_ is None:
+                return
+            try:
+                native_call = queue_.get(timeout=0.5)
+            except Exception:
+                if not self._is_running():
+                    return
+                continue
+            if native_call is None:  # shutdown sentinel
+                return
+            try:
+                self._admit_one(native_call)
+            except Exception:
+                LOG.debug("admission failed")
+            finally:
+                with self._lock:
+                    self._admit_inflight = max(0, self._admit_inflight - 1)
+
+    def _admit_one(self, native_call: Any) -> None:
+        """Admit one pending native call through the handler."""
+        if not self._is_running():
+            self._decline_native(native_call)
+            return
+        with self._lock:
+            handler = self._inbound
         peer = str(getattr(native_call, "peer", "") or "")
         caller_id = peer  # untrusted far-end URI; never authentication
         app_id: str | None = None
@@ -576,28 +834,32 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 record.close_emitted = True
                 record.hangup_completed_emitted = True
                 self._calls.pop(app_id, None)
+                self._drop_cb_lock(app_id)
             else:
                 if record.close_emitted:
                     return
                 record.close_emitted = True
                 record.remote_closed = True
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                if closed_first:
-                    listener.on_transfer_result(
-                        app_id, TransferResult.ACCEPTED_BY_PBX
-                    )
-                elif local:
-                    listener.on_hangup_completed(app_id)
-                else:
-                    listener.on_caller_hangup(app_id)
-            except Exception:
-                pass
+            media_lost = "rtp" in reason.lower()
+            if local or closed_first:
+                # Record (and its callback lock) drop with the close.
+                self._calls.pop(app_id, None)
+                self._drop_cb_lock(app_id)
+        if media_lost:
+            # RTP-timeout teardown: the media path died (vanished peer,
+            # expired NAT, partition). Report it to health alongside the
+            # normal close routing below; recovery follows on the next
+            # established call or re-registration.
+            LOG.info("telephony media lost call_id=%s reason=%s", app_id, reason)
+            self._report_media(False, app_id, "rtp timeout")
+        if closed_first:
+            self._deliver(
+                app_id, "on_transfer_result", TransferResult.ACCEPTED_BY_PBX
+            )
+        elif local:
+            self._deliver(app_id, "on_hangup_completed")
+        else:
+            self._deliver(app_id, "on_caller_hangup")
 
     def _emit_hangup_completed(self, app_id: str) -> None:
         """Complete a locally-requested hangup against an already
@@ -608,49 +870,27 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 return
             record.hangup_completed_emitted = True
             self._calls.pop(app_id, None)
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_hangup_completed(app_id)
-            except Exception:
-                pass
+            self._drop_cb_lock(app_id)
+        self._deliver(app_id, "on_hangup_completed")
 
     def _on_native_dtmf(self, app_id: str, digit: str) -> None:
         with self._lock:
             known = app_id in self._calls
         if not known:
             return
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_dtmf(app_id, digit)
-            except Exception:
-                pass
+        self._deliver(app_id, "on_dtmf", digit)
 
     def _on_native_remote_hold(self, app_id: str, held: bool) -> None:
         with self._lock:
             record = self._calls.get(app_id)
             if record is None:
                 return
+            was_held = record.remote_hold
             record.remote_hold = held
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_remote_hold(app_id, held)
-            except Exception:
-                pass
+        if was_held and not held:
+            # Peer resumed: same freshness rule as local resume.
+            self._flush_record(record)
+        self._deliver(app_id, "on_remote_hold", held)
 
     def _on_native_established(self, app_id: str) -> None:
         with self._lock:
@@ -669,21 +909,18 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 if info is not None:
                     record.tx_rate = int(info.tx_sample_rate or DEFAULT_LINE_RATE)
                     record.rx_rate = int(info.rx_sample_rate or DEFAULT_LINE_RATE)
+                # Declined legs must never look answered, even on the
+                # answer-then-release fallback path: the core already
+                # finished (or never admitted) the call, and depending
+                # on another module's synchronous deletion is fragile.
                 if not record.established:
                     record.established = True
-                    emit_answered = True
-        if not emit_answered:
-            return
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_answered(app_id)
-            except Exception:
-                pass
+                    emit_answered = not record.decline_release
+        if emit_answered:
+            # Media path verified working again (or for the first time):
+            # lift any media-lost degradation.
+            self._report_media(True, app_id, "established")
+            self._deliver(app_id, "on_answered")
 
     # -- internals -------------------------------------------------------
 
@@ -692,9 +929,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
     ) -> _CallRecord | None:
         """Bind the oldest pending native call to ``app_id``.
 
-        Called re-entrantly from answer()/reject()/blind_transfer() while
-        the inbound handler is still on the stack, or directly after it
-        returns. Idempotent: an already-bound id returns its record."""
+        Called from answer()/reject()/blind_transfer(), including
+        re-entrantly from inside the inbound handler, or directly after
+        it returns. Thread-safe; idempotent: an already-bound id
+        returns its record."""
         with self._lock:
             existing = self._calls.get(app_id)
             if existing is not None:
@@ -811,24 +1049,15 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         either order), and the core safely ignores unknown/ended ids.
         Exactly-once per transfer is enforced by the transfer_open guard
         and watchdog cancellation at the call sites, not here."""
-        listener = self._current_listener()
-        if listener is None:
-            return
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_transfer_result(app_id, result)
-            except Exception:
-                pass
+        self._deliver(app_id, "on_transfer_result", result)
 
     def _decline_native(self, native_call: Any) -> None:
         """SIP-level decline for a native leg with no application id
-        (inbound handler returned None). Same upstream limitation as
-        :meth:`reject`: try ``reject()``, fall back to answer-then-BYEs
-        on ``StaleHandleError``. The leg gets a synthetic
-        ``declined-N`` record so its close routes sanely (unknown to the
-        core, which ignores it) and no slot leaks."""
+        (inbound handler returned None): ``reject()`` first (486), with
+        the same answer-then-release fallback as :meth:`reject` on
+        ``StaleHandleError``. The leg gets a synthetic ``declined-N``
+        record so its close routes sanely (unknown to the core, which
+        ignores it) and no slot leaks."""
         with self._lock:
             self._declined_total += 1
             app_id = f"declined-{self._declined_total}"
@@ -841,11 +1070,27 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         if loop is None or not self._is_running():
             with self._lock:
                 self._calls.pop(app_id, None)
+                self._drop_cb_lock(app_id)
             return
 
         async def run() -> None:
-            # Decline is always answer-then-release (see reject()): a
-            # direct reject() is not deterministic on this binding.
+            for attempt, delay in enumerate(
+                (0.0,) + self._REJECT_RETRY_DELAYS
+            ):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    result = native_call.reject()
+                    if asyncio.iscoroutine(result):
+                        await result
+                    return
+                except Exception as error:
+                    if type(error).__name__ != "StaleHandleError":
+                        LOG.debug(
+                            "telephony op failed: %s", type(error).__name__
+                        )
+                        return
+                    LOG.debug("decline reject race, attempt %d", attempt)
             self._answer_then_release(record)
 
         try:
@@ -862,6 +1107,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         if loop is None:
             with self._lock:
                 self._calls.pop(record.app_id, None)
+                self._drop_cb_lock(record.app_id)
             return
 
         async def run() -> None:
@@ -881,6 +1127,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 )
                 with self._lock:
                     self._calls.pop(record.app_id, None)
+                    self._drop_cb_lock(record.app_id)
                 return
             try:
                 await asyncio.wait_for(
@@ -902,6 +1149,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             # Safety: never leak the slot if the close never arrived.
             with self._lock:
                 self._calls.pop(record.app_id, None)
+                self._drop_cb_lock(record.app_id)
 
         try:
             asyncio.run_coroutine_threadsafe(run(), loop)
@@ -981,7 +1229,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
 
         def on_dtmf(digit_event: Any) -> None:
             digit = str(getattr(digit_event, "digit", "") or "").upper()
-            if len(digit) == 1 and digit in _VALID_DTMF:
+            if len(digit) == 1 and digit in VALID_DTMF_DIGITS:
                 self._on_native_dtmf(app_id, digit)
 
         try:
@@ -993,19 +1241,26 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
     # -- loop-thread coroutines ------------------------------------------
 
     async def _async_start(self) -> None:
+        import baresip as _baresip_module
         from baresip import Account, Config, Runtime, UserAgent
         from baresip.events import Event as _Event
 
+        _check_binding_version(_baresip_module)
         cfg = self._config
         # sip_trace logs every SIP message under baresip.native.sip at
         # DEBUG (integration diagnostics only; credentials never appear
         # there -- auth material stays in headers the harness redacts).
+        # sip_listen travels as the one typed escape hatch the binding
+        # requires for loopback benches (no free-text channel exists).
+        extra_lines = (
+            f"sip_listen {cfg.sip_listen}\n" if cfg.sip_listen else ""
+        )
         baresip_config = Config(
             net_interface=cfg.bind,
             audio_driver="aumem",
             max_concurrent_calls=cfg.max_calls,
             rtp_timeout=cfg.rtp_timeout,
-            extra_config_text=cfg.extra_config_text,
+            extra_config_text=extra_lines,
             sip_trace=cfg.sip_trace,
         )
         runtime = Runtime()
@@ -1017,6 +1272,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             password=cfg.password,
             domain=cfg.domain,
             registrar=cfg.registrar,
+            reg_interval=cfg.reg_interval,
             transport=cfg.transport,  # type: ignore[arg-type]
             audio_codecs=tuple(cfg.audio_codecs),
             dtmf_mode=cfg.dtmf_mode,  # type: ignore[arg-type]
@@ -1032,6 +1288,8 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 return
             if kind is _Event.REGISTER_OK:
+                with self._lock:
+                    self._register_ok_count += 1
                 self._set_reg_state(TelephonyRegistrationState.REGISTERED)
             elif kind is _Event.REGISTER_FAIL:
                 with self._lock:
@@ -1065,6 +1323,13 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 pass
         if runtime is not None:
+            # Graceful first: refuse new calls and let live ones end
+            # (bounded) before tearing the stack down. Closing with live
+            # calls risks native teardown races.
+            try:
+                await asyncio.wait_for(runtime.drain(), timeout=8.0)
+            except Exception:
+                pass
             try:
                 await runtime.close()
             except Exception:
@@ -1084,6 +1349,17 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 target=self._media_pump, name="baresip-media", daemon=True
             )
             self._media_thread = thread
+        thread.start()
+
+    def _start_admit_thread(self) -> None:
+        with self._lock:
+            if self._admit_thread is not None or not self._running:
+                return
+            self._admit_queue = queue.Queue()
+            thread = threading.Thread(
+                target=self._admission_worker, name="baresip-admit", daemon=True
+            )
+            self._admit_thread = thread
         thread.start()
 
     def _media_pump(self) -> None:
@@ -1111,7 +1387,11 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         with self._lock:
             if record.decline_release:
                 return
-            if not record.tx or record.local_hold or record.remote_closed:
+            if record.local_hold or record.remote_hold:
+                # Held either way: nothing is transmitted. The queue
+                # stays bounded (oldest drops) and resume flushes it.
+                return
+            if not record.tx or record.remote_closed:
                 return
             chunk = record.tx.popleft()
             record.tx_bytes -= len(chunk)
@@ -1139,24 +1419,27 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                     record.tx.appendleft(remainder)
                     record.tx_bytes += len(remainder)
         except Exception as error:
-            # AudioRestarted/AudioNotActive: re-queue for the next epoch
-            # when media is back; drop when the call is gone.
-            if type(error).__name__ == "AudioRestarted":
-                with self._lock:
+            # Every write failure is counted and the chunk is re-queued
+            # (bounded: the cap still applies, oldest drops first). The
+            # old code dropped the chunk silently whenever the re-probe
+            # succeeded -- a live call with vanishing audio and no
+            # signal. AudioRestarted additionally counts renegotiations.
+            with self._lock:
+                record.tx_errors += 1
+                if type(error).__name__ == "AudioRestarted":
                     record.audio_restarts += 1
             try:
                 audio.info()
             except Exception:
-                with self._lock:
-                    if record.app_id in self._calls:
-                        record.tx.appendleft(chunk)
-                        record.tx_bytes += len(chunk)
-                        while (
-                            record.tx_bytes > TX_QUEUE_MAX_BYTES and record.tx
-                        ):
-                            dropped = record.tx.popleft()
-                            record.tx_bytes -= len(dropped)
-                            record.tx_dropped_bytes += len(dropped)
+                pass
+            with self._lock:
+                if record.app_id in self._calls:
+                    record.tx.appendleft(chunk)
+                    record.tx_bytes += len(chunk)
+                    while record.tx_bytes > TX_QUEUE_MAX_BYTES and record.tx:
+                        dropped = record.tx.popleft()
+                        record.tx_bytes -= len(dropped)
+                        record.tx_dropped_bytes += len(dropped)
 
     def _drain_rx(self, record: _CallRecord) -> None:
         native = record.native
@@ -1165,15 +1448,22 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         with self._lock:
             if record.decline_release:
                 return
-            if record.local_hold or record.close_emitted:
+            if record.local_hold or record.remote_hold or record.close_emitted:
+                # Held either way: caller speech is never delivered as
+                # app input while held (spec: no garbage as caller
+                # speech). Buffered line audio is flushed on resume.
                 return
         try:
             audio = native.audio
         except Exception:
+            with self._lock:
+                record.rx_errors += 1
             return
         try:
             raw = audio.read(RX_READ_BYTES)
         except Exception:
+            with self._lock:
+                record.rx_errors += 1
             return
         if not raw:
             return
@@ -1186,9 +1476,11 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         try:
             pcm = resample_pcm16(bytes(raw), rx_rate, APP_PCM_RATE)
         except Exception:
+            with self._lock:
+                record.rx_errors += 1
             return
         with self._lock:
-            if record.local_hold or record.close_emitted:
+            if record.local_hold or record.remote_hold or record.close_emitted:
                 return
             if record.app_id not in self._calls:
                 return
@@ -1204,18 +1496,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             )
         except Exception:
             return
-        listener = self._current_listener()
-        if listener is None:
-            return
         # Late close racing this delivery is benign: unknown ids and
         # wrong-state frames are dropped by the core/session.
-        with self._cb_lock:
-            if not self._is_running():
-                return
-            try:
-                listener.on_caller_audio(record.app_id, frame)
-            except Exception:
-                pass
+        self._deliver(record.app_id, "on_caller_audio", frame)
 
     # -- small helpers ----------------------------------------------------
 
@@ -1231,6 +1514,38 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         with self._lock:
             return self._loop
 
+    def _cb_lock_for(self, call_id: str) -> threading.RLock:
+        """The callback serializer for one call (created on demand)."""
+        with self._lock:
+            lock = self._cb_locks.get(call_id)
+            if lock is None:
+                lock = threading.RLock()
+                self._cb_locks[call_id] = lock
+            return lock
+
+    def _drop_cb_lock(self, call_id: str) -> None:
+        with self._lock:
+            self._cb_locks.pop(call_id, None)
+
+    def _deliver(self, call_id: str, method: str, *args: object) -> None:
+        """Invoke one listener method for one call: serialized per call,
+        lightweight, never raising into the stack. The single shared
+        shape for every fan-out site (one place to get the locking
+        right). Callbacks must return fast: heavy backend work
+        (model inference, process restarts, storage, network) must be
+        deferred by the listener, never run inline on SIP/media threads.
+        """
+        listener = self._current_listener()
+        if listener is None:
+            return
+        with self._cb_lock_for(call_id):
+            if not self._is_running():
+                return
+            try:
+                getattr(listener, method)(call_id, *args)
+            except Exception:
+                pass
+
     def _set_reg_state(self, state: TelephonyRegistrationState) -> None:
         with self._lock:
             listener = self._status
@@ -1240,6 +1555,23 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 listener.on_registration_state(state)
             except Exception:
                 pass
+            # A fresh registration epoch invalidates pre-restart media
+            # evidence: recovery here keeps re-registration restorative.
+            if state is TelephonyRegistrationState.REGISTERED:
+                self._report_media(True, "", "re-registered")
+
+    def _report_media(self, healthy: bool, call_id: str, detail: str = "") -> None:
+        with self._lock:
+            listener = self._status
+        if listener is None:
+            return
+        report = getattr(listener, "on_media_state", None)
+        if not callable(report):
+            return
+        try:
+            report(healthy, call_id, detail)
+        except Exception:
+            pass
 
     def _set_reg_state_locked(self, state: TelephonyRegistrationState) -> None:
         self._reg_state = state
@@ -1268,7 +1600,7 @@ class CoreInboundBridge(InboundCallHandler):
 
 
 class CoreStatusBridge(TelephonyStatusListener):
-    """Composition seam: adapter registration states -> core health."""
+    """Composition seam: adapter registration/media states -> core health."""
 
     def __init__(self, core: Any) -> None:
         self._core = core
@@ -1278,6 +1610,14 @@ class CoreStatusBridge(TelephonyStatusListener):
     ) -> None:
         try:
             self._core.report_telephony_state(state, detail)
+        except Exception:
+            pass
+
+    def on_media_state(
+        self, healthy: bool, call_id: str = "", detail: str = ""
+    ) -> None:
+        try:
+            self._core.report_telephony_media(healthy, call_id, detail)
         except Exception:
             pass
 
@@ -1292,3 +1632,14 @@ def wire_baresip_core(core: Any, adapter: BaresipTelephonyAdapter) -> None:
     adapter.set_listener(core)
     adapter.set_inbound_handler(CoreInboundBridge(core))
     adapter.set_status_listener(CoreStatusBridge(core))
+
+
+def baresip_adapter_from_config(config_service: Any) -> BaresipTelephonyAdapter:
+    """Composition root for the telephony path: read the declarative
+    ``sip.*`` identity through ``ConfigService`` (canonical config.db)
+    and build the adapter. This is the consumer that keeps
+    ``ConfigService.telephony_config()`` live: unregistered SIP
+    identities fail closed here (ValueError) instead of halfway through
+    a call.
+    """
+    return BaresipTelephonyAdapter(config_service.telephony_config())

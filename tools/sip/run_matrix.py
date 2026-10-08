@@ -17,7 +17,6 @@ Usage: python3 tools/sip/run_matrix.py [--keep] [--pcma-only]
 from __future__ import annotations
 
 import argparse
-import asyncio
 import collections
 import json
 import logging
@@ -25,7 +24,6 @@ import os
 import platform
 import queue
 import re
-import shutil
 import struct
 import subprocess
 import sys
@@ -198,11 +196,18 @@ class CallerProc:
         self._listen = listen
         self._user = user
         self._password = password
+        # Counterparty stderr is captured to a file (never DEVNULL):
+        # dial/establish failures need the far-end traceback to be
+        # diagnosable, and the tail lands in the evidence on failure.
+        self._stderr_path = (
+            f"/tmp/vr-caller-{user}-{listen.replace('.', '_').replace(':', '_')}.log"
+        )
+        self._stderr_file = open(self._stderr_path, "w")
         self._proc = subprocess.Popen(
             [sys.executable, os.path.join(REPO, "tools", "sip", "caller.py")],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             text=True,
             bufsize=1,
         )
@@ -282,6 +287,19 @@ class CallerProc:
             self._proc.wait(timeout=20)
         except Exception:
             self._proc.kill()
+        try:
+            self._stderr_file.close()
+        except Exception:
+            pass
+
+    def stderr_tail(self, lines: int = 25) -> str:
+        """Last lines of counterparty stderr for failure evidence."""
+        try:
+            with open(self._stderr_path, errors="replace") as handle:
+                content = handle.readlines()
+        except OSError:
+            return ""
+        return "".join(content[-lines:])[-2000:]
 
     @property
     def returncode(self):
@@ -435,11 +453,20 @@ def main() -> int:
     from fakes import FakePolicy, FakeVoiceBackend
 
     codec = args.codecs
+    run_id = f"m25-{int(time.time())}-{os.getpid()}"
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        head_sha = sh("git", "rev-parse", "HEAD", timeout=15).stdout.strip()
+    except Exception:
+        head_sha = "unknown"
     evidence["meta"] = {
         "os": platform.platform(),
         "arch": platform.machine(),
         "python": platform.python_version(),
         "codec_run": codec,
+        "run_id": run_id,
+        "started_at": started_at,
+        "head_sha": head_sha,
     }
     try:
         import baresip
@@ -447,6 +474,25 @@ def main() -> int:
         evidence["meta"]["baresip_python"] = baresip.__version__
     except Exception:
         evidence["meta"]["baresip_python"] = "missing"
+
+    # Preflight: every loopback SIP/RTP port must be free. A stray
+    # probe holding one produces cascading nonsense (bind fails deep
+    # inside the stack); fail fast with the culprit instead.
+    import socket as _socket
+
+    busy = []
+    for _port in (5060, 5070, 5071, 5072, 5074, 5075, 5076):
+        _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        try:
+            _sock.bind(("127.0.0.1", _port))
+        except OSError:
+            busy.append(_port)
+        finally:
+            _sock.close()
+    if busy:
+        checks.record("preflight-ports", "loopback SIP ports free", False,
+                       f"busy={busy}; kill stray probes first")
+        return finish(evidence, checks, 1)
 
     # -- build pinned images -----------------------------------------
     r = sh("docker", "build", "-q", "-t", AST_IMAGE,
@@ -499,7 +545,7 @@ def main() -> int:
             max_calls=2,
             rtp_timeout=5,
             sip_trace=True,
-            extra_config_text="sip_listen 127.0.0.1:5070\n",
+            sip_listen="127.0.0.1:5070",
         )
     )
     from receptionist.policy import Destination as _Destination
@@ -626,6 +672,7 @@ def main() -> int:
         "ready-telephony", "service READY once registered",
         core.health.status is HealthStatus.READY, core.health.status.value,
     )
+    evidence["reg_aor_initial"] = asterisk_cli("pjsip", "show", "aor", "700")[-1200:]
     if state is not TelephonyRegistrationState.REGISTERED:
         # Fail fast: nothing downstream can work without registration
         # (e.g. a stale probe still holding the loopback SIP port).
@@ -667,10 +714,8 @@ def main() -> int:
             return None
 
     adapter.set_inbound_handler(DeclineAll())
-    # Generous timeout: the decline release answers first, and the very
-    # first answer on a fresh stack may take seconds (audio init).
-    rc, out = run_sipp("uac_expect_reject.xml", ADAPTER_SIP, timeout=25)
-    checks.record("sipp-reject", "declined INVITE released promptly (200+BYE path)",
+    rc, out = run_sipp("uac_expect_reject.xml", ADAPTER_SIP)
+    checks.record("sipp-reject", "declined INVITE gets 486, no media",
                    rc == 0, out[-500:])
     evidence["sip_timelines"]["s2"] = timeline_of(out)
     from receptionist.baresip_adapter import CoreInboundBridge
@@ -684,6 +729,16 @@ def main() -> int:
     checks.record("sipp-hold", "re-INVITE hold/resume answered + observed",
                    rc == 0 and got_hold, f"rc={rc} holds={holds[-4:]}")
     evidence["sip_timelines"]["s3"] = timeline_of(out)
+
+    # NOTE (no s5 CANCEL scenario): CANCEL-before-answer against a fast
+    # responder is inherently racy for strict SIPp (the 200/CANCEL order
+    # varies run to run and sipp scenarios must match exactly). The
+    # pre-answer caller-hangup contract is proven deterministically at
+    # the session seam instead
+    # (test_call_session.PreAnswerCallerHangupTest: INCOMING ->
+    # reject, CALLER_HANGUP outcome, no answer, no voice resources),
+    # and remote hangup after answer is covered by s1/BYE, PBX-outage,
+    # and shutdown-peer checks below.
     capturing[0] = False
     # Prefer the adapter-side trace (complete, redacted) over SIPp stdout.
     traced = collapse_timeline(sip_lines)
@@ -699,6 +754,8 @@ def main() -> int:
         return finish(evidence, checks, 1)
     app_a = dial_identified(caller, lambda: caller.dial("A"), core)
     ok = app_a is not None
+    if not ok:
+        diagnose_dial(evidence, "A", adapter, core, caller)
     checks.record("invite-routed", "INVITE via Asterisk answered + established", ok)
     both = ok and app_a is not None and listener.wait_answered(app_a, 5)
     checks.record("evt-answered", "adapter on_answered with app call id", bool(both),
@@ -728,6 +785,14 @@ def main() -> int:
         sr_ok = all(f.sample_rate == 16000 and f.channels == 1 for f in frames[-10:])
         checks.record("pcm-rx-format", "inbound normalized to 16kHz mono pcm16",
                        bool(frames) and sr_ok, f"frames={len(frames)}")
+        # Negotiated codec, registrar-side: the PBX reports the actual
+        # on-the-wire codec per leg (offers alone prove nothing).
+        expected_wire = {"pcmu": "ulaw", "pcma": "alaw"}.get(codec, codec)
+        wire_codecs = parse_channel_codecs(asterisk_cli("pjsip", "show", "channelstats"))
+        leg_codecs = sorted({c for ch, c in wire_codecs if ch.startswith("700-")})
+        checks.record("codec-negotiated", f"wire codec is {expected_wire} ({codec})",
+                       leg_codecs == [expected_wire],
+                       f"legs={wire_codecs}")
 
         # PCM TX: assistant frames -> RTP -> caller reads tone
         session = core.get_session(app_a)
@@ -829,10 +894,12 @@ def main() -> int:
             held_flag = adapter._calls.get(app_a).local_hold  # noqa: SLF001
         adapter.send_audio(app_a, make_frame(
             tone_pcm(duration_seconds=0.5, sample_rate=16000), 16000))
+        rx_before = listener.audio_bytes.get(app_a, 0)
         time.sleep(1)
         with adapter._lock:  # noqa: SLF001
             rec_a = adapter._calls.get(app_a)  # noqa: SLF001
             queued_while_held = rec_a.tx_bytes if rec_a else -1
+        rx_frozen = listener.audio_bytes.get(app_a, 0) == rx_before
         adapter.resume(app_a)
         time.sleep(1)
         with adapter._lock:  # noqa: SLF001
@@ -845,6 +912,8 @@ def main() -> int:
                        and count_op_errors() == op_errors_before,
                        f"held={held_flag} queued={queued_while_held} "
                        f"drained={drained} resumed={resumed_flag}")
+        checks.record("hold-local-media", "no caller audio crosses while held",
+                       rx_frozen, f"rx_frozen={rx_frozen}")
         # Caller re-INVITE through Asterisk succeeds at the SIP layer
         # (answered by the B2BUA leg); the session stays ACTIVE throughout.
         caller.cmd({"op": "hold", "tag": "A"})
@@ -859,23 +928,47 @@ def main() -> int:
                        and sess_a is not None and sess_a.state.value == "active",
                        f"hold_done={bool(h_done)} resume_done={bool(r_done)}")
 
-        # second call: isolation
-        app_b = dial_identified(caller, lambda: caller.dial("B"), core)
-        ok_b = app_b is not None
-        checks.record("two-calls", "two simultaneous call objects, distinct app ids",
-                       ok_b and app_b is not None and app_b != app_a,
-                       f"a={app_a} b={app_b}")
-        if ok_b and app_b:
-            caller.cmd({"op": "tone", "tag": "B", "seconds": 2.0, "freq": 880.0})
-            got_b = wait_for(lambda: listener.audio_bytes.get(app_b, 0) >= 16000, 15)
-            checks.record("two-calls-audio", "per-call audio routing stays separate",
-                           got_b, f"b_bytes={listener.audio_bytes.get(app_b, 0)}")
-            caller.cmd({"op": "hangup", "tag": "A"})
-            gone_a = wait_for(lambda: listener.caller_hangup.get(app_a, 0) >= 1, 15)
-            time.sleep(1)
-            still_b = core.get_session(app_b) is not None
-            checks.record("two-calls-hangup", "hangup A keeps B alive",
-                           gone_a and still_b, f"a_hangups={listener.caller_hangup.get(app_a, 0)} b_alive={still_b}")
+    # Local hangup (AC3): the app ends a live leg; the caller must
+    # observe our BYE and the session must complete and evict. Uses
+    # a dedicated leg so the A/B isolation test below is untouched.
+    app_e = dial_identified(caller, lambda: caller.dial("E"), core)
+    hung_local = False
+    if app_e is None:
+        diagnose_dial(evidence, "E-local-hangup", adapter, core, caller)
+    else:
+        if listener.wait_answered(app_e, 15):
+            session_e = core.get_session(app_e)
+            if session_e is not None:
+                session_e.end_call()
+                hung_local = caller.expect(
+                    lambda e: e.get("event") == "closed" and e.get("tag") == "E",
+                    15,
+                ) is not None
+                hung_local = hung_local and wait_for(
+                    lambda: core.get_session(app_e) is None, 15
+                )
+    checks.record("local-hangup", "app hangup BYEs the caller, session evicted",
+                   hung_local, f"app={app_e}")
+
+    # second call: isolation
+    app_b = dial_identified(caller, lambda: caller.dial("B"), core)
+    if app_b is None:
+        diagnose_dial(evidence, "B-twocalls", adapter, core, caller)
+    ok_b = app_b is not None
+    checks.record("two-calls", "two simultaneous call objects, distinct app ids",
+                   ok_b and app_b is not None and app_b != app_a,
+                   f"a={app_a} b={app_b}")
+    if ok_b and app_b:
+        caller.cmd({"op": "tone", "tag": "B", "seconds": 2.0, "freq": 880.0})
+        got_b = wait_for(lambda: listener.audio_bytes.get(app_b, 0) >= 16000, 15)
+        checks.record("two-calls-audio", "per-call audio routing stays separate",
+                       got_b, f"b_bytes={listener.audio_bytes.get(app_b, 0)}")
+        caller.cmd({"op": "hangup", "tag": "A"})
+        gone_a = wait_for(lambda: listener.caller_hangup.get(app_a, 0) >= 1, 15)
+        time.sleep(1)
+        still_b = core.get_session(app_b) is not None
+        checks.record("two-calls-hangup", "hangup A keeps B alive",
+                       gone_a and still_b, f"a_hangups={listener.caller_hangup.get(app_a, 0)} b_alive={still_b}")
 
     # -- direct leg: end-to-end hold forwarding + REFER primitive ------------
     # TRUE peer dialog (no B2BUA): an unregistered counterparty process
@@ -891,19 +984,33 @@ def main() -> int:
             lambda: callerB.dial_direct("X", f"sip:{SIP_USER}@{ADAPTER_SIP}"),
             core,
         )
+        if app_x is None:
+            diagnose_dial(evidence, "X-direct", adapter, core, callerB)
         direct_ok = app_x is not None and listener.wait_answered(app_x, 5)
     checks.record("direct-leg", "direct INVITE answered with app call id",
                    direct_ok, f"app={app_x}")
     if direct_ok and app_x:
+        # Stream caller audio across the hold window so the freeze
+        # assertion is meaningful (an idle line proves nothing).
+        callerB.cmd({"op": "tone", "tag": "X", "seconds": 8.0, "freq": 550.0})
+        flowing = wait_for(
+            lambda: listener.audio_bytes.get(app_x, 0) >= 16000, 15
+        )
         callerB.cmd({"op": "hold", "tag": "X"})
         x_hold = listener.wait_hold(app_x, True, 15)
+        bytes_at_hold = listener.audio_bytes.get(app_x, 0)
+        time.sleep(1.5)
+        frozen = listener.audio_bytes.get(app_x, 0) == bytes_at_hold
         # Pace re-INVITEs: a resume racing the hold transaction's tail
         # can be answered 491 and lost (real peers pace the same way).
-        time.sleep(1.5)
         callerB.cmd({"op": "resume", "tag": "X"})
         x_resume = listener.wait_hold(app_x, False, 15)
         checks.record("hold-remote-direct", "remote re-INVITE observed end to end",
                        x_hold and x_resume, f"hold={x_hold} resume={x_resume}")
+        checks.record("hold-remote-media", "no caller audio crosses while held",
+                       bool(flowing) and x_hold and frozen,
+                       f"flowing={flowing} bytes_at_hold={bytes_at_hold} "
+                       f"bytes_later={listener.audio_bytes.get(app_x, 0)}")
         try:
             callerB.cmd({"op": "hangup", "tag": "X"})
         except Exception:
@@ -954,6 +1061,8 @@ def main() -> int:
     # Fresh leg T via Asterisk: REFER it to 201 and let the real PBX
     # report the outcome (proven: 202 + NOTIFY sipfrag failure).
     app_t = dial_identified(caller, lambda: caller.dial("T"), core)
+    if app_t is None:
+        diagnose_dial(evidence, "T-xfer-reject", adapter, core, caller)
     if app_t is not None:
         listener.wait_answered(app_t, 10)
     if app_t and core.get_session(app_t) is not None:
@@ -977,28 +1086,41 @@ def main() -> int:
             pass
     wait_for(lambda: len(core._sessions) == 0, 20)  # noqa: SLF001
 
-    # -- explicit re-REGISTER ---------------------------------------------------
-    loop = adapter._loop  # noqa: SLF001
-    ua = adapter._ua  # noqa: SLF001
-    if loop is None or ua is None:
-        re_reg = False
-        LOG.info("re-register probe: adapter stack unavailable")
-    else:
-        try:
-            fut = asyncio.run_coroutine_threadsafe(ua.register(), loop)
-            fut.result(timeout=20)
-            re_reg = adapter.registration_state is TelephonyRegistrationState.REGISTERED
-        except Exception as error:
-            re_reg = False
-            LOG.info("re-register probe: %s", type(error).__name__)
-    hist = asterisk_cli("pjsip", "show", "history")
-    reg_count = len(re.findall(r"REGISTER", hist))
-    evidence["reg_history_sample"] = hist[-1500:]
-    # Normative: the re-REGISTER transaction itself gets 200 OK (same
-    # stack path as expiry refresh). The registrar-side count is
-    # corroboration (history depth varies by build).
-    checks.record("reg-reregister", "re-REGISTER 200 OK against Asterisk",
-                   re_reg, f"register_hits={reg_count}")
+    # -- explicit re-REGISTER (public primitive, registrar-verified) -------
+    # refresh_registration() is the product seam (same stack path as
+    # expiry refresh). Registrar-side proof: the 700 contact must still
+    # be present with a bumped expiration afterwards. The AOR view
+    # carries per-contact expiration for flap diagnosis.
+    contacts_before = asterisk_cli("pjsip", "show", "contacts")
+    aor_before = asterisk_cli("pjsip", "show", "aor", "700")
+    state, fresh = adapter.refresh_registration(timeout=20)
+    # The stack refreshes as unregister-old-dialog + register-new-dialog;
+    # the registrar transiently shows no 700 contact between the two legs
+    # (the adapter settle-wait covers the common case). Poll briefly so a
+    # residual ms-scale race cannot flake the check, while a persistently
+    # missing contact still fails loudly.
+    contacts_after = ""
+    contact_seen = False
+    poll_end = time.monotonic() + 10.0
+    while time.monotonic() < poll_end:
+        contacts_after = asterisk_cli("pjsip", "show", "contacts")
+        contact_seen = "700/" in contacts_after
+        if contact_seen:
+            break
+        time.sleep(0.5)
+    aor_after = asterisk_cli("pjsip", "show", "aor", "700")
+    re_reg = (
+        fresh
+        and state is TelephonyRegistrationState.REGISTERED
+        and contact_seen
+    )
+    evidence["reg_contacts_before"] = contacts_before[-800:]
+    evidence["reg_contacts_after"] = contacts_after[-800:]
+    evidence["reg_aor_before"] = aor_before[-1200:]
+    evidence["reg_aor_after"] = aor_after[-1200:]
+    checks.record("reg-reregister", "re-REGISTER 200 OK, registrar contact present",
+                   re_reg,
+                   f"state={state.value} fresh={fresh} contact_seen={contact_seen}")
 
     # -- PBX outage: call closes, registration lost, recovery --------------------
     # NOTE: every counterparty needs its own loopback SIP port (baresip
@@ -1006,6 +1128,8 @@ def main() -> int:
     caller2 = CallerProc([codec], listen="127.0.0.1:5074")
     live_call = caller2.start()
     app_c = dial_identified(caller2, lambda: caller2.dial("C"), core) if live_call else None
+    if live_call and app_c is None:
+        diagnose_dial(evidence, "C-restart", adapter, core, caller2)
     # Deterministic outage test: the call must be ESTABLISHED on both
     # sides (plus media settle) before stopping the PBX; otherwise we
     # would measure setup-race teardown instead of outage survival.
@@ -1017,21 +1141,36 @@ def main() -> int:
     live_call = live_call and app_c is not None and c_up
     checks.record("pbx-call-up", "outage leg established before PBX stop",
                    bool(live_call), f"app={app_c}")
-    docker("stop", AST_NAME, timeout=60)
+    # Hard kill (SIGKILL, not graceful stop): no BYE goes out, RTP just
+    # stops, so the adapter-side RTP timeout is what must close the call.
+    # A graceful `docker stop` would let Asterisk BYE cleanly, which only
+    # proves remote-hangup handling (already covered by s1).
+    docker("kill", AST_NAME, timeout=60)
     closed = wait_for(
         lambda: app_c is not None and listener.caller_hangup.get(app_c, 0) >= 1, 30)
     checks.record("pbx-restart-call", "PBX outage closes the live call (RTP timeout)",
                    bool(live_call) and closed, f"app={app_c}")
-    try:
-        loop = adapter._loop  # noqa: SLF001
-        ua = adapter._ua  # noqa: SLF001
-        fut = asyncio.run_coroutine_threadsafe(ua.register(), loop)
+    # Media health (story 23): the RTP-timeout teardown must surface as
+    # a telephony media condition, distinct from registration loss.
+    from receptionist.alerting import (
+        CODE_TELEPHONY_MEDIA_LOST as _MEDIA_LOST,
+    )
+    from receptionist.alerting import HealthComponent as _HC
+
+    def _media_active() -> bool:
         try:
-            fut.result(timeout=20)
+            return any(
+                c.component is _HC.TELEPHONY and c.code == _MEDIA_LOST
+                for c in core.monitor.active_conditions()
+            )
         except Exception:
-            pass
-    except Exception:
-        pass
+            return False
+
+    media_seen = wait_for(_media_active, 15)
+    checks.record("media-health", "RTP-timeout teardown degrades telephony health",
+                   bool(live_call) and closed and media_seen,
+                   f"media_lost_active={media_seen}")
+    adapter.refresh_registration(timeout=20)
     lost = wait_for(
         lambda: adapter.registration_state
         in (TelephonyRegistrationState.REGISTRATION_LOST,
@@ -1041,17 +1180,14 @@ def main() -> int:
                    f"state={adapter.registration_state.value} health={core.health.status.value}")
     docker("start", AST_NAME, timeout=60)
     wait_asterisk_ready(60)
-    recovered = False
-    if loop is not None and ua is not None:
-        try:
-            fut = asyncio.run_coroutine_threadsafe(ua.register(), loop)
-            fut.result(timeout=25)
-            recovered = adapter.registration_state is TelephonyRegistrationState.REGISTERED
-        except Exception as error:
-            LOG.info("recovery register: %s", type(error).__name__)
+    recovered_state, recovered_fresh = adapter.refresh_registration(timeout=25)
+    recovered = (
+        recovered_fresh
+        and recovered_state is TelephonyRegistrationState.REGISTERED
+    )
     ok_health = wait_for(lambda: core.health.status is HealthStatus.READY, 15)
     checks.record("reg-recovery", "PBX back -> re-registered + READY", recovered and ok_health,
-                   f"recovered={recovered} health={core.health.status.value}")
+                   f"recovered={recovered} fresh={recovered_fresh} health={core.health.status.value}")
     try:
         caller2.stop()
     except Exception:
@@ -1061,6 +1197,8 @@ def main() -> int:
     caller3 = CallerProc([codec], listen="127.0.0.1:5075")
     live_d = caller3.start()
     app_d = dial_identified(caller3, lambda: caller3.dial("D"), core) if live_d else None
+    if live_d and app_d is None:
+        diagnose_dial(evidence, "D-shutdown", adapter, core, caller3)
     live_d = live_d and app_d is not None and listener.wait_answered(app_d, 20)
     if live_d and app_d:
         time.sleep(1.0)
@@ -1156,6 +1294,49 @@ def wait_for(pred, timeout: float) -> bool:
     return bool(pred())
 
 
+def parse_channel_codecs(channelstats: str) -> list[tuple[str, str]]:
+    """Parse `pjsip show channelstats` into (channel, codec) pairs."""
+    pairs: list[tuple[str, str]] = []
+    for line in (channelstats or "").splitlines():
+        parts = line.split()
+        # Shape: <bridge> <channel like 700-0000000b> <uptime> <codec> ...
+        if (
+            len(parts) >= 4
+            and re.fullmatch(r"[A-Za-z0-9]+-[0-9a-fA-F]+", parts[1] or "")
+            and parts[3].lower() in ("ulaw", "alaw", "g722", "opus")
+        ):
+            pairs.append((parts[1], parts[3].lower()))
+    return pairs
+
+
+def diagnose_dial(evidence: dict, name: str, adapter, core, caller) -> None:
+    """Failure diagnostics for a dial that produced no session: adapter
+    load, registrar contacts, PBX channels, and counterparty stderr.
+    A bare `app=None` with no cause is not an acceptable artifact."""
+    detail: dict = {}
+    try:
+        with adapter._lock:  # noqa: SLF001
+            detail["adapter_calls"] = sorted(adapter._calls)  # noqa: SLF001
+            detail["adapter_pending"] = len(adapter._pending)  # noqa: SLF001
+            detail["reg_state"] = adapter.registration_state.value
+    except Exception as error:
+        detail["adapter_error"] = type(error).__name__
+    try:
+        detail["core_sessions"] = sorted(core._sessions)  # noqa: SLF001
+    except Exception as error:
+        detail["core_error"] = type(error).__name__
+    try:
+        detail["pjsip_channels"] = asterisk_cli("pjsip", "show", "channels")[-800:]
+        detail["contacts"] = asterisk_cli("pjsip", "show", "contacts")[-800:]
+    except Exception as error:
+        detail["asterisk_error"] = type(error).__name__
+    try:
+        detail["caller_stderr"] = caller.stderr_tail()
+    except Exception:
+        pass
+    evidence.setdefault("dial_diagnostics", {})[name] = detail
+
+
 def collapse_timeline(lines: list[str]) -> list[str]:
     seen: list[str] = []
     for entry in lines:
@@ -1196,6 +1377,7 @@ def finish(evidence: dict, checks: Check, code: int) -> int:
         except Exception:
             pass
     evidence["checks"] = checks.items
+    evidence["meta"]["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     evidence["summary"] = {
         "total": len(checks.items),
         "failed": len(checks.failed),

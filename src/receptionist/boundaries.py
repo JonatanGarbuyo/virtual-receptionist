@@ -39,11 +39,13 @@ class TransferResult(Enum):
 class TelephonyListener(Protocol):
     """Normalized telephony events into the application.
 
-    Threading: the adapter may invoke these from SIP/media threads. The
-    core dispatches them onto its own serialization; listener
+    Threading: the adapter may invoke these from SIP/media threads,
+    serialized per call (one call's callbacks never block another's).
+    The core dispatches them onto its own serialization; listener
     implementations must be thread-safe and must never run LLM/STT/TTS,
-    SQLite, or network I/O inline. Callbacks are lightweight: they record
-    and return.
+    process restarts, SQLite, or network I/O inline — backends needing
+    slow cancellation must defer it internally. Callbacks are
+    lightweight: they record and return.
     """
 
     def on_answered(self, call_id: str) -> None: ...
@@ -58,17 +60,19 @@ class TelephonyListener(Protocol):
 class InboundCallHandler(Protocol):
     """Synchronous inbound-call admission seam (project-owned).
 
-    The adapter invokes this from its SIP thread when a native INVITE
-    arrives, holding the native call object internally in a pending
-    slot. The handler (composition layer) admits the call through
-    ``ReceptionistCore.incoming_call(...)`` and returns the application
-    ``call_id`` so the adapter can bind native <-> application id.
+    The adapter invokes this on its serial admission worker (never on
+    the SIP thread) when a native INVITE arrives, holding the native
+    call object internally in a pending slot. The handler (composition
+    layer) admits the call through ``ReceptionistCore.incoming_call(...)``
+    and returns the application ``call_id`` so the adapter can bind
+    native <-> application id. Admissions run strictly one at a time in
+    arrival order, so each re-entrant answer binds its own native leg.
 
-    Re-entrancy contract: ``incoming_call`` synchronously calls back
-    into the adapter (``answer``/``reject``/``blind_transfer``) for the
-    returned id while this handler is still on the stack. The adapter
-    therefore binds a pending native call to the id demanded by that
-    re-entrant call instead of requiring the binding to pre-exist.
+    Re-entrancy contract: ``incoming_call`` calls back into the adapter
+    (``answer``/``reject``/``blind_transfer``) for the returned id. The
+    adapter binds the pending native call demanded by that call instead
+    of requiring the binding to pre-exist; all adapter entry points are
+    thread-safe.
 
     Returns the application call id to bind, or ``None`` to decline at
     the SIP level (the adapter rejects the native call). Never receives
@@ -102,6 +106,7 @@ class TelephonyStatusListener(Protocol):
     def on_registration_state(
         self, state: TelephonyRegistrationState, detail: str = ""
     ) -> None: ...
+    def on_media_state(self, healthy: bool, call_id: str = "", detail: str = "") -> None: ...
 
 
 class TelephonyAdapter(Protocol):
@@ -122,6 +127,9 @@ class TelephonyAdapter(Protocol):
     def set_inbound_handler(self, handler: InboundCallHandler | None) -> None: ...
     def set_status_listener(self, listener: TelephonyStatusListener | None) -> None: ...
     def start(self) -> None: ...
+    def refresh_registration(
+        self,
+    ) -> tuple[TelephonyRegistrationState, bool]: ...
     def shutdown(self) -> None: ...
     def answer(self, call_id: str) -> None: ...
     def reject(self, call_id: str) -> None: ...
@@ -129,6 +137,7 @@ class TelephonyAdapter(Protocol):
     def blind_transfer(self, call_id: str, pbx_target: str) -> None: ...
     def send_audio(self, call_id: str, frame: AudioFrame) -> None: ...
     def flush_audio(self, call_id: str) -> None: ...
+    def playout_pending_bytes(self, call_id: str) -> int: ...
     def send_dtmf(self, call_id: str, digits: str) -> None: ...
     def hold(self, call_id: str) -> None: ...
     def resume(self, call_id: str) -> None: ...
@@ -180,6 +189,13 @@ AUDIO_CHANNELS_MONO = 1
 #: (100 ms at 16 kHz is 3.2 KiB); anything larger is a resource bug,
 #: never a legitimate turn fragment.
 MAX_AUDIO_FRAME_BYTES = 1024 * 1024
+
+
+#: The closed DTMF digit alphabet shared by every layer (adapter RX/TX
+#: validation and core observation). Single source so the sets cannot
+#: drift; DTMF modes (RFC4733/SIP INFO) are a separate transport
+#: concern and live in telephony config.
+VALID_DTMF_DIGITS = frozenset("0123456789ABCD*#")
 
 
 @dataclass(frozen=True)

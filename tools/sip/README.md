@@ -20,7 +20,8 @@ Three roles, deliberately separated (spec #17):
   PCMU/PCMA + RFC4733, `direct_media=no`, internal test context only.
 - `sipp/Dockerfile`, `scenarios/*.xml` — versioned SIPp scenarios:
   - `uac_answer_bye`: INVITE answered, remote BYE, exactly-once hangup.
-  - `uac_expect_reject`: declined INVITE released promptly (200+BYE;
+  - `uac_expect_reject`: declined INVITE answered `486` (native
+    `reject()`; answer-then-release fallback only on a lost race —
     see decline note below).
   - `uac_hold_resume`: re-INVITE hold/resume with SDP answers.
 - `caller.py` — counterparty process (JSON protocol on stdin/stdout).
@@ -40,8 +41,9 @@ VR_RUN_SIP=1 python -m unittest tests.test_telephony_integration -v
 ```
 
 Everything runs on loopback (`--network host` containers + host
-processes). The adapter listens on `127.0.0.1:5070` (`sip_listen` via
-`extra_config_text`); counterparties use 5071/5072/5074/5075/5076 —
+processes). The adapter listens on `127.0.0.1:5070` (typed
+`sip.listen` key, rendered to the binding's `sip_listen` directive —
+no free-text config channel); counterparties use 5071/5072/5074/5075/5076 —
 every process needs its own SIP port (baresip binds at start).
 
 ## Findings encoded here (not assumptions)
@@ -53,7 +55,7 @@ every process needs its own SIP port (baresip binds at start).
   legs (SIPp s3, unregistered-caller leg), local hold on PBX legs.
 - A registered baresip UA proxy-routes outbound INVITEs through its
   registrar, so "direct" legs need an unregistered counterparty.
-- `Call.reject()`/`hangup()` on a fresh inbound leg raise
-  `StaleHandleError` on baresip-python 0.5.2a3; decline is released via
-  public answer+BYE until upstream fixes it (see adapter docstring and
-  the evidence README). No patching, no unsafe handles.
+- Decline is a native SIP rejection (`486` via `reject()`); only on a
+  lost race (`StaleHandleError`, e.g. simultaneous remote CANCEL) does
+  the adapter fall back to answer-then-release so the slot never leaks
+  (see adapter docstring). No patching, no unsafe handles.

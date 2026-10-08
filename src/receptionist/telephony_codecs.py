@@ -10,33 +10,40 @@ asserting "RTP packets exist":
 - decode them back and assert energy/frequency/duration properties,
 - document that G.711 is lossy (no byte-perfect assertions).
 
-ITU-T G.711 μ-law / A-law, signed 16-bit linear PCM <-> 8-bit codes.
+ITU-T G.711 μ-law / A-law, signed 16-bit linear PCM <-> 8-bit codes,
+following the canonical Sun/public-domain segment-table algorithms
+(validated sample-for-sample against an independent reference; see
+``tests/test_telephony_contract.py`` for the fixed vector table).
 """
 
 from __future__ import annotations
 
-_MULAW_BIAS = 0x84
-_MULAW_CLIP = 32635
+import struct
+
+#: Segment boundaries shared by both laws (Sun tables).
+_SEGMENTS = (0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF)
+
+
+def _segment(value: int) -> int:
+    for index, edge in enumerate(_SEGMENTS):
+        if value <= edge:
+            return index
+    return len(_SEGMENTS)
 
 
 def linear_to_ulaw(sample: int) -> int:
     """Encode one 16-bit linear sample to 8-bit μ-law."""
     sample = max(-32768, min(32767, int(sample)))
-    sign = 0x80 if sample < 0 else 0x00
     if sample < 0:
-        sample = -sample
-    if sample > _MULAW_CLIP:
-        sample = _MULAW_CLIP
-    sample += _MULAW_BIAS
-    exponent = 7
-    for exp in range(7, -1, -1):
-        if sample & (1 << (exp + 7)):
-            exponent = exp
-            break
+        sample = 0x84 - sample
+        mask = 0x7F
     else:
-        exponent = 0
-    mantissa = (sample >> (exponent + 3)) & 0x0F
-    return (~(sign | (exponent << 4) | mantissa)) & 0xFF
+        sample += 0x84
+        mask = 0xFF
+    segment = _segment(sample)
+    if segment >= 8:
+        return 0x7F ^ mask
+    return (((segment << 4) | ((sample >> (segment + 3)) & 0x0F)) ^ mask) & 0xFF
 
 
 def ulaw_to_linear(code: int) -> int:
@@ -45,34 +52,40 @@ def ulaw_to_linear(code: int) -> int:
     sign = code & 0x80
     exponent = (code >> 4) & 0x07
     mantissa = code & 0x0F
-    sample = ((mantissa << 3) + _MULAW_BIAS) << exponent
-    sample -= _MULAW_BIAS
+    sample = ((mantissa << 3) + 0x84) << exponent
+    sample -= 0x84
     return -sample if sign else sample
 
 
 def linear_to_alaw(sample: int) -> int:
-    """Encode one 16-bit linear sample to 8-bit A-law."""
+    """Encode one 16-bit linear sample to 8-bit A-law.
+
+    Note the inverted sign convention: a positive sample encodes with
+    the MSB *set* (the `0xD5` mask), unlike μ-law.
+    """
     sample = max(-32768, min(32767, int(sample)))
-    sign = 0x80 if sample < 0 else 0x00
-    if sample < 0:
-        sample = -sample
-    if sample > 32767:
-        sample = 32767
-    if sample >= 256:
-        exponent = 7
-        for exp in range(7, 0, -1):
-            if sample & (1 << (exp + 7)):
-                exponent = exp
-                break
-        mantissa = (sample >> (exponent + 3)) & 0x0F
-        code = (exponent << 4) | mantissa
+    if sample >= 0:
+        mask = 0xD5
     else:
-        code = (sample >> 4) & 0x0F
-    return (sign | code ^ 0x55) & 0xFF
+        mask = 0x55
+        sample = -sample - 1
+    segment = _segment(sample)
+    if segment >= 8:
+        return 0x7F ^ mask
+    value = segment << 4
+    if segment < 2:
+        value |= (sample >> 4) & 0x0F
+    else:
+        value |= (sample >> (segment + 3)) & 0x0F
+    return (value ^ mask) & 0xFF
 
 
 def alaw_to_linear(code: int) -> int:
-    """Decode one 8-bit A-law code to a 16-bit linear sample."""
+    """Decode one 8-bit A-law code to a 16-bit linear sample.
+
+    After the `0x55` toggle a set sign bit means *positive* (inverse of
+    μ-law); getting this backwards negates the whole signal.
+    """
     code = int(code) ^ 0x55
     sign = code & 0x80
     exponent = (code >> 4) & 0x07
@@ -81,7 +94,7 @@ def alaw_to_linear(code: int) -> int:
         sample = (mantissa << 4) + 8
     else:
         sample = ((mantissa << 4) + 0x108) << (exponent - 1)
-    return -sample if sign else sample
+    return sample if sign else -sample
 
 
 def encode_pcm16_to_ulaw(pcm: bytes) -> bytes:
@@ -89,18 +102,13 @@ def encode_pcm16_to_ulaw(pcm: bytes) -> bytes:
     if len(pcm) % 2 != 0:
         raise ValueError("pcm16 needs an even byte count")
     count = len(pcm) // 2
-    import struct
-
     samples = struct.unpack(f"<{count}h", pcm)
-    return bytes(linear_to_ulaw(s) for s in samples)
+    return bytes(linear_to_ulaw(sample) for sample in samples)
 
 
 def decode_ulaw_to_pcm16(payload: bytes) -> bytes:
     """Decode a PCMU payload to mono PCM16-LE bytes."""
-    import struct
-
-    samples = [ulaw_to_linear(b) for b in payload]
-    return struct.pack(f"<{len(samples)}h", *samples)
+    return struct.pack(f"<{len(payload)}h", *(ulaw_to_linear(b) for b in payload))
 
 
 def encode_pcm16_to_alaw(pcm: bytes) -> bytes:
@@ -108,15 +116,10 @@ def encode_pcm16_to_alaw(pcm: bytes) -> bytes:
     if len(pcm) % 2 != 0:
         raise ValueError("pcm16 needs an even byte count")
     count = len(pcm) // 2
-    import struct
-
     samples = struct.unpack(f"<{count}h", pcm)
-    return bytes(linear_to_alaw(s) for s in samples)
+    return bytes(linear_to_alaw(sample) for sample in samples)
 
 
 def decode_alaw_to_pcm16(payload: bytes) -> bytes:
     """Decode a PCMA payload to mono PCM16-LE bytes."""
-    import struct
-
-    samples = [alaw_to_linear(b) for b in payload]
-    return struct.pack(f"<{len(samples)}h", *samples)
+    return struct.pack(f"<{len(payload)}h", *(alaw_to_linear(b) for b in payload))

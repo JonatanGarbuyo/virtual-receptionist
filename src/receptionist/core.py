@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from receptionist.boundaries import (
+    VALID_DTMF_DIGITS,
     AudioFrame,
     CallIdGenerator,
     Clock,
@@ -25,6 +26,7 @@ from receptionist.alerting import (
     CODE_CONFIG_UNAVAILABLE,
     CODE_HISTORY_UNAVAILABLE,
     CODE_TELEPHONY_LOST,
+    CODE_TELEPHONY_MEDIA_LOST,
     CODE_TELEPHONY_NOT_REGISTERED,
     CODE_TRANSCRIPT_UNAVAILABLE,
     CODE_VOICE_BACKEND_NOT_READY,
@@ -335,6 +337,8 @@ class ReceptionistCore:
             self.health.mark_not_ready("telephony endpoint not registered")
         elif (HealthComponent.TELEPHONY, CODE_TELEPHONY_LOST) in active:
             self.health.mark_not_ready("telephony registration lost")
+        elif (HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST) in active:
+            self.health.mark_degraded("telephony media path lost")
         elif (HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN) in active:
             self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
         elif (HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE) in active or (
@@ -512,15 +516,34 @@ class ReceptionistCore:
             return
         if not isinstance(digit, str) or len(digit) != 1:
             return
-        if digit.upper() not in "0123456789ABCD*#":
+        if digit.upper() not in VALID_DTMF_DIGITS:
             return
 
     def on_remote_hold(self, call_id: str, held: bool) -> None:
         """Observe a remote hold/resume re-INVITE. Transport-level only:
-        media routing already pauses/resumes in the adapter; the session
-        needs no state change in v0.1."""
+        the adapter pauses TX/RX while held and flushes stale media on
+        resume, so the session needs no state change in v0.1."""
         if self._sessions.get(call_id) is None:
             return
+
+    def report_telephony_media(
+        self, healthy: bool, call_id: str = "", detail: str = ""
+    ) -> None:
+        """Project-owned media-health hook (story 23: registration *and*
+        media health). An RTP-timeout teardown degrades the service while
+        the media path is unverified; the next established call or a
+        fresh registration recovers it. Sanitized and edge-triggered
+        like every other condition: per-call details never alert."""
+        if healthy:
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST
+            )
+        else:
+            self.monitor.report_unhealthy(
+                HealthComponent.TELEPHONY,
+                CODE_TELEPHONY_MEDIA_LOST,
+            )
+        self._reconcile_health()
 
     # -- telephony registration health -----------------------------------
 
@@ -540,6 +563,11 @@ class ReceptionistCore:
             )
             self.monitor.report_recovered(
                 HealthComponent.TELEPHONY, CODE_TELEPHONY_LOST
+            )
+            # Fresh registration epoch invalidates pre-restart media
+            # evidence (mirrors the adapter's own recovery report).
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST
             )
         elif state in (
             TelephonyRegistrationState.STARTING,

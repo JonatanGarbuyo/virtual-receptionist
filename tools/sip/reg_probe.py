@@ -25,7 +25,7 @@ def main() -> int:
             registrar=registrar,
             bind="127.0.0.1",
             reg_interval=600,
-            extra_config_text="sip_listen 127.0.0.1:5098\n",
+            sip_listen="127.0.0.1:5098",
         )
     )
     state = adapter.start(timeout=12.0)

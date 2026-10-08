@@ -281,6 +281,48 @@ class EndCallTest(unittest.TestCase):
         self.assertEqual(len(calls.list_all()), 1)
 
 
+class PreAnswerCallerHangupTest(unittest.TestCase):
+    """CANCEL-equivalent at session level, deterministic: the caller
+    hangs up before the call is ever answered (INCOMING state). SIPp
+    cannot script this deterministically against a fast responder (the
+    200/CANCEL race), so the session contract carries the proof: reject
+    without answer, CALLER_HANGUP outcome, no voice resources."""
+
+    def test_hangup_while_incoming_rejects_without_answering(self) -> None:
+        from receptionist.call_session import CallSession
+        from receptionist.persistence import RuntimeStorage
+        from receptionist.policy import PolicyEngine
+
+        clock = FakeClock()
+        telephony = FakeTelephony()
+        session = CallSession(
+            call_id="call-9",
+            caller_id="+34910000009",
+            telephony=telephony,
+            voice=FakeVoiceBackend(),
+            greeting="Hola",
+            clock=clock,
+            policy_engine=PolicyEngine(
+                destinations={}, fallback_id="none", limits=Limits()
+            ),
+            runtime=RuntimeStorage(
+                calls=InMemoryCallRepository(),
+                messages=InMemoryMessageRepository(clock=clock),
+                transcripts=InMemoryTranscriptStore(),
+                audit=InMemoryAuditLog(),
+            ),
+        )
+        self.assertEqual(session.state, CallState.INCOMING)
+        # CANCEL before any answer: refuse, persist CALLER_HANGUP, open
+        # nothing (no answer, no voice session, no media).
+        session.handle_caller_hangup()
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertEqual(session.history, [CallState.INCOMING, CallState.ENDED])
+        self.assertEqual(telephony.answered, [])
+        self.assertEqual(telephony.rejected, ["call-9"])
+        self.assertIsNone(session.voice_session)
+
+
 class PolicyRejectTest(unittest.TestCase):
     def test_denied_call_is_rejected_without_answering(self) -> None:
         policy = FakePolicy(allow=False)

@@ -1,17 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- #25 s2: inbound INVITE declined at the SIP level.
-     Upstream limitation (baresip-python 0.5.2a3: reject()/hangup() on a
-     fresh inbound leg always raise StaleHandleError), worked around with
-     public primitives only: the adapter answers and releases immediately
-     (200 + BYE) instead of a bare 486. Deterministic expectation below.
-     If upstream fixes decline, this scenario upgrades to expect 486 and
-     the fallback is removed. Pass = call released promptly, slot freed,
-     no AI resources opened, exactly-once close adapter-side. -->
-<scenario name="uac_decline_release">
+<!-- #25 s2: inbound INVITE declined at the SIP level with 486.
+     The adapter rejects via native reject(); only on a lost race
+     (StaleHandle, e.g. a simultaneous remote CANCEL) does it fall back
+     to answer-then-release so the slot never leaks. Pass = exactly one
+     4xx final response and no established media. -->
+<scenario name="uac_expect_reject">
   <send retrans="500">
     <![CDATA[
       INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]-s2
       From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag02[call_number]
       To: <sip:[service]@[remote_ip]:[remote_port]>
       Call-ID: [call_id]
@@ -29,45 +26,29 @@
       t=0 0
       m=audio [media_port] RTP/AVP 0 8 101
       a=rtpmap:0 PCMU/8000
-a=rtpmap:8 PCMA/8000
+      a=rtpmap:8 PCMA/8000
       a=rtpmap:101 telephone-event/8000
       a=fmtp:101 0-15
     ]]>
   </send>
 
   <recv response="100" optional="true"/>
+  <!-- The stack occasionally emits the 180 twice for one INVITE; the
+       duplicate must not abort the scenario. -->
   <recv response="180" optional="true"/>
-  <recv response="200" rtd="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="486" rtd="true"/>
 
   <send>
     <![CDATA[
-      ACK sip:[remote_ip]:[remote_port] SIP/2.0
-      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+      ACK sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]-s2
       From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag02[call_number]
       To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
       Call-ID: [call_id]
       CSeq: 1 ACK
       Contact: <sip:sipp@[local_ip]:[local_port]>
       Max-Forwards: 70
-      Content-Length: 0
-    ]]>
-  </send>
-
-  <!-- No media-refresh block here: the decline release BYEs immediately
-       after establishment (before any refresh can fire), so the only
-       deterministic order is 200 -> ACK -> BYE. -->
-  <!-- the decline release: our BYE must arrive promptly -->
-  <recv request="BYE" rtd="true"/>
-
-  <send>
-    <![CDATA[
-      SIP/2.0 200 OK
-      [last_Via:]
-      [last_From:]
-      [last_To:]
-      [last_Call-ID:]
-      [last_CSeq:]
-      Contact: <sip:sipp@[local_ip]:[local_port]>
       Content-Length: 0
     ]]>
   </send>
