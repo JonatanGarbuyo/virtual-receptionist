@@ -3,21 +3,34 @@
 `evidence.json` is written by `tools/sip/run_matrix.py` (one file per
 run). Pinned artifacts of the final code:
 
-- `evidence-pcmu.json` — full matrix, PCMU-forced: **42/42 pass**.
-- `evidence-pcma.json` — full matrix, PCMA-forced: **42/42 pass**.
+- `evidence-pcmu.json` — full matrix, PCMU-forced: **46/46 pass**.
+- `evidence-pcma.json` — full matrix, PCMA-forced: **46/46 pass**.
 - `evidence.json` — copy of the latest run.
 
-42 checks per run: imaging/pbx/registration (9), SIPp scenarios +
-events (6: answer/BYE, 486 decline, hold/resume, CANCEL-equivalent at
-session level), media both directions + negotiated codec (6), DTMF (2),
-hold local/remote/direct (4), local hangup + 2-call isolation (4),
-direct leg (1), transfers ACCEPTED/REJECTED (3), re-registration
-verified + outage + media health + recovery (5), shutdown + zombies (2).
+46 checks per run: clean-tree provenance gate (1), imaging/pbx/
+registration (8), SIPp scenarios + events (6: answer/BYE + hangup +
+cleanup, 486 decline, hold/resume, RTP-timeout fault), media both
+directions + negotiated codec (7), DTMF (2), hold local/remote/direct
+(5), local hangup + 2-call isolation (4), direct leg (1), counterparty
+registration (1), transfers ACCEPTED/REJECTED (3), re-registration
+verified + outage + media health + recovery (6), shutdown + zombies (2).
 
 Each check carries its detail; the SIP timelines are redacted (no
 Authorization, no secrets). The gated unittest
 (`tests/test_telephony_integration.py`, `VR_RUN_SIP=1`) replays the
 matrix and fails on any non-pass.
+
+## Provenance (auditable two-step flow)
+
+Each evidence file records `meta.tested_code_sha` (the exact HEAD the
+matrix ran on) plus `meta.worktree_dirty` (uncommitted input paths,
+always empty here). `run_matrix.py` refuses to run on a dirty input
+tree (`worktree-clean` check; `--allow-dirty` override marks the
+evidence unattributable instead). Evidence outputs
+(`docs/evidence/`) are run products and never invalidate a run.
+Flow: commit code/scenario/harness → run both matrices clean →
+evidence/docs-only commit. The evidence commit's parent is the tested
+code commit.
 
 ## Binding decision
 
@@ -57,6 +70,12 @@ CANCEL) so the slot never leaks.
 
 - Post-answer in-dialog media refresh from the stack (~90 ms,
   full codec offer); peers answer it; scenarios script it.
+- Re-registration refresh is unregister-old-dialog + register-new-dialog
+  on the wire: the stack answers the expires-0 leg with 200 OK before
+  the re-register leg completes, so `refresh_registration()` waits for
+  outcome quiescence before reporting `fresh` (else a registrar query
+  in between observes the contact deleted — a real race, proven on
+  the wire, not a stale read).
 - Asterisk B2BUA terminates hold locally and never forwards re-INVITEs;
   a registered UA proxy-routes outbound INVITEs through its registrar
   (true direct legs need an unregistered counterparty).
