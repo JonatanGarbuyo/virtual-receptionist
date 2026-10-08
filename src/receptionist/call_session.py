@@ -444,6 +444,21 @@ class CallSession:
             return
         self._finish(self._pending_outcome or CallOutcome.COMPLETED)
 
+    def handle_media_failed(self, detail: str = "") -> None:
+        """Application decision for a dead local media stack on a live
+        dialog (adapter streak trip). The caller is still there and the
+        SIP leg still signals, so this enters the normal provider
+        failure path: PBX fallback handoff when configured, otherwise a
+        deterministic exit. Only ACTIVE sessions decide; closing/closed
+        sessions already own their outcome, and an in-flight failure is
+        never double-handled (late/repeated signals are no-ops)."""
+        del detail
+        if self._state is not CallState.ACTIVE:
+            return
+        if self._provider_terminal_failure:
+            return
+        self._fail_provider_path("local_media_failure")
+
     # -- voice events ------------------------------------------------------
 
     def _over_call_limit(self) -> bool:

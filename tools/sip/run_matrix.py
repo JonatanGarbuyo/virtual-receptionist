@@ -106,6 +106,7 @@ class RecordingListener:
         self.dtmf_events: dict[tuple[str, str], threading.Event] = {}
         self.holds: list[tuple[str, bool]] = []
         self.hold_events: dict[tuple[str, bool], threading.Event] = {}
+        self.media_failed: list[tuple[str, str]] = []
         self.threads: dict[str, set[str]] = collections.defaultdict(set)
 
     def _note(self, call_id: str) -> None:
@@ -150,6 +151,11 @@ class RecordingListener:
         with self._lock:
             self.holds.append((call_id, held))
             self.hold_events.setdefault((call_id, held), threading.Event()).set()
+
+    def on_media_failed(self, call_id: str, detail: str = "") -> None:
+        with self._lock:
+            self._note(call_id)
+            self.media_failed.append((call_id, detail))
 
     # -- wait helpers (fail-safe timeouts; correctness via content) ----
     def wait_answered(self, call_id: str, timeout: float = 15) -> bool:
@@ -536,7 +542,10 @@ def main() -> int:
     evidence["meta"]["asterisk"] = (ver.stdout or ver.stderr or "").strip()
     ver = docker("run", "--rm", "--entrypoint", "sipp", SIPP_IMAGE, "-v", timeout=60)
     evidence["meta"]["sipp"] = ((ver.stdout or "") + (ver.stderr or "")).strip().splitlines()[0:1]
-    if checks.failed and not args.keep:
+    # Fail fast when the pinned images do not build. worktree-clean is
+    # excluded: with --allow-dirty it fails by design (unattributable
+    # evidence) while the run itself must still proceed.
+    if any(item["id"].startswith("img-") for item in checks.failed) and not args.keep:
         return finish(evidence, checks, 1)
 
     # -- start disposable PBX -----------------------------------------
@@ -689,6 +698,10 @@ def main() -> int:
         def on_remote_hold(self, call_id: str, held: bool) -> None:
             self._a.on_remote_hold(call_id, held)
             self._b.on_remote_hold(call_id, held)
+
+        def on_media_failed(self, call_id: str, detail: str = "") -> None:
+            self._a.on_media_failed(call_id, detail)
+            self._b.on_media_failed(call_id, detail)
 
     adapter.set_listener(FanOut(chain, core_listener))
     core.start()

@@ -46,6 +46,13 @@ class TelephonyListener(Protocol):
     process restarts, SQLite, or network I/O inline — backends needing
     slow cancellation must defer it internally. Callbacks are
     lightweight: they record and return.
+
+    ``on_media_failed`` reports a persistently broken local media stack
+    (consecutive audio read/write failures) for a call whose SIP dialog
+    is still alive. The adapter never decides the business outcome: it
+    reports health and emits this signal, and the application chooses
+    PBX fallback or termination. Sources emit it edge-triggered (once
+    per failure streak); receivers must still be idempotent.
     """
 
     def on_answered(self, call_id: str) -> None: ...
@@ -55,6 +62,7 @@ class TelephonyListener(Protocol):
     def on_caller_audio(self, call_id: str, frame: AudioFrame) -> None: ...
     def on_dtmf(self, call_id: str, digit: str) -> None: ...
     def on_remote_hold(self, call_id: str, held: bool) -> None: ...
+    def on_media_failed(self, call_id: str, detail: str = "") -> None: ...
 
 
 class InboundCallHandler(Protocol):

@@ -486,6 +486,12 @@ class ReceptionistCore:
     def on_hangup_completed(self, call_id: str) -> None:
         self._dispatch(call_id, CallSession.handle_hangup_completed)
 
+    def on_media_failed(self, call_id: str, detail: str = "") -> None:
+        """Route a dead-local-media signal; the session owns the
+        fallback/termination decision. Eviction (and AI slot release)
+        follows the session's terminal transition through _dispatch."""
+        self._dispatch(call_id, CallSession.handle_media_failed, detail)
+
     def on_transfer_result(self, call_id: str, result: TransferResult) -> None:
         self._dispatch(call_id, CallSession.handle_transfer_result, result)
 

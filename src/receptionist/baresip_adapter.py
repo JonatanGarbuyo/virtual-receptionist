@@ -166,6 +166,13 @@ class _CallRecord:
     # discarded with the record.
     rx_dispatch: collections.deque = field(default_factory=collections.deque)
     rx_dropped_frames: int = 0
+    # Lifecycle events from the stack (established/closed/hold/dtmf) as
+    # small tuples, drained FIFO by the same per-call dispatcher before
+    # RX frames. Unlike media, these are never dropped: they are rare,
+    # tiny, and carry exactly-once close semantics. Enqueued by the
+    # loop-thread stack callbacks, which snapshot and return promptly
+    # so slow core work never stalls the shared SIP loop.
+    ev_dispatch: collections.deque = field(default_factory=collections.deque)
     rx_dispatch_started: bool = False
     rx_thread: Any = None
     rx_ready: threading.Event = field(default_factory=threading.Event)
@@ -884,7 +891,6 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 record.close_emitted = True
                 record.hangup_completed_emitted = True
                 self._calls.pop(app_id, None)
-                self._drop_cb_lock(app_id)
             else:
                 if record.close_emitted:
                     return
@@ -892,9 +898,14 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 record.remote_closed = True
             media_lost = "rtp" in reason.lower()
             if local or closed_first:
-                # Record (and its callback lock) drop with the close.
+                # Record drops with the close; its callback lock drops
+                # only AFTER the terminal delivery below, so delivery
+                # reuses the live serializer instead of resurrecting a
+                # permanent entry for a removed call.
                 self._calls.pop(app_id, None)
-                self._drop_cb_lock(app_id)
+                drop_lock_after = True
+            else:
+                drop_lock_after = False
         if media_lost:
             # RTP-timeout teardown: the media path died (vanished peer,
             # expired NAT, partition). Report it to health alongside the
@@ -910,6 +921,8 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             self._deliver(app_id, "on_hangup_completed")
         else:
             self._deliver(app_id, "on_caller_hangup")
+        if drop_lock_after:
+            self._drop_cb_lock(app_id)
 
     def _emit_hangup_completed(self, app_id: str) -> None:
         """Complete a locally-requested hangup against an already
@@ -920,8 +933,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 return
             record.hangup_completed_emitted = True
             self._calls.pop(app_id, None)
-            self._drop_cb_lock(app_id)
         self._deliver(app_id, "on_hangup_completed")
+        # Drop after delivery: delivering first reuses the live
+        # serializer instead of resurrecting a permanent entry.
+        self._drop_cb_lock(app_id)
 
     def _on_native_dtmf(self, app_id: str, digit: str) -> None:
         with self._lock:
@@ -1268,14 +1283,18 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 self._note_event(app_id, f"stack:{kind.name}")
             except Exception:
                 pass
+            # Snapshot and return: the per-call dispatcher owns all
+            # downstream core work, never the shared SIP loop thread.
             if kind is _Event.CALL_ESTABLISHED:
-                self._on_native_established(app_id)
+                self._enqueue_native_event(app_id, ("established",))
             elif kind is _Event.CALL_CLOSED:
-                self._on_native_closed(app_id, str(getattr(event, "text", "") or ""))
+                self._enqueue_native_event(
+                    app_id, ("closed", str(getattr(event, "text", "") or ""))
+                )
             elif kind is _Event.CALL_HOLD:
-                self._on_native_remote_hold(app_id, True)
+                self._enqueue_native_event(app_id, ("hold", True))
             elif kind is _Event.CALL_RESUME:
-                self._on_native_remote_hold(app_id, False)
+                self._enqueue_native_event(app_id, ("hold", False))
             elif kind is _Event.CALL_LOCAL_SDP:
                 try:
                     self._note_event(app_id, f"local-sdp:{event.text}")
@@ -1285,7 +1304,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         def on_dtmf(digit_event: Any) -> None:
             digit = str(getattr(digit_event, "digit", "") or "").upper()
             if len(digit) == 1 and digit in VALID_DTMF_DIGITS:
-                self._on_native_dtmf(app_id, digit)
+                self._enqueue_native_event(app_id, ("dtmf", digit))
 
         try:
             native_call.on(on_event)
@@ -1577,14 +1596,15 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         self._note_media_success(record, "rx")
 
     def _ensure_rx_dispatch(self, app_id: str) -> None:
-        """Start the per-call RX dispatcher thread (idempotent).
+        """Start the per-call dispatcher thread (idempotent).
 
-        Called on establishment: from then on, frames enqueued by
-        :meth:`_drain_rx` are delivered to the listener on this thread,
-        FIFO per call. The thread is a daemon and exits on its own when
-        the record leaves ``_calls`` or the adapter stops, so close
-        paths never join it (in particular a listener re-entrantly
-        hanging up from this thread cannot self-join).
+        Called on establishment and on the first enqueued stack event:
+        from then on, lifecycle events and RX frames are delivered to
+        the listener on this thread, FIFO per stream (lifecycle first).
+        The thread is a daemon and exits on its own when the record
+        leaves ``_calls`` or the adapter stops, so close paths never
+        join it (in particular a listener re-entrantly hanging up from
+        this thread cannot self-join).
         """
         with self._lock:
             record = self._calls.get(app_id)
@@ -1601,8 +1621,40 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             self._rx_threads[app_id] = thread
         thread.start()
 
+    def _enqueue_native_event(self, app_id: str, event: tuple) -> None:
+        """Snapshot one stack lifecycle event for per-call dispatch.
+
+        The production seam below the vendor-typed stack callbacks: the
+        loop thread calls this with plain data (kind plus payload) and
+        returns immediately, so slow core cancellation/fallback work can
+        never stall shared SIP dispatch. Drops the event when the call
+        is unknown (close already handled) or the adapter is stopping
+        (no callbacks after STOPPED).
+        """
+        with self._lock:
+            if not self._running:
+                return
+            record = self._calls.get(app_id)
+            if record is None:
+                return
+            record.ev_dispatch.append(event)
+            record.rx_ready.set()
+        self._ensure_rx_dispatch(app_id)
+
+    def _dispatch_native_event(self, app_id: str, event: tuple) -> None:
+        """Process one queued lifecycle event on the call dispatcher."""
+        kind = event[0] if event else None
+        if kind == "established":
+            self._on_native_established(app_id)
+        elif kind == "closed":
+            self._on_native_closed(app_id, str(event[1]) if len(event) > 1 else "")
+        elif kind == "hold":
+            self._on_native_remote_hold(app_id, bool(event[1]) if len(event) > 1 else False)
+        elif kind == "dtmf":
+            self._on_native_dtmf(app_id, str(event[1]) if len(event) > 1 else "")
+
     def _rx_dispatch_loop(self, app_id: str) -> None:
-        """Dispatcher body: deliver enqueued RX frames until close/stop."""
+        """Dispatcher body: lifecycle events then RX frames, until close/stop."""
         try:
             while self._is_running():
                 with self._lock:
@@ -1612,6 +1664,17 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                     ready = record.rx_ready
                 ready.wait(timeout=RX_DISPATCH_POLL_S)
                 ready.clear()
+                while True:
+                    with self._lock:
+                        if app_id not in self._calls:
+                            return
+                        record = self._calls[app_id]
+                        pending = list(record.ev_dispatch)
+                        record.ev_dispatch.clear()
+                    if not pending:
+                        break
+                    for native_event in pending:
+                        self._dispatch_native_event(app_id, native_event)
                 self._dispatch_once(app_id)
         finally:
             with self._lock:
@@ -1673,9 +1736,24 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         right). Callbacks must return fast: heavy backend work
         (model inference, process restarts, storage, network) must be
         deferred by the listener, never run inline on SIP/media threads.
+
+        Serializer entries live and die with their call record: delivery
+        for a removed id (late transfer outcomes, terminal closes)
+        still happens -- the core safely ignores unknown ids -- but
+        never resurrects a permanent entry.
         """
         listener = self._current_listener()
         if listener is None:
+            return
+        with self._lock:
+            known = call_id in self._calls
+        if not known:
+            if not self._is_running():
+                return
+            try:
+                getattr(listener, method)(call_id, *args)
+            except Exception:
+                pass
             return
         with self._cb_lock_for(call_id):
             if not self._is_running():
@@ -1703,13 +1781,15 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         """Account one consecutive TX/RX stack failure for one call.
 
         The streak trips :data:`MEDIA_ERROR_STREAK_LIMIT` exactly once:
-        one sanitized media-unhealthy transition plus a hangup of the
-        dead leg (a call that cannot move media cannot converse; hanging
-        up also frees the slot for new calls). Records already closing,
-        remote-closed, or held never trip -- their media path is
-        intentionally idle, and close routing owns their outcome. The
-        RTP-timeout path stays independent: it observes vanished peers,
-        this observes a broken local stack with a live dialog.
+        one sanitized media-unhealthy transition plus one project-owned
+        per-call media-failure signal. The adapter never decides the
+        business outcome: the application (core/session) chooses PBX
+        fallback handoff or termination, and only its hangup/transfer
+        closes the leg. Records already closing, remote-closed, or held
+        never trip -- their media path is intentionally idle, and close
+        routing owns their outcome. The RTP-timeout path stays
+        independent: it observes vanished peers, this observes a broken
+        local stack with a live dialog.
         """
         with self._lock:
             if record.app_id not in self._calls:
@@ -1724,18 +1804,16 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 streak = record.rx_error_streak
             trip = streak == MEDIA_ERROR_STREAK_LIMIT
         if trip:
+            detail = f"persistent {direction} media failure"
             LOG.warning(
                 "telephony media %s failure streak call_id=%s",
                 direction,
                 record.app_id,
             )
-            self._report_media(
-                False, record.app_id, f"persistent {direction} media failure"
-            )
-            try:
-                self.hangup(record.app_id)
-            except Exception:
-                pass
+            self._report_media(False, record.app_id, detail)
+            # Application decision, serialized per call like every other
+            # listener fan-out; never raises into the pump.
+            self._deliver(record.app_id, "on_media_failed", detail)
 
     def _note_media_success(self, record: _CallRecord, direction: str) -> None:
         """Reset one direction's failure streak: real media flowing
