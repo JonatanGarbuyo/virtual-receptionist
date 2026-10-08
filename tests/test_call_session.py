@@ -162,8 +162,43 @@ class ConversationLoopTest(unittest.TestCase):
         self.assertEqual(session.current_turn, 3)
         self.assertEqual(session.mode, ActiveMode.INFERENCE)
 
-    def test_caller_speech_while_greeting_barges_in(self) -> None:
-        # Barge-in is enabled by default (#24): speech over the greeting
+    def test_drain_finishes_on_tick_without_inbound_audio(self) -> None:
+        # M2: generation finished with TX still queued and the peer then
+        # sends no RTP (silence suppression). Driving only the periodic
+        # app clock must flip SPEAKING to LISTENING once TX drains, and
+        # the normal silence policy must resume afterwards.
+        from receptionist.audio import make_frame, tone_pcm
+        from receptionist.call_session import NO_INPUT_REPROMPT
+
+        core, telephony, voice, clock, _ = make_core()
+        core.start()
+        session = core.incoming_call("+34910000001")
+        backend = voice.sessions["call-1"]
+        backend.finish_playback(1)
+        backend.deliver_caller_speech("Quisiera hablar con ventas")
+        backend.deliver_response("Le comunico con ventas.", 2)
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        telephony.send_audio(
+            "call-1",
+            make_frame(tone_pcm(duration_seconds=0.5, sample_rate=16000), 16000),
+        )
+        backend.finish_playback(2)
+        # Generation end with playout pending: still speaking, drain
+        # armed, and no inbound frames arrive from here on.
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        self.assertGreater(telephony.playout_pending_bytes("call-1"), 0)
+        # TX drains with zero inbound RTP; only the tick runs.
+        telephony.drain_playout("call-1", 1 << 30)
+        self.assertEqual(telephony.playout_pending_bytes("call-1"), 0)
+        core.tick()
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+        # Normal silence policy resumes: reprompt after one window.
+        clock.advance(30.0)
+        core.tick()
+        spoken = [text for text, _ in backend.spoken]
+        self.assertIn(NO_INPUT_REPROMPT, spoken)
+
+    def test_caller_speech_while_greeting_barges_in(self) -> None:        # Barge-in is enabled by default (#24): speech over the greeting
         # cancels the greeting output and opens a fresh inference turn.
         from receptionist.boundaries import CancelReason
 

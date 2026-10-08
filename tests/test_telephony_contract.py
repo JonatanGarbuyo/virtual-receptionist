@@ -707,12 +707,13 @@ class AdapterBackpressureTest(unittest.TestCase):
         adapter._running = True  # noqa: SLF001 (listener delivery gate)
         record = _CallRecord(app_id="call-1", native=_NativeStub())
         adapter._calls["call-1"] = record  # noqa: SLF001
-        # Healthy: TX drains, RX delivers.
+        # Healthy: TX drains, RX enqueues; dispatch delivers.
         adapter.send_audio("call-1", make_frame(
             tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
         adapter._pump_tx(record)  # noqa: SLF001
         self.assertTrue(written)
         adapter._drain_rx(record)  # noqa: SLF001
+        adapter._dispatch_once("call-1")  # noqa: SLF001
         self.assertTrue(delivered)
         # Remote hold: neither direction flows.
         written.clear()
@@ -723,12 +724,115 @@ class AdapterBackpressureTest(unittest.TestCase):
         adapter._pump_tx(record)  # noqa: SLF001
         self.assertEqual(written, [])
         adapter._drain_rx(record)  # noqa: SLF001
+        adapter._dispatch_once("call-1")  # noqa: SLF001
         self.assertEqual(delivered, [])
         # Resume flushes stale media; flow restores after.
         adapter._on_native_remote_hold("call-1", False)  # noqa: SLF001
         self.assertFalse(record.remote_hold)
         adapter._drain_rx(record)  # noqa: SLF001
+        adapter._dispatch_once("call-1")  # noqa: SLF001
         self.assertTrue(delivered)
+
+    def test_blocked_listener_cannot_stall_other_call_media(self) -> None:
+        """M1: a call blocked in on_caller_audio must not stall call B.
+
+        Call A's listener blocks on a barrier (barge-in cancelling
+        STT/LLM output, which can take seconds). Driving the production
+        pump path (``_pump_once``) must still pump TX and enqueue RX for
+        both calls and deliver B's audio; A's frame waits in its FIFO
+        and is delivered in order once unblocked. Barrier/Event waits
+        carry timeouts as fail-safes only, never as the mechanism.
+        """
+        import threading
+        from types import SimpleNamespace
+
+        from receptionist.baresip_adapter import BaresipTelephonyAdapter, _CallRecord
+        from receptionist.telephony_config import TelephonyConfig
+
+        written_b: list = []
+        delivered_a: list = []
+        delivered_b: list = []
+        unblock_a = threading.Event()
+        a_done = threading.Event()
+        b_done = threading.Event()
+
+        class _AudioStub:
+            def __init__(self, written: list | None = None) -> None:
+                self._written = written
+
+            def info(self):  # noqa: ANN202
+                return SimpleNamespace(
+                    tx_sample_rate=8000, rx_sample_rate=8000
+                )
+
+            def write(self, pcm) -> int:  # noqa: ANN001, ANN202
+                if self._written is not None:
+                    self._written.append(bytes(pcm))
+                return len(pcm)
+
+            def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
+                return tone_pcm(duration_seconds=0.02, sample_rate=8000)[:max_bytes]
+
+        class _BlockingListener:
+            def on_caller_audio(self, call_id: str, frame) -> None:  # noqa: ANN001, ANN202
+                if call_id == "call-a":
+                    # Simulate blocking barge-in cancellation.
+                    self._entered_a.set()
+                    unblock_a.wait(timeout=10)
+                    delivered_a.append((call_id, frame))
+                    a_done.set()
+                else:
+                    delivered_b.append((call_id, frame))
+                    b_done.set()
+
+            def __init__(self) -> None:
+                self._entered_a = threading.Event()
+
+        class _NativeStub:
+            def __init__(self, written: list | None = None) -> None:
+                self.audio = _AudioStub(written)
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        listener = _BlockingListener()
+        adapter.set_listener(listener)
+        adapter._running = True  # noqa: SLF001 (listener delivery gate)
+        record_a = _CallRecord(app_id="call-a", native=_NativeStub())
+        record_b = _CallRecord(app_id="call-b", native=_NativeStub(written_b))
+        adapter._calls["call-a"] = record_a  # noqa: SLF001
+        adapter._calls["call-b"] = record_b  # noqa: SLF001
+        adapter.send_audio("call-b", make_frame(
+            tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+        # Production dispatch path for A (its own dispatcher thread,
+        # as started at establishment); the pump itself runs below on
+        # this thread.
+        adapter._ensure_rx_dispatch("call-a")  # noqa: SLF001
+        adapter._ensure_rx_dispatch("call-b")  # noqa: SLF001
+        try:
+            # One production pump pass: TX for B plus RX enqueue for
+            # both calls. It must return promptly even though A's
+            # delivery is about to block.
+            adapter._pump_once()  # noqa: SLF001
+            # B's TX was pumped by the shared pump.
+            self.assertTrue(written_b)
+            # B's audio is delivered while A stays blocked.
+            self.assertTrue(b_done.wait(timeout=5))
+            self.assertTrue(listener._entered_a.wait(timeout=5))
+            self.assertEqual(delivered_a, [])
+            # Release A: its queued frame is delivered in order.
+            unblock_a.set()
+            self.assertTrue(a_done.wait(timeout=5))
+            self.assertEqual(len(delivered_a), 1)
+            self.assertEqual(delivered_a[0][0], "call-a")
+        finally:
+            unblock_a.set()
+            adapter._calls.pop("call-a", None)  # noqa: SLF001
+            adapter._calls.pop("call-b", None)  # noqa: SLF001
+            for record in (record_a, record_b):
+                thread = record.rx_thread
+                if thread is not None:
+                    thread.join(timeout=5)
 
     def test_transfer_watchdog_reports_timeout_when_open(self) -> None:
         from receptionist.baresip_adapter import BaresipTelephonyAdapter, _CallRecord
@@ -750,6 +854,179 @@ class AdapterBackpressureTest(unittest.TestCase):
         # Second firing is a no-op (already closed out).
         adapter._transfer_watchdog_fired("call-9")  # noqa: SLF001
         self.assertEqual(results, [("call-9", TransferResult.TIMEOUT)])
+
+
+class MediaErrorStreakTest(unittest.TestCase):
+    """M3: persistent local media failure must surface exactly once."""
+
+    def _adapter(self):
+        from receptionist.baresip_adapter import BaresipTelephonyAdapter
+        from receptionist.telephony_config import TelephonyConfig
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter._running = True  # noqa: SLF001 (listener delivery gate)
+        return adapter
+
+    def test_persistent_tx_failure_reports_once_and_hangs_up(self) -> None:
+        from types import SimpleNamespace
+
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+
+        states: list = []
+
+        class _StatusStub:
+            def on_registration_state(self, state, detail="") -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_media_state(self, healthy, call_id="", detail="") -> None:  # noqa: ANN001, ANN202
+                states.append((healthy, call_id))
+
+        class _AudioStub:
+            def info(self):  # noqa: ANN202
+                return SimpleNamespace(
+                    tx_sample_rate=8000, rx_sample_rate=8000
+                )
+
+            def write(self, pcm) -> int:  # noqa: ANN001, ANN202
+                raise RuntimeError("aumem write broken")
+
+            def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
+                return b""
+
+        class _NativeStub:
+            audio = _AudioStub()
+
+        adapter = self._adapter()
+        adapter.set_status_listener(_StatusStub())
+        record = _CallRecord(app_id="call-tx", native=_NativeStub())
+        adapter._calls["call-tx"] = record  # noqa: SLF001
+        adapter.send_audio("call-tx", make_frame(
+            tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+        for _ in range(MEDIA_ERROR_STREAK_LIMIT + 10):
+            adapter._pump_tx(record)  # noqa: SLF001
+        # Exactly one unhealthy transition (no per-frame spam) naming
+        # the call, and the dead leg is released.
+        unhealthy = [s for s in states if s[0] is False]
+        self.assertEqual(len(unhealthy), 1)
+        self.assertEqual(unhealthy[0][1], "call-tx")
+        self.assertTrue(record.local_close)
+        self.assertEqual(record.tx_errors, MEDIA_ERROR_STREAK_LIMIT + 10)
+
+    def test_persistent_rx_failure_reports_once_and_hangs_up(self) -> None:
+        from types import SimpleNamespace
+
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+
+        states: list = []
+
+        class _StatusStub:
+            def on_registration_state(self, state, detail="") -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_media_state(self, healthy, call_id="", detail="") -> None:  # noqa: ANN001, ANN202
+                states.append((healthy, call_id))
+
+        class _AudioStub:
+            def info(self):  # noqa: ANN202
+                return SimpleNamespace(
+                    tx_sample_rate=8000, rx_sample_rate=8000
+                )
+
+            def write(self, pcm) -> int:  # noqa: ANN001, ANN202
+                return len(pcm)
+
+            def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
+                raise RuntimeError("aumem read broken")
+
+        class _NativeStub:
+            audio = _AudioStub()
+
+        adapter = self._adapter()
+        adapter.set_status_listener(_StatusStub())
+        record = _CallRecord(app_id="call-rx", native=_NativeStub())
+        adapter._calls["call-rx"] = record  # noqa: SLF001
+        for _ in range(MEDIA_ERROR_STREAK_LIMIT + 10):
+            adapter._drain_rx(record)  # noqa: SLF001
+        unhealthy = [s for s in states if s[0] is False]
+        self.assertEqual(len(unhealthy), 1)
+        self.assertEqual(unhealthy[0][1], "call-rx")
+        self.assertTrue(record.local_close)
+
+    def test_media_success_resets_streak_and_recovers(self) -> None:
+        from types import SimpleNamespace
+
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+
+        states: list = []
+        failing = True
+
+        class _StatusStub:
+            def on_registration_state(self, state, detail="") -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_media_state(self, healthy, call_id="", detail="") -> None:  # noqa: ANN001, ANN202
+                states.append((healthy, call_id))
+
+        class _AudioStub:
+            def info(self):  # noqa: ANN202
+                return SimpleNamespace(
+                    tx_sample_rate=8000, rx_sample_rate=8000
+                )
+
+            def write(self, pcm) -> int:  # noqa: ANN001, ANN202
+                if failing:
+                    raise RuntimeError("transient write failure")
+                return len(pcm)
+
+            def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
+                return b""
+
+        class _NativeStub:
+            audio = _AudioStub()
+
+        adapter = self._adapter()
+        adapter.set_status_listener(_StatusStub())
+        record = _CallRecord(app_id="call-flap", native=_NativeStub())
+        adapter._calls["call-flap"] = record  # noqa: SLF001
+        # Blips below the limit never surface ...
+        for _ in range(MEDIA_ERROR_STREAK_LIMIT - 1):
+            adapter.send_audio("call-flap", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_tx(record)  # noqa: SLF001
+        self.assertEqual(
+            [s for s in states if s[0] is False], []
+        )
+        # ... and one success forgets the whole streak ...
+        failing = False
+        adapter.send_audio("call-flap", make_frame(
+            tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+        adapter._pump_tx(record)  # noqa: SLF001
+        self.assertEqual(record.tx_error_streak, 0)
+        # ... so a fresh full streak is required to trip.
+        failing = True
+        for _ in range(MEDIA_ERROR_STREAK_LIMIT - 1):
+            adapter.send_audio("call-flap", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_tx(record)  # noqa: SLF001
+        self.assertEqual(
+            [s for s in states if s[0] is False], []
+        )
+        adapter.send_audio("call-flap", make_frame(
+            tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+        adapter._pump_tx(record)  # noqa: SLF001
+        unhealthy = [s for s in states if s[0] is False]
+        self.assertEqual(len(unhealthy), 1)
 
     def test_declined_leg_never_emits_answered(self) -> None:
         from receptionist.baresip_adapter import BaresipTelephonyAdapter, _CallRecord

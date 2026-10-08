@@ -465,14 +465,24 @@ class CallSession:
 
         Terminates past-deadline calls; exits expired message capture
         back to listening; reprompts once after a silence window and
-        falls back after the second. Returns True when the call was
-        terminated.
+        falls back after the second. Completes a deferred
+        playback-finished transition whose playout drained without any
+        inbound media (silence-suppressed peer): without this poll the
+        session would stay SPEAKING forever and no-input handling would
+        never start. Returns True when the call was terminated.
         """
         with self._lock:
             if self._state in (CallState.TERMINATING, CallState.ENDED):
                 return False
             if self._terminate_if_over_limit():
                 return True
+            # Drain completion is independent of inbound RTP: the peer
+            # may send nothing while listening, so the periodic tick is
+            # the backstop that flips SPEAKING to LISTENING once TX
+            # drained. Cancellation/handoff clear _awaiting_drain, and a
+            # newer turn ignores the stale flag via turn identity, so a
+            # late drain can never move a newer turn.
+            self._maybe_finish_drain()
             self._enforce_capture_expiry()
             self._enforce_no_input()
             return False
@@ -793,7 +803,8 @@ class CallSession:
             # Generation end is not RTP drain: the adapter may still
             # hold seconds of queued playout. Stay speaking (barge-in
             # armed) until the queue actually drains; the flip happens
-            # in _maybe_finish_drain on the next media/commit event.
+            # in _maybe_finish_drain on the next media/commit event or
+            # periodic tick.
             if self._playout_drained():
                 self._mode = ActiveMode.LISTENING
             else:
@@ -811,8 +822,12 @@ class CallSession:
 
     def _maybe_finish_drain(self) -> None:
         """Complete a deferred playback-finished transition once RTP
-        actually drained. Called on media/commit entry points (caller
-        must hold the session lock)."""
+        actually drained. Called on media/commit entry points and on the
+        periodic timeout tick (caller must hold the session lock). Only
+        acts while _awaiting_drain is set; cancellation, barge-in,
+        handoff, and finish all clear the flag, and turn identity guards
+        the playback-finished setter, so a late drain never moves a
+        newer turn."""
         if not self._awaiting_drain:
             return
         if not self._playout_drained():

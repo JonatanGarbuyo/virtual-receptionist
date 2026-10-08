@@ -352,6 +352,7 @@ def run_sipp(
         "uac_answer_bye.xml": "5061",
         "uac_expect_reject.xml": "5062",
         "uac_hold_resume.xml": "5063",
+        "uac_rtp_timeout.xml": "5064",
     }
     cmd = [
         "docker", "run", "--rm", "--network", "host",
@@ -422,6 +423,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--codecs", default="pcmu")
+    parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help="run despite uncommitted code/harness changes (development "
+        "only: evidence is then NOT attributable to tested_code_sha)",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     checks = Check()
@@ -468,6 +474,29 @@ def main() -> int:
         "started_at": started_at,
         "head_sha": head_sha,
     }
+    # -- code provenance gate (M4) --------------------------------------
+    # Auditable two-step flow: commit code/scenario/harness first, then
+    # run matrices from the clean tree so tested_code_sha names exactly
+    # what ran. head_sha above and tested_code_sha must agree on a clean
+    # tree; dirty input trees fail fast (override with --allow-dirty
+    # for iteration; that evidence is explicitly unattributable).
+    # Evidence outputs (docs/evidence/) are run products, not inputs,
+    # and never invalidate a run.
+    _code_sha, _dirty_inputs = code_provenance()
+    evidence["meta"]["tested_code_sha"] = _code_sha
+    evidence["meta"]["worktree_dirty"] = _dirty_inputs
+    evidence["meta"]["allow_dirty"] = bool(args.allow_dirty)
+    _clean = not _dirty_inputs
+    checks.record("worktree-clean", "matrix runs from a clean input tree",
+                   _clean,
+                   "clean" if _clean else
+                   f"dirty_inputs={_dirty_inputs[:10]}")
+    if _dirty_inputs and not args.allow_dirty:
+        checks.record("worktree-abort", "no run on dirty input tree",
+                       False,
+                       f"commit code first or re-run with --allow-dirty "
+                       f"(evidence then not attributable to {_code_sha})")
+        return finish(evidence, checks, 1)
     try:
         import baresip
 
@@ -729,6 +758,35 @@ def main() -> int:
     checks.record("sipp-hold", "re-INVITE hold/resume answered + observed",
                    rc == 0 and got_hold, f"rc={rc} holds={holds[-4:]}")
     evidence["sip_timelines"]["s3"] = timeline_of(out)
+
+    # -- SIPp s4: RTP-timeout fault -----------------------------------------
+    # Scripted fault/media scenario per #25: an established dialog with
+    # zero RTP from the peer must be closed by the adapter's RTP
+    # timeout. Observable outcome: the adapter emits caller_hangup for
+    # the faulted call, the telephony media condition degrades, and
+    # the session is evicted. The scenario itself fails (rc != 0) when
+    # no BYE arrives, so silence can never count as coverage.
+    from receptionist.alerting import (
+        CODE_TELEPHONY_MEDIA_LOST as _MEDIA_LOST_S4,
+    )
+    from receptionist.alerting import HealthComponent as _HC_S4
+
+    answered_before_s4 = set(listener.answered)
+    rc, out = run_sipp("uac_rtp_timeout.xml", ADAPTER_SIP, timeout=25)
+    evidence["sip_timelines"]["s4"] = timeline_of(out)
+    fault_ids = sorted(set(listener.answered) - answered_before_s4)
+    app_f = fault_ids[-1] if fault_ids else None
+    hung_f = app_f is not None and listener.caller_hangup.get(app_f, 0) >= 1
+    media_bad_s4 = any(
+        c.component is _HC_S4.TELEPHONY and c.code == _MEDIA_LOST_S4
+        for c in core.monitor.active_conditions()
+    )
+    evicted_f = app_f is not None and core.get_session(app_f) is None
+    checks.record("sipp-rtp-timeout",
+                   "no-RTP dialog closed by RTP timeout + media health",
+                   rc == 0 and hung_f and media_bad_s4 and evicted_f,
+                   f"rc={rc} app={app_f} hung={hung_f} "
+                   f"media_lost={media_bad_s4} evicted={evicted_f}")
 
     # NOTE (no s5 CANCEL scenario): CANCEL-before-answer against a fast
     # responder is inherently racy for strict SIPp (the 200/CANCEL order
@@ -1356,6 +1414,42 @@ def timeline_of(sipp_output: str) -> list[str]:
         if not seen or seen[-1] != entry:
             seen.append(entry)
     return seen[-40:]
+
+
+# Evidence outputs are run products, not inputs: they never invalidate
+# a run. Everything else must be committed (see --allow-dirty).
+_PROVENANCE_IGNORED_PREFIXES = ("docs/evidence/",)
+
+
+def code_provenance() -> tuple[str, list[str]]:
+    """(HEAD sha, dirty input paths) for auditable matrix evidence.
+
+    `tested_code_sha` names the exact code tree under test. A run made
+    after editing code/scenario/harness but before committing would be
+    stamped with the parent SHA while testing something else entirely;
+    the dirty list exposes exactly that situation.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            timeout=30, cwd=REPO,
+        )
+        sha = (proc.stdout or "").strip() or "unknown"
+    except Exception:
+        sha = "unknown"
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True,
+            timeout=30, cwd=REPO,
+        )
+        dirty = []
+        for line in (proc.stdout or "").splitlines():
+            path = line[3:].strip().split(" -> ")[-1]
+            if path and not path.startswith(_PROVENANCE_IGNORED_PREFIXES):
+                dirty.append(line.strip())
+    except Exception:
+        dirty = []
+    return sha, dirty
 
 
 def snapshot_adapter_events(evidence: dict, adapter) -> None:

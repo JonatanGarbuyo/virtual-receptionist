@@ -24,6 +24,11 @@ Three roles, deliberately separated (spec #17):
     `reject()`; answer-then-release fallback only on a lost race —
     see decline note below).
   - `uac_hold_resume`: re-INVITE hold/resume with SDP answers.
+  - `uac_rtp_timeout` (fault): established dialog with zero RTP from
+    the peer; the adapter's RTP timeout must close it with BYE. The
+    matrix asserts the hangup, the telephony media-health condition,
+    and session eviction — and the scenario itself fails when no BYE
+    arrives, so silence never counts as coverage.
 - `caller.py` — counterparty process (JSON protocol on stdin/stdout).
 - `reg_probe.py` — negative registration probe (own process).
 - `run_matrix.py` — the full matrix; writes

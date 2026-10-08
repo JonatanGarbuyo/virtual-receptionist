@@ -123,6 +123,28 @@ RX_READ_BYTES = 640
 #: Media pump period in seconds.
 MEDIA_PERIOD = 0.01
 
+#: Per-call RX dispatch queue bound (frames of 20 ms): caller audio
+#: read from the stack is enqueued here by the media pump and delivered
+#: to the listener by a dedicated per-call dispatcher thread. The pump
+#: itself never runs listener code, so a call blocked inside
+#: ``on_caller_audio`` (barge-in cancelling STT/LLM output, which can
+#: take seconds) cannot stall TX/RX for other calls. Full queues drop
+#: oldest-first and count ``rx_dropped_frames`` (same policy as TX).
+RX_DISPATCH_MAX_FRAMES = 50
+
+#: RX dispatcher poll period: prompt delivery via the per-record event,
+#: with a bounded poll fallback so a missed wakeup never stalls a call.
+RX_DISPATCH_POLL_S = 0.05
+
+#: Consecutive media-failure trip: this many back-to-back TX (or RX)
+#: stack failures on one call converts dead media into one
+#: project-owned media-unhealthy transition plus a hangup of the dead
+#: leg. At the 10 ms pump period this is ~0.5 s of fully dead media;
+#: isolated blips never trip it, and any successful media resets the
+#: streak. Fires exactly once per streak (equality, not >=), so a
+#: lingering failure cannot spam health transitions.
+MEDIA_ERROR_STREAK_LIMIT = 50
+
 
 @dataclass
 class _CallRecord:
@@ -135,6 +157,18 @@ class _CallRecord:
     tx_bytes: int = 0
     tx_dropped_bytes: int = 0
     rx_seq: int = 0
+    # RX dispatch: frames the media pump has read but not yet delivered
+    # to the listener. A dedicated per-call dispatcher thread (started at
+    # establishment) drains this FIFO in order; the pump only enqueues,
+    # so listener work -- including blocking barge-in cancellation --
+    # never stalls the shared media pump. Bounded oldest-drop with a
+    # drop counter; pending audio is meaningless after close and is
+    # discarded with the record.
+    rx_dispatch: collections.deque = field(default_factory=collections.deque)
+    rx_dropped_frames: int = 0
+    rx_dispatch_started: bool = False
+    rx_thread: Any = None
+    rx_ready: threading.Event = field(default_factory=threading.Event)
     tx_rate: int = DEFAULT_LINE_RATE
     rx_rate: int = DEFAULT_LINE_RATE
     local_hold: bool = False
@@ -161,6 +195,11 @@ class _CallRecord:
     # live call with dead media and no signal.
     tx_errors: int = 0
     rx_errors: int = 0
+    # Consecutive-failure streaks backing the bounded trip policy (see
+    # MEDIA_ERROR_STREAK_LIMIT): any successful media resets the
+    # streak for that direction.
+    tx_error_streak: int = 0
+    rx_error_streak: int = 0
 
 
 class BaresipTelephonyAdapter(TelephonyAdapter):
@@ -188,6 +227,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         # the per-call serializer. Entries are dropped with their call
         # record.
         self._cb_locks: dict[str, threading.RLock] = {}
+        # RX dispatcher threads by call id (see _ensure_rx_dispatch):
+        # joined boundedly at shutdown, self-exiting on record removal.
+        self._rx_threads: dict[str, threading.Thread] = {}
         self._admit_queue: queue.Queue | None = None
         self._admit_thread: threading.Thread | None = None
         self._admit_inflight = 0
@@ -397,6 +439,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             media_thread = self._media_thread
             admit_thread = self._admit_thread
             admit_queue = self._admit_queue
+            rx_threads = list(self._rx_threads.values())
+            for record in list(self._calls.values()):
+                record.rx_ready.set()
             calls = list(self._calls.values())
             self._pending.clear()
         for record in calls:
@@ -436,6 +481,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 pass
         if admit_thread is not None and admit_thread is not threading.current_thread():
             admit_thread.join(timeout=5)
+        me = threading.current_thread()
+        for rx_thread in rx_threads:
+            if rx_thread is not me:
+                rx_thread.join(timeout=5)
         with self._lock:
             self._loop = None
             self._loop_thread = None
@@ -443,6 +492,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             self._admit_thread = None
             self._admit_queue = None
             self._admit_inflight = 0
+            self._rx_threads.clear()
             self._runtime = None
             self._ua = None
             self._calls.clear()
@@ -920,6 +970,11 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             # Media path verified working again (or for the first time):
             # lift any media-lost degradation.
             self._report_media(True, app_id, "established")
+            if not declining:
+                # From here on the pump reads caller audio; deliver it on
+                # the per-call dispatcher so listener work (barge-in
+                # cancellation included) never stalls the shared pump.
+                self._ensure_rx_dispatch(app_id)
             self._deliver(app_id, "on_answered")
 
     # -- internals -------------------------------------------------------
@@ -1363,7 +1418,12 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         thread.start()
 
     def _media_pump(self) -> None:
-        """Single media thread: TX pump then RX drain per live call."""
+        """Single media thread: TX pump then RX drain per live call.
+
+        RX drain only enqueues frames for the per-call dispatcher
+        threads; no listener code runs here, so one call's blocking
+        listener work can never stall another call's media.
+        """
         while self._is_running():
             try:
                 self._pump_once()
@@ -1401,6 +1461,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             with self._lock:
                 record.tx.appendleft(chunk)
                 record.tx_bytes += len(chunk)
+            self._note_media_error(record, "tx")
             return
         try:
             try:
@@ -1409,6 +1470,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 pass
             accepted = audio.write(chunk)
+            self._note_media_success(record, "tx")
             with self._lock:
                 record.tx_accepted_total += max(0, accepted)
                 if record.first_tx_at is None and accepted > 0:
@@ -1424,10 +1486,12 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             # old code dropped the chunk silently whenever the re-probe
             # succeeded -- a live call with vanishing audio and no
             # signal. AudioRestarted additionally counts renegotiations.
+            # The consecutive streak feeds the bounded trip policy.
             with self._lock:
                 record.tx_errors += 1
                 if type(error).__name__ == "AudioRestarted":
                     record.audio_restarts += 1
+            self._note_media_error(record, "tx")
             try:
                 audio.info()
             except Exception:
@@ -1458,12 +1522,14 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         except Exception:
             with self._lock:
                 record.rx_errors += 1
+            self._note_media_error(record, "rx")
             return
         try:
             raw = audio.read(RX_READ_BYTES)
         except Exception:
             with self._lock:
                 record.rx_errors += 1
+            self._note_media_error(record, "rx")
             return
         if not raw:
             return
@@ -1478,6 +1544,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         except Exception:
             with self._lock:
                 record.rx_errors += 1
+            self._note_media_error(record, "rx")
             return
         with self._lock:
             if record.local_hold or record.remote_hold or record.close_emitted:
@@ -1496,9 +1563,81 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             )
         except Exception:
             return
-        # Late close racing this delivery is benign: unknown ids and
+        # Late close racing this delivery is benign: the dispatcher
+        # re-checks membership per frame, and unknown ids and
         # wrong-state frames are dropped by the core/session.
-        self._deliver(record.app_id, "on_caller_audio", frame)
+        with self._lock:
+            if record.app_id not in self._calls:
+                return
+            if len(record.rx_dispatch) >= RX_DISPATCH_MAX_FRAMES:
+                record.rx_dispatch.popleft()
+                record.rx_dropped_frames += 1
+            record.rx_dispatch.append(frame)
+            record.rx_ready.set()
+        self._note_media_success(record, "rx")
+
+    def _ensure_rx_dispatch(self, app_id: str) -> None:
+        """Start the per-call RX dispatcher thread (idempotent).
+
+        Called on establishment: from then on, frames enqueued by
+        :meth:`_drain_rx` are delivered to the listener on this thread,
+        FIFO per call. The thread is a daemon and exits on its own when
+        the record leaves ``_calls`` or the adapter stops, so close
+        paths never join it (in particular a listener re-entrantly
+        hanging up from this thread cannot self-join).
+        """
+        with self._lock:
+            record = self._calls.get(app_id)
+            if record is None or record.rx_dispatch_started:
+                return
+            record.rx_dispatch_started = True
+            thread = threading.Thread(
+                target=self._rx_dispatch_loop,
+                args=(app_id,),
+                name=f"baresip-rx-{app_id}",
+                daemon=True,
+            )
+            record.rx_thread = thread
+            self._rx_threads[app_id] = thread
+        thread.start()
+
+    def _rx_dispatch_loop(self, app_id: str) -> None:
+        """Dispatcher body: deliver enqueued RX frames until close/stop."""
+        try:
+            while self._is_running():
+                with self._lock:
+                    if app_id not in self._calls:
+                        return
+                    record = self._calls[app_id]
+                    ready = record.rx_ready
+                ready.wait(timeout=RX_DISPATCH_POLL_S)
+                ready.clear()
+                self._dispatch_once(app_id)
+        finally:
+            with self._lock:
+                if self._rx_threads.get(app_id) is threading.current_thread():
+                    self._rx_threads.pop(app_id, None)
+
+    def _dispatch_once(self, app_id: str) -> None:
+        """Deliver all currently enqueued RX frames for one call, FIFO.
+
+        The shared unit of delivery work: dispatcher threads call this
+        when signalled, and deterministic tests call it directly (no
+        threads, no sleeps). Membership is re-checked per frame so a
+        close racing the drain discards the tail instead of delivering
+        caller audio into a dead call.
+        """
+        with self._lock:
+            record = self._calls.get(app_id)
+            if record is None:
+                return
+            frames = list(record.rx_dispatch)
+            record.rx_dispatch.clear()
+        for frame in frames:
+            with self._lock:
+                if app_id not in self._calls:
+                    return
+            self._deliver(app_id, "on_caller_audio", frame)
 
     # -- small helpers ----------------------------------------------------
 
@@ -1559,6 +1698,54 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             # evidence: recovery here keeps re-registration restorative.
             if state is TelephonyRegistrationState.REGISTERED:
                 self._report_media(True, "", "re-registered")
+
+    def _note_media_error(self, record: _CallRecord, direction: str) -> None:
+        """Account one consecutive TX/RX stack failure for one call.
+
+        The streak trips :data:`MEDIA_ERROR_STREAK_LIMIT` exactly once:
+        one sanitized media-unhealthy transition plus a hangup of the
+        dead leg (a call that cannot move media cannot converse; hanging
+        up also frees the slot for new calls). Records already closing,
+        remote-closed, or held never trip -- their media path is
+        intentionally idle, and close routing owns their outcome. The
+        RTP-timeout path stays independent: it observes vanished peers,
+        this observes a broken local stack with a live dialog.
+        """
+        with self._lock:
+            if record.app_id not in self._calls:
+                return
+            if record.close_emitted or record.remote_closed or record.decline_release:
+                return
+            if direction == "tx":
+                record.tx_error_streak += 1
+                streak = record.tx_error_streak
+            else:
+                record.rx_error_streak += 1
+                streak = record.rx_error_streak
+            trip = streak == MEDIA_ERROR_STREAK_LIMIT
+        if trip:
+            LOG.warning(
+                "telephony media %s failure streak call_id=%s",
+                direction,
+                record.app_id,
+            )
+            self._report_media(
+                False, record.app_id, f"persistent {direction} media failure"
+            )
+            try:
+                self.hangup(record.app_id)
+            except Exception:
+                pass
+
+    def _note_media_success(self, record: _CallRecord, direction: str) -> None:
+        """Reset one direction's failure streak: real media flowing
+        proves the path alive, so an earlier blip streak is forgotten
+        and a recovered path never trips."""
+        with self._lock:
+            if direction == "tx":
+                record.tx_error_streak = 0
+            else:
+                record.rx_error_streak = 0
 
     def _report_media(self, healthy: bool, call_id: str, detail: str = "") -> None:
         with self._lock:
