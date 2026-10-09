@@ -1402,6 +1402,7 @@ class _StubAudio:
         self._fail_write = fail_write
         self._fail_read = fail_read
         self.written: list = []
+        self.reads = 0
 
     def info(self):  # noqa: ANN202
         return self._info
@@ -1415,6 +1416,7 @@ class _StubAudio:
     def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
         if self._fail_read:
             raise RuntimeError("aumem read broken")
+        self.reads += 1
         return tone_pcm(duration_seconds=0.02, sample_rate=8000)[:max_bytes]
 
 
@@ -1898,9 +1900,10 @@ class SignalingOrderTest(unittest.TestCase):
 
 
 class TerminalBackpressureTest(unittest.TestCase):
-    """Test H: a flooded non-terminal backlog (DTMF + hold churn)
-    stays bounded, holds coalesce to the final state, and a terminal
-    close is never dropped -- it arrives after the kept backlog."""
+    """Test H: a flooded DTMF backlog stays bounded while every
+    hold/resume snapshot (full FIFO, never coalesced) and the
+    terminal close are never dropped -- the close arrives after the
+    kept backlog, in causal order."""
 
     def test_terminal_close_survives_nonterminal_flood(self) -> None:
         from receptionist.baresip_adapter import (
@@ -1937,8 +1940,14 @@ class TerminalBackpressureTest(unittest.TestCase):
             for index in range(200):
                 adapter._enqueue_native_event(  # noqa: SLF001
                     "call-f", ("dtmf", str(index % 10)))
+            # One hold before and one after the flood: full FIFO keeps
+            # both, in order, around the bounded DTMF backlog.
+            adapter._enqueue_native_event("call-f", ("hold", True))  # noqa: SLF001
+            for index in range(200, 400):
                 adapter._enqueue_native_event(  # noqa: SLF001
-                    "call-f", ("hold", bool(index % 2)))
+                    "call-f", ("dtmf", str(index % 10)))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-f", ("hold", False))
             pending_dtmf = [
                 event for event in record.ev_dispatch
                 if event and event[0] == "dtmf"
@@ -1948,29 +1957,30 @@ class TerminalBackpressureTest(unittest.TestCase):
                 if event and event[0] == "hold"
             ]
             self.assertLessEqual(len(pending_dtmf), EV_DISPATCH_MAX_NONTERMINAL)
-            self.assertLessEqual(len(pending_holds), 1)
-            # Holds coalesced to the single latest state.
-            self.assertEqual(
-                [event for event in record.ev_dispatch
-                 if event and event[0] == "hold"],
-                [("hold", True)],
-            )
+            # Both holds survived, in causal order.
+            self.assertEqual(pending_holds, [("hold", True), ("hold", False)])
             adapter._enqueue_native_event("call-f", ("closed", "OK"))  # noqa: SLF001
             drained = adapter._drain_native_events("call-f")  # noqa: SLF001
             self.assertGreater(drained, 0)
             # Terminal close arrived exactly once, last.
             self.assertEqual(observed[-1], ("hangup",))
             self.assertEqual(observed.count(("hangup",)), 1)
-            # Exactly one (coalesced) hold, carrying the final state.
+            # Causal order survives: hold True was enqueued before
+            # the second flood, so FIFO delivers it first (older DTMF
+            # ahead of it was evicted), then the 128 kept DTMF, then
+            # hold False, then the terminal hangup.
+            self.assertEqual(observed[0], ("hold", True))
+            self.assertEqual(observed[EV_DISPATCH_MAX_NONTERMINAL + 1],
+                             ("hold", False))
             self.assertEqual(
                 [entry for entry in observed if entry[0] == "hold"],
-                [("hold", True)],
+                [("hold", True), ("hold", False)],
             )
             # DTMF kept the newest backlog in order (oldest dropped).
             kept = [entry[1] for entry in observed if entry[0] == "dtmf"]
             self.assertEqual(len(kept), EV_DISPATCH_MAX_NONTERMINAL)
             self.assertEqual(
-                kept, [str(index % 10) for index in range(72, 200)])
+                kept, [str(index % 10) for index in range(272, 400)])
         finally:
             adapter._calls.pop("call-f", None)  # noqa: SLF001
 
@@ -2115,6 +2125,207 @@ class DispatcherLeakTest(unittest.TestCase):
             adapter._running = False  # noqa: SLF001
             for thread in list(adapter._rx_threads.values()):  # noqa: SLF001
                 thread.join(timeout=5)
+
+
+class RemoteHoldGateTest(unittest.TestCase):
+    """Remote-HOLD media gate: the stack callback gates TX/RX
+    synchronously (lightweight flag + queue mutation, never core/AI
+    work), discards pre-HOLD queued caller audio, resume flushes
+    stale media, holds stay full FIFO, and sibling calls are
+    unaffected. Event waits are fail-safes only."""
+
+    def _gated_adapter(self, *call_ids: str):
+        import threading
+
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        delivered: list = []
+        blocked: dict = {}
+        audio: dict = {}
+
+        class _GateRecorder:
+            def on_caller_audio(self, call_id: str, frame) -> None:  # noqa: ANN001, ANN202
+                gate = blocked.get(call_id)
+                if gate is not None:
+                    gate["entered"].set()
+                    gate["release"].wait(timeout=10)
+                delivered.append((call_id, frame))
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                delivered.append((call_id, f"hold:{held}"))
+
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                delivered.append((call_id, f"dtmf:{digit}"))
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_GateRecorder())
+        adapter._running = True  # noqa: SLF001
+        for call_id in call_ids:
+            stub = _StubAudio()
+            audio[call_id] = stub
+            adapter._calls[call_id] = _CallRecord(  # noqa: SLF001
+                app_id=call_id, native=_StubNative(stub))
+        return adapter, delivered, blocked, audio
+
+    def test_hold_entry_gates_pump_and_discards_queued_rx(self) -> None:
+        adapter, delivered, _, audio = self._gated_adapter("call-h")
+        try:
+            adapter.send_audio("call-h", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(audio["call-h"].written), 1)
+            reads_before = audio["call-h"].reads
+            self.assertGreater(reads_before, 0)
+            # One caller frame is already queued for delivery ...
+            record = adapter._calls["call-h"]  # noqa: SLF001
+            self.assertEqual(len(record.rx_dispatch), 1)
+            # ... then the stack reports HOLD: the gate engages
+            # synchronously and the queued pre-HOLD audio is gone.
+            self.assertTrue(adapter._gate_remote_hold("call-h", True))  # noqa: SLF001
+            adapter._enqueue_native_event("call-h", ("hold", True))  # noqa: SLF001
+            self.assertTrue(record.remote_hold)
+            self.assertEqual(list(record.rx_dispatch), [])
+            # The pump moves nothing more for the held call.
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(audio["call-h"].written), 1)
+            self.assertEqual(audio["call-h"].reads, reads_before)
+            # Draining delivers the hold notification, never caller
+            # audio: nothing queued before the gate may cross it.
+            adapter._drain_native_events("call-h")  # noqa: SLF001
+            adapter._dispatch_once("call-h")  # noqa: SLF001
+            self.assertEqual(delivered, [("call-h", "hold:True")])
+        finally:
+            adapter._calls.pop("call-h", None)  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
+
+    def test_blocked_dispatcher_hold_still_gates_and_b_flows(self) -> None:
+        import threading
+
+        adapter, delivered, blocked, audio = self._gated_adapter(
+            "call-a", "call-b")
+        blocked["call-a"] = {
+            "entered": threading.Event(), "release": threading.Event(),
+        }
+        try:
+            adapter._ensure_rx_dispatch("call-a")  # noqa: SLF001
+            adapter._ensure_rx_dispatch("call-b")  # noqa: SLF001
+            # A frame for A enters delivery and blocks A's dispatcher
+            # (slow application work) ...
+            record_a = adapter._calls["call-a"]  # noqa: SLF001
+            record_a.rx_dispatch.append(assistant_frame())
+            record_a.rx_ready.set()
+            self.assertTrue(blocked["call-a"]["entered"].wait(timeout=5))
+            # ... while A is blocked, the stack reports HOLD: the sync
+            # gate returns immediately and stops A's media.
+            self.assertTrue(adapter._gate_remote_hold("call-a", True))  # noqa: SLF001
+            adapter._enqueue_native_event("call-a", ("hold", True))  # noqa: SLF001
+            self.assertTrue(record_a.remote_hold)
+            adapter.send_audio("call-a", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter.send_audio("call-b", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            # A: zero TX/RX movement after HOLD. B: fully flowing.
+            self.assertEqual(audio["call-a"].written, [])
+            reads_a = audio["call-a"].reads
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(audio["call-a"].written, [])
+            self.assertEqual(audio["call-a"].reads, reads_a)
+            self.assertEqual(len(audio["call-b"].written), 1)
+            self.assertGreater(audio["call-b"].reads, 0)
+            # B's signaling is delivered while A stays blocked+held.
+            adapter._enqueue_native_event("call-b", ("dtmf", "5"))  # noqa: SLF001
+            adapter._drain_native_events("call-b")  # noqa: SLF001
+            self.assertIn(("call-b", "dtmf:5"), delivered)
+            # Release A: only the pre-HOLD in-flight frame plus the
+            # hold notification were ever delivered for A.
+            blocked["call-a"]["release"].set()
+            adapter._drain_native_events("call-a")  # noqa: SLF001
+            adapter._dispatch_once("call-a")  # noqa: SLF001
+            audio_a = [entry for entry in delivered if entry[0] == "call-a"]
+            self.assertEqual(len(audio_a), 2)
+            self.assertIn(("call-a", "hold:True"), audio_a)
+        finally:
+            blocked["call-a"]["release"].set()
+            adapter._calls.pop("call-a", None)  # noqa: SLF001
+            adapter._calls.pop("call-b", None)  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
+            for thread in list(adapter._rx_threads.values()):  # noqa: SLF001
+                thread.join(timeout=5)
+
+    def test_unpaced_hold_dtmf_resume_keeps_causal_order(self) -> None:
+        adapter, delivered, _, _ = self._gated_adapter("call-q")
+        try:
+            record = adapter._calls["call-q"]  # noqa: SLF001
+            # No dispatcher threads: the production enqueue unit runs
+            # inline; the full-FIFO queue must preserve causality even
+            # when nothing is processed between enqueues.
+            record.rx_dispatch_started = True
+            adapter._enqueue_native_event("call-q", ("hold", True))  # noqa: SLF001
+            adapter._enqueue_native_event("call-q", ("dtmf", "5"))  # noqa: SLF001
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-q", ("hold", False))
+            adapter._drain_native_events("call-q")  # noqa: SLF001
+            self.assertEqual(
+                delivered,
+                [("call-q", "hold:True"), ("call-q", "dtmf:5"),
+                 ("call-q", "hold:False")],
+            )
+        finally:
+            adapter._calls.pop("call-q", None)  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
+
+    def test_resume_flushes_stale_and_fresh_media_flows(self) -> None:
+        adapter, delivered, _, audio = self._gated_adapter("call-r")
+        try:
+            adapter.send_audio("call-r", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(audio["call-r"].written), 1)
+            # HOLD with media in flight: queued RX is discarded at the
+            # gate; TX pumped before the gate already went out.
+            self.assertTrue(adapter._gate_remote_hold("call-r", True))  # noqa: SLF001
+            adapter._enqueue_native_event("call-r", ("hold", True))  # noqa: SLF001
+            adapter.send_audio("call-r", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter.send_audio("call-r", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(audio["call-r"].written), 1)
+            record = adapter._calls["call-r"]  # noqa: SLF001
+            self.assertGreater(record.tx_bytes, 0)
+            # RESUME flushes the stale backlog before reopening media.
+            self.assertTrue(adapter._gate_remote_hold("call-r", False))  # noqa: SLF001
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-r", ("hold", False))
+            self.assertFalse(record.remote_hold)
+            self.assertEqual(record.tx_bytes, 0)
+            self.assertEqual(list(record.rx_dispatch), [])
+            # Fresh media flows again both ways.
+            adapter.send_audio("call-r", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(audio["call-r"].written), 2)
+            adapter._drain_native_events("call-r")  # noqa: SLF001
+            adapter._dispatch_once("call-r")  # noqa: SLF001
+            signals = [entry[1] for entry in delivered
+                       if entry[0] == "call-r"
+                       and isinstance(entry[1], str)]
+            self.assertEqual(signals, ["hold:True", "hold:False"])
+            audio_entries = [
+                entry for entry in delivered
+                if entry[0] == "call-r" and not isinstance(entry[1], str)
+            ]
+            self.assertEqual(len(audio_entries), 1)
+        finally:
+            adapter._calls.pop("call-r", None)  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
 
 
 class TelephonyConfigTest(unittest.TestCase):

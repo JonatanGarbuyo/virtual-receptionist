@@ -148,13 +148,12 @@ MEDIA_ERROR_STREAK_LIMIT = 50
 
 #: Lifecycle-event queue bound (DTMF backlog only): DTMF snapshots
 #: waiting on one call's dispatcher. Terminal and answered events
-#: (established/closed/transfer/media_failed) always append -- they
-#: are rare, tiny, and carry exactly-once/no-drop semantics, so a
-#: flooded DTMF backlog can never evict them. Hold state coalesces
-#: (only the latest pending hold is kept, preserving the final
-#: state, never evicted by DTMF pressure); DTMF order is preserved
-#: among kept digits, dropping oldest only as a documented last
-#: resort under pathological flood.
+#: (established/closed/transfer/media_failed) always append, and so
+#: does every hold/resume snapshot (full FIFO: holds are rare, tiny,
+#: and causal order across DTMF must survive, so they are never
+#: coalesced or evicted). DTMF order is preserved among kept digits,
+#: dropping oldest only as a documented last resort under
+#: pathological flood.
 EV_DISPATCH_MAX_NONTERMINAL = 128
 
 #: Lifecycle kinds that are never dropped or coalesced: the answered
@@ -190,12 +189,14 @@ class _CallRecord:
     # transfer/media_failed) as small tuples, drained FIFO by the same
     # per-call dispatcher before RX frames. Signaling policy is split:
     # answered/terminal events are never dropped or coalesced (rare,
-    # tiny, exactly-once close semantics); hold coalesces to the
-    # latest pending state; DTMF keeps order, dropping oldest only as
-    # a last resort when the non-terminal backlog exceeds
-    # EV_DISPATCH_MAX_NONTERMINAL. Enqueued by stack/loop/pump threads
-    # (and transfer watchdogs), which snapshot and return promptly so
-    # slow core work never stalls shared SIP/media dispatch.
+    # tiny, exactly-once close semantics), and hold/resume snapshots
+    # are full FIFO too (causal order across DTMF must survive, so
+    # holds are never merged); DTMF keeps order, dropping oldest only
+    # as a last resort when its backlog exceeds
+    # EV_DISPATCH_MAX_NONTERMINAL. The media gate itself (remote_hold
+    # flag plus queue flushes) is applied synchronously in
+    # _gate_remote_hold on the stack callback -- never deferred to the
+    # dispatcher -- so no TX/RX crosses a HOLD boundary.
     ev_dispatch: collections.deque = field(default_factory=collections.deque)
     rx_dispatch_started: bool = False
     rx_thread: Any = None
@@ -969,6 +970,39 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             return
         self._deliver(app_id, "on_dtmf", digit)
 
+    def _gate_remote_hold(self, app_id: str, held: bool) -> bool:
+        """Apply the remote-hold media gate synchronously (stack thread).
+
+        Called directly from the native CALL_HOLD/CALL_RESUME callback
+        before it returns, so no TX write or RX read/delivery can cross
+        the HOLD boundary while the core notification still travels
+        through the per-call dispatcher. Deliberately lightweight:
+        in-memory flag plus queue mutation under the adapter lock only
+        -- no listener, no core, no AI, no SQLite, no native I/O, never
+        blocking. Returns True when the gate changed state.
+
+        Entry (False -> True) also discards already-queued caller RX:
+        a frame read before the HOLD must never reach
+        ``on_caller_audio`` after it. Resume (True -> False) flushes
+        stale TX/RX first, so only fresh media flows afterwards.
+        Unknown ids (close already handled) are ignored.
+        """
+        with self._lock:
+            record = self._calls.get(app_id)
+            if record is None:
+                return False
+            if held and not record.remote_hold:
+                record.remote_hold = True
+                record.rx_dispatch.clear()
+                return True
+            if not held and record.remote_hold:
+                record.tx.clear()
+                record.tx_bytes = 0
+                record.rx_dispatch.clear()
+                record.remote_hold = False
+                return True
+            return False
+
     def _on_native_remote_hold(self, app_id: str, held: bool) -> None:
         with self._lock:
             record = self._calls.get(app_id)
@@ -1323,6 +1357,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 pass
             # Snapshot and return: the per-call dispatcher owns all
             # downstream core work, never the shared SIP loop thread.
+            # Remote hold additionally gates media synchronously here
+            # (lightweight flag + queue mutation only): the pump must
+            # stop TX/RX the moment the stack reports HOLD, not when
+            # the dispatcher later delivers the notification.
             if kind is _Event.CALL_ESTABLISHED:
                 self._enqueue_native_event(app_id, ("established",))
             elif kind is _Event.CALL_CLOSED:
@@ -1330,8 +1368,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                     app_id, ("closed", str(getattr(event, "text", "") or ""))
                 )
             elif kind is _Event.CALL_HOLD:
+                self._gate_remote_hold(app_id, True)
                 self._enqueue_native_event(app_id, ("hold", True))
             elif kind is _Event.CALL_RESUME:
+                self._gate_remote_hold(app_id, False)
                 self._enqueue_native_event(app_id, ("hold", False))
             elif kind is _Event.CALL_LOCAL_SDP:
                 try:
@@ -1671,13 +1711,12 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         after STOPPED).
 
         Backpressure: answered/terminal kinds (established, closed,
-        transfer, media_failed) always append -- a non-terminal flood
-        can never evict them. Hold inputs coalesce (only the latest
-        pending hold is kept, preserving the final state, and holds
-        are never evicted by DTMF pressure). DTMF keeps arrival order
-        with the backlog bounded at EV_DISPATCH_MAX_NONTERMINAL,
-        dropping oldest only as a documented last resort under
-        pathological flood.
+        transfer, media_failed) always append, and so does every
+        hold/resume snapshot -- holds are full FIFO, never coalesced
+        or evicted, so causal order across DTMF always survives.
+        DTMF keeps arrival order with its backlog bounded at
+        EV_DISPATCH_MAX_NONTERMINAL, dropping oldest only as a
+        documented last resort under pathological flood.
         """
         kind = event[0] if event else None
         with self._lock:
@@ -1686,13 +1725,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             record = self._calls.get(app_id)
             if record is None:
                 return
-            if kind == "hold":
-                record.ev_dispatch = collections.deque(
-                    pending
-                    for pending in record.ev_dispatch
-                    if not pending or pending[0] != "hold"
-                )
-            elif kind not in _EV_NO_DROP_KINDS:
+            if kind not in _EV_NO_DROP_KINDS and kind != "hold":
                 # DTMF-only bound: drop the oldest pending DTMF while
                 # over budget (holds and answered/terminal events are
                 # never evicted by DTMF pressure).
@@ -1798,6 +1831,17 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         for frame in frames:
             with self._lock:
                 if app_id not in self._calls:
+                    return
+                record = self._calls[app_id]
+                if (
+                    record.local_hold
+                    or record.remote_hold
+                    or record.close_emitted
+                ):
+                    # Held or closing: caller PCM is never delivered
+                    # (the synchronous hold gate plus the RX-drain gate
+                    # already stop new frames; this covers any frame
+                    # queued before the gate engaged).
                     return
             self._deliver(app_id, "on_caller_audio", frame)
 
