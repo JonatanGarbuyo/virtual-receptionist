@@ -138,12 +138,32 @@ RX_DISPATCH_POLL_S = 0.05
 
 #: Consecutive media-failure trip: this many back-to-back TX (or RX)
 #: stack failures on one call converts dead media into one
-#: project-owned media-unhealthy transition plus a hangup of the dead
-#: leg. At the 10 ms pump period this is ~0.5 s of fully dead media;
+#: project-owned media-unhealthy transition plus one application
+#: media-failure signal (the application owns fallback/termination).
+#: At the 10 ms pump period this is ~0.5 s of fully dead media;
 #: isolated blips never trip it, and any successful media resets the
 #: streak. Fires exactly once per streak (equality, not >=), so a
 #: lingering failure cannot spam health transitions.
 MEDIA_ERROR_STREAK_LIMIT = 50
+
+#: Lifecycle-event queue bound (DTMF backlog only): DTMF snapshots
+#: waiting on one call's dispatcher. Terminal and answered events
+#: (established/closed/transfer/media_failed) always append -- they
+#: are rare, tiny, and carry exactly-once/no-drop semantics, so a
+#: flooded DTMF backlog can never evict them. Hold state coalesces
+#: (only the latest pending hold is kept, preserving the final
+#: state, never evicted by DTMF pressure); DTMF order is preserved
+#: among kept digits, dropping oldest only as a documented last
+#: resort under pathological flood.
+EV_DISPATCH_MAX_NONTERMINAL = 128
+
+#: Lifecycle kinds that are never dropped or coalesced: the answered
+#: signal and every terminal outcome (close, transfer result, media
+#: failure). The enqueue path guarantees capacity for these even
+#: under non-terminal backpressure.
+_EV_NO_DROP_KINDS = frozenset(
+    {"established", "closed", "transfer", "media_failed"}
+)
 
 
 @dataclass
@@ -166,12 +186,16 @@ class _CallRecord:
     # discarded with the record.
     rx_dispatch: collections.deque = field(default_factory=collections.deque)
     rx_dropped_frames: int = 0
-    # Lifecycle events from the stack (established/closed/hold/dtmf) as
-    # small tuples, drained FIFO by the same per-call dispatcher before
-    # RX frames. Unlike media, these are never dropped: they are rare,
-    # tiny, and carry exactly-once close semantics. Enqueued by the
-    # loop-thread stack callbacks, which snapshot and return promptly
-    # so slow core work never stalls the shared SIP loop.
+    # Lifecycle events from the stack (established/closed/hold/dtmf/
+    # transfer/media_failed) as small tuples, drained FIFO by the same
+    # per-call dispatcher before RX frames. Signaling policy is split:
+    # answered/terminal events are never dropped or coalesced (rare,
+    # tiny, exactly-once close semantics); hold coalesces to the
+    # latest pending state; DTMF keeps order, dropping oldest only as
+    # a last resort when the non-terminal backlog exceeds
+    # EV_DISPATCH_MAX_NONTERMINAL. Enqueued by stack/loop/pump threads
+    # (and transfer watchdogs), which snapshot and return promptly so
+    # slow core work never stalls shared SIP/media dispatch.
     ev_dispatch: collections.deque = field(default_factory=collections.deque)
     rx_dispatch_started: bool = False
     rx_thread: Any = None
@@ -1113,13 +1137,27 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         self._emit_transfer_result(record.app_id, result)
 
     def _emit_transfer_result(self, app_id: str, result: TransferResult) -> None:
-        """Deliver a normalized transfer outcome. Always emitted, even if
-        the call record is already gone: transfer results race dialog
-        teardown (the close event and the outcome callback arrive in
-        either order), and the core safely ignores unknown/ended ids.
-        Exactly-once per transfer is enforced by the transfer_open guard
-        and watchdog cancellation at the call sites, not here."""
-        self._deliver(app_id, "on_transfer_result", result)
+        """Route a normalized transfer outcome to the call dispatcher.
+
+        Always emitted, even if the call record is already gone:
+        transfer results race dialog teardown (the close event and the
+        outcome callback arrive in either order), and the core safely
+        ignores unknown/ended ids. Exactly-once per transfer is
+        enforced by the transfer_open guard and watchdog cancellation
+        at the call sites, not here.
+
+        Known records enqueue (loop/watchdog threads snapshot and
+        return; slow core work runs on the per-call dispatcher, never
+        on shared SIP dispatch). Gone records deliver immediately on
+        the calling thread: the core drops unknown ids before any
+        slow work, so nothing shared can stall.
+        """
+        with self._lock:
+            known = app_id in self._calls
+        if known:
+            self._enqueue_native_event(app_id, ("transfer", result))
+        else:
+            self._deliver(app_id, "on_transfer_result", result)
 
     def _decline_native(self, native_call: Any) -> None:
         """SIP-level decline for a native leg with no application id
@@ -1624,22 +1662,73 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
     def _enqueue_native_event(self, app_id: str, event: tuple) -> None:
         """Snapshot one stack lifecycle event for per-call dispatch.
 
-        The production seam below the vendor-typed stack callbacks: the
-        loop thread calls this with plain data (kind plus payload) and
-        returns immediately, so slow core cancellation/fallback work can
-        never stall shared SIP dispatch. Drops the event when the call
-        is unknown (close already handled) or the adapter is stopping
-        (no callbacks after STOPPED).
+        The production seam below the vendor-typed stack callbacks and
+        the media pump: the calling thread passes plain data (kind plus
+        payload) and returns immediately, so slow core
+        cancellation/fallback work can never stall shared SIP/media
+        dispatch. Drops the event when the call is unknown (close
+        already handled) or the adapter is stopping (no callbacks
+        after STOPPED).
+
+        Backpressure: answered/terminal kinds (established, closed,
+        transfer, media_failed) always append -- a non-terminal flood
+        can never evict them. Hold inputs coalesce (only the latest
+        pending hold is kept, preserving the final state, and holds
+        are never evicted by DTMF pressure). DTMF keeps arrival order
+        with the backlog bounded at EV_DISPATCH_MAX_NONTERMINAL,
+        dropping oldest only as a documented last resort under
+        pathological flood.
         """
+        kind = event[0] if event else None
         with self._lock:
             if not self._running:
                 return
             record = self._calls.get(app_id)
             if record is None:
                 return
+            if kind == "hold":
+                record.ev_dispatch = collections.deque(
+                    pending
+                    for pending in record.ev_dispatch
+                    if not pending or pending[0] != "hold"
+                )
+            elif kind not in _EV_NO_DROP_KINDS:
+                # DTMF-only bound: drop the oldest pending DTMF while
+                # over budget (holds and answered/terminal events are
+                # never evicted by DTMF pressure).
+                while (
+                    sum(
+                        1
+                        for pending in record.ev_dispatch
+                        if pending and pending[0] == "dtmf"
+                    )
+                    >= EV_DISPATCH_MAX_NONTERMINAL
+                ):
+                    for pending in record.ev_dispatch:
+                        if pending and pending[0] == "dtmf":
+                            record.ev_dispatch.remove(pending)
+                            break
             record.ev_dispatch.append(event)
             record.rx_ready.set()
         self._ensure_rx_dispatch(app_id)
+
+    def _drain_native_events(self, app_id: str) -> int:
+        """Process every queued lifecycle event for one call, FIFO.
+
+        Deterministic test seam (no threads, no sleeps): the
+        production dispatcher threads run the same
+        ``_dispatch_native_event`` unit of work. Returns the number of
+        events processed.
+        """
+        processed = 0
+        while True:
+            with self._lock:
+                record = self._calls.get(app_id)
+                if record is None or not record.ev_dispatch:
+                    return processed
+                event = record.ev_dispatch.popleft()
+            self._dispatch_native_event(app_id, event)
+            processed += 1
 
     def _dispatch_native_event(self, app_id: str, event: tuple) -> None:
         """Process one queued lifecycle event on the call dispatcher."""
@@ -1652,6 +1741,16 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             self._on_native_remote_hold(app_id, bool(event[1]) if len(event) > 1 else False)
         elif kind == "dtmf":
             self._on_native_dtmf(app_id, str(event[1]) if len(event) > 1 else "")
+        elif kind == "transfer":
+            self._deliver(
+                app_id,
+                "on_transfer_result",
+                event[1] if len(event) > 1 else TransferResult.TRANSPORT_ERROR,
+            )
+        elif kind == "media_failed":
+            self._deliver(
+                app_id, "on_media_failed", str(event[1]) if len(event) > 1 else ""
+            )
 
     def _rx_dispatch_loop(self, app_id: str) -> None:
         """Dispatcher body: lifecycle events then RX frames, until close/stop."""
@@ -1782,14 +1881,17 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
 
         The streak trips :data:`MEDIA_ERROR_STREAK_LIMIT` exactly once:
         one sanitized media-unhealthy transition plus one project-owned
-        per-call media-failure signal. The adapter never decides the
-        business outcome: the application (core/session) chooses PBX
-        fallback handoff or termination, and only its hangup/transfer
-        closes the leg. Records already closing, remote-closed, or held
-        never trip -- their media path is intentionally idle, and close
-        routing owns their outcome. The RTP-timeout path stays
-        independent: it observes vanished peers, this observes a broken
-        local stack with a live dialog.
+        per-call media-failure signal, enqueued for the per-call
+        dispatcher (never delivered inline: the pump thread snapshots
+        and returns, so slow application cancellation/fallback can
+        never stall shared media dispatch). The adapter never decides
+        the business outcome: the application (core/session) chooses
+        PBX fallback handoff or termination, and only its
+        hangup/transfer closes the leg. Records already closing,
+        remote-closed, or held never trip -- their media path is
+        intentionally idle, and close routing owns their outcome. The
+        RTP-timeout path stays independent: it observes vanished
+        peers, this observes a broken local stack with a live dialog.
         """
         with self._lock:
             if record.app_id not in self._calls:
@@ -1811,9 +1913,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 record.app_id,
             )
             self._report_media(False, record.app_id, detail)
-            # Application decision, serialized per call like every other
-            # listener fan-out; never raises into the pump.
-            self._deliver(record.app_id, "on_media_failed", detail)
+            # Application decision, queued for the per-call dispatcher
+            # like every other listener fan-out; never raises into the
+            # pump, never runs core inline on shared dispatch.
+            self._enqueue_native_event(record.app_id, ("media_failed", detail))
 
     def _note_media_success(self, record: _CallRecord, direction: str) -> None:
         """Reset one direction's failure streak: real media flowing

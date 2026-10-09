@@ -964,11 +964,16 @@ class CallSession:
 
     def _fail_provider_path(self, failure_category: str) -> None:
         """Record one terminal conversational failure and leave the AI
-        path exactly once, toward PBX fallback or a safe exit."""
+        path exactly once, toward PBX fallback or a safe exit. In-flight
+        provider output is cancelled first (best-effort, contained):
+        no more inference/TTS burns on a path already declared dead.
+        The fallback handoff cancels again with its own reason when it
+        runs; both are idempotent by backend contract."""
         self._provider_terminal_failure = True
         if self._breaker is not None:
             self._breaker.record_failure()
         self._failure_category = failure_category
+        self._cancel_voice_output(CancelReason.PROVIDER_FAILED)
         if not self._attempt_fallback("provider failed"):
             self._exit_after_failed_handoff()
 

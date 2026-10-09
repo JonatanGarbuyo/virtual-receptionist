@@ -46,7 +46,14 @@ from receptionist.telephony_codecs import (
     encode_pcm16_to_ulaw,
 )
 
-from fakes import FakeCallIds, FakeClock, FakePolicy, FakeTelephony, FakeVoiceBackend
+from fakes import (
+    FakeCallIds,
+    FakeClock,
+    FakePolicy,
+    FakeTelephony,
+    FakeVoiceBackend,
+    FakeVoiceSession,
+)
 
 
 GREETING = "Bienvenido, ¿en qué puedo ayudarle?"
@@ -849,6 +856,9 @@ class AdapterBackpressureTest(unittest.TestCase):
         record.transfer_open = True
         adapter._calls["call-9"] = record  # noqa: SLF001
         adapter._transfer_watchdog_fired("call-9")  # noqa: SLF001
+        # Watchdog outcomes route through the per-call dispatcher (never
+        # inline on the timer thread): drain deterministically.
+        adapter._drain_native_events("call-9")  # noqa: SLF001
         self.assertEqual(results, [("call-9", TransferResult.TIMEOUT)])
         self.assertFalse(record.transfer_open)
         # Second firing is a no-op (already closed out).
@@ -1054,6 +1064,9 @@ class MediaErrorStreakTest(unittest.TestCase):
             tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
         for _ in range(MEDIA_ERROR_STREAK_LIMIT + 10):
             adapter._pump_tx(record)  # noqa: SLF001
+        # The trip only enqueues (the pump never runs listener code):
+        # drain the per-call dispatcher deterministically.
+        adapter._drain_native_events("call-tx")  # noqa: SLF001
         # Exactly one unhealthy transition (no per-frame spam) naming
         # the call, and exactly one application signal: the adapter
         # never owns the business outcome, so the leg stays up for the
@@ -1111,6 +1124,7 @@ class MediaErrorStreakTest(unittest.TestCase):
         adapter._calls["call-rx"] = record  # noqa: SLF001
         for _ in range(MEDIA_ERROR_STREAK_LIMIT + 10):
             adapter._drain_rx(record)  # noqa: SLF001
+        adapter._drain_native_events("call-rx")  # noqa: SLF001
         unhealthy = [s for s in states if s[0] is False]
         self.assertEqual(len(unhealthy), 1)
         self.assertEqual(unhealthy[0][1], "call-rx")
@@ -1285,23 +1299,32 @@ class MediaFailureCrossLayerTest(unittest.TestCase):
         try:
             for _ in range(MEDIA_ERROR_STREAK_LIMIT):
                 adapter._pump_tx(record)  # noqa: SLF001
+            # The streak trip enqueues the application signal; drain
+            # the per-call dispatcher deterministically (no threads,
+            # no sleeps) before asserting the cross-layer outcome.
+            adapter._drain_native_events(call_id)  # noqa: SLF001
             # Exactly one signal; the session left ACTIVE through the
             # failure path (no fallback configured -> exit + hangup).
             self.assertEqual(signals, [call_id])
             self.assertEqual(session.state, CallState.TERMINATING)
             self.assertEqual(hangups, [call_id])
-            # Media health degraded alongside the failure path.
-            self.assertTrue(
-                any(
-                    c.component is HealthComponent.TELEPHONY
-                    and c.code == CODE_TELEPHONY_MEDIA_LOST
-                    for c in core.monitor.active_conditions()
-                )
-            )
-            # The telephony leg closes; the session ends and evicts.
+            # The voice output was cancelled and the voice session is
+            # still open (close happens at the terminal transition).
+            live = voice.sessions[call_id]
+            self.assertTrue(live.cancels)
+            self.assertFalse(live.closed)
+            # Media health degraded alongside the failure path, once.
+            media_lost = [
+                c for c in core.monitor.active_conditions()
+                if c.component is HealthComponent.TELEPHONY
+                and c.code == CODE_TELEPHONY_MEDIA_LOST
+            ]
+            self.assertEqual(len(media_lost), 1)
             adapter._on_native_closed(call_id, "OK")  # noqa: SLF001
             self.assertEqual(session.state, CallState.ENDED)
             self.assertIsNone(core.get_session(call_id))
+            # Terminal transition closed the voice session.
+            self.assertTrue(voice.sessions[call_id].closed)
             # Repeated errors and a late duplicate signal/close do not
             # double-handle: still one hangup, still one emission.
             for _ in range(10):
@@ -1319,6 +1342,779 @@ class MediaFailureCrossLayerTest(unittest.TestCase):
         finally:
             core.on_media_failed = orig_signal
             adapter.hangup = orig_hangup
+
+
+def _wired_adapter_core(max_ai_sessions: int = 1):
+    """Real adapter + core wiring for cross-layer dispatch tests.
+
+    No SIP stack: records are bound manually and stack callbacks are
+    driven through the production enqueue/dispatch seam. Returns
+    ``(core, adapter, voice, clock)`` with the adapter running and the
+    core READY-admitted.
+    """
+    from receptionist.baresip_adapter import (
+        BaresipTelephonyAdapter,
+        wire_baresip_core,
+    )
+    from receptionist.resilience import ResilienceConfig
+    from receptionist.telephony_config import TelephonyConfig
+
+    voice = FakeVoiceBackend()
+    clock = FakeClock()
+    adapter = BaresipTelephonyAdapter(
+        TelephonyConfig(username="u", domain="d", password="p")
+    )
+    core = ReceptionistCore(
+        telephony=adapter,
+        voice=voice,
+        config_service=ConfigService(InMemoryConfigRepository(dict(
+            {"greeting": GREETING, "language": "es"}))),
+        policy=FakePolicy(),
+        clock=clock,
+        resilience=ResilienceConfig(max_ai_sessions=max_ai_sessions),
+        policy_engine=PolicyEngine(
+            destinations={}, fallback_id="none", limits=Limits()),
+        runtime=RuntimeStorage(
+            calls=InMemoryCallRepository(),
+            messages=InMemoryMessageRepository(clock=clock),
+            transcripts=InMemoryTranscriptStore(),
+            audit=InMemoryAuditLog(),
+        ),
+        retention=RetentionPolicy(),
+        call_ids=FakeCallIds(),
+    )
+    wire_baresip_core(core, adapter)
+    adapter._running = True  # noqa: SLF001
+    core.start()
+    core.report_telephony_state(TelephonyRegistrationState.REGISTERED)
+    return core, adapter, voice, clock
+
+
+class _StubAudio:
+    """Native audio double with scripted TX/RX behaviour."""
+
+    def __init__(self, *, fail_write=False, fail_read=False) -> None:
+        from types import SimpleNamespace
+
+        self._info = SimpleNamespace(
+            tx_sample_rate=8000, rx_sample_rate=8000
+        )
+        self._fail_write = fail_write
+        self._fail_read = fail_read
+        self.written: list = []
+
+    def info(self):  # noqa: ANN202
+        return self._info
+
+    def write(self, pcm) -> int:  # noqa: ANN001, ANN202
+        if self._fail_write:
+            raise RuntimeError("aumem write broken")
+        self.written.append(bytes(pcm))
+        return len(pcm)
+
+    def read(self, max_bytes: int) -> bytes:  # noqa: ANN202
+        if self._fail_read:
+            raise RuntimeError("aumem read broken")
+        return tone_pcm(duration_seconds=0.02, sample_rate=8000)[:max_bytes]
+
+
+class _StubNative:
+    def __init__(self, audio) -> None:  # noqa: ANN001
+        self.audio = audio
+
+
+class MediaFailureRxCrossLayerTest(unittest.TestCase):
+    """Test B: a persistent RX streak drives the same application
+    failure path as TX (signal once, cancel voice, terminate, hangup
+    once, evict, release the AI slot)."""
+
+    def test_rx_streak_terminates_evicts_and_releases_slot(self) -> None:
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+        from receptionist.call_session import CallState
+
+        core, adapter, voice, _ = _wired_adapter_core()
+        session = core.incoming_call("+34910000011")
+        call_id = session.call_id
+        record = _CallRecord(
+            app_id=call_id, native=_StubNative(_StubAudio(fail_read=True))
+        )
+        adapter._calls[call_id] = record  # noqa: SLF001
+        core.on_answered(call_id)
+        self.assertEqual(session.state, CallState.ACTIVE)
+
+        signals: list = []
+        orig_signal = core.on_media_failed
+        core.on_media_failed = lambda cid, detail="": (  # noqa: E731
+            signals.append((cid, detail)), orig_signal(cid, detail))
+        hangups: list = []
+        orig_hangup = adapter.hangup
+        adapter.hangup = lambda cid: (  # noqa: E731
+            hangups.append(cid), orig_hangup(cid))
+        try:
+            for _ in range(MEDIA_ERROR_STREAK_LIMIT):
+                adapter._drain_rx(record)  # noqa: SLF001
+            adapter._drain_native_events(call_id)  # noqa: SLF001
+            self.assertEqual(len(signals), 1)
+            self.assertEqual(signals[0][0], call_id)
+            self.assertIn("rx", signals[0][1])
+            self.assertEqual(session.state, CallState.TERMINATING)
+            self.assertEqual(hangups, [call_id])
+            live = voice.sessions[call_id]
+            self.assertTrue(live.cancels)
+            adapter._on_native_closed(call_id, "OK")  # noqa: SLF001
+            self.assertEqual(session.state, CallState.ENDED)
+            self.assertIsNone(core.get_session(call_id))
+            self.assertTrue(voice.sessions[call_id].closed)
+            session2 = core.incoming_call("+34910000012")
+            core.on_answered(session2.call_id)
+            self.assertEqual(session2.state, CallState.ACTIVE)
+        finally:
+            core.on_media_failed = orig_signal
+            adapter.hangup = orig_hangup
+
+
+class MediaFailureIsolationTest(unittest.TestCase):
+    """Test C: call A fails its media streak while call B stays fully
+    operational (ACTIVE, RX/TX flowing, no trip) and A's teardown
+    never touches B."""
+
+    def test_failing_call_does_not_disturb_other_call(self) -> None:
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+        from receptionist.call_session import CallState
+
+        core, adapter, _, _ = _wired_adapter_core(max_ai_sessions=2)
+        session_a = core.incoming_call("+34910000021")
+        session_b = core.incoming_call("+34910000022")
+        record_a = _CallRecord(
+            app_id=session_a.call_id,
+            native=_StubNative(_StubAudio(fail_write=True)),
+        )
+        audio_b = _StubAudio()
+        record_b = _CallRecord(
+            app_id=session_b.call_id, native=_StubNative(audio_b)
+        )
+        adapter._calls[session_a.call_id] = record_a  # noqa: SLF001
+        adapter._calls[session_b.call_id] = record_b  # noqa: SLF001
+        core.on_answered(session_a.call_id)
+        core.on_answered(session_b.call_id)
+        self.assertEqual(session_a.state, CallState.ACTIVE)
+        self.assertEqual(session_b.state, CallState.ACTIVE)
+
+        hangups: list = []
+        orig_hangup = adapter.hangup
+        adapter.hangup = lambda cid: (  # noqa: E731
+            hangups.append(cid), orig_hangup(cid))
+        try:
+            adapter.send_audio(
+                session_a.call_id,
+                make_frame(
+                    tone_pcm(duration_seconds=0.02, sample_rate=16000),
+                    16000,
+                ),
+            )
+            adapter.send_audio(
+                session_b.call_id,
+                make_frame(
+                    tone_pcm(duration_seconds=0.02, sample_rate=16000),
+                    16000,
+                ),
+            )
+            for _ in range(MEDIA_ERROR_STREAK_LIMIT):
+                adapter._pump_tx(record_a)  # noqa: SLF001
+                adapter._pump_tx(record_b)  # noqa: SLF001
+                adapter._drain_rx(record_b)  # noqa: SLF001
+            adapter._drain_native_events(session_a.call_id)  # noqa: SLF001
+            adapter._drain_native_events(session_b.call_id)  # noqa: SLF001
+            # A left ACTIVE exactly once; B never tripped.
+            self.assertEqual(session_a.state, CallState.TERMINATING)
+            self.assertEqual(hangups, [session_a.call_id])
+            self.assertEqual(session_b.state, CallState.ACTIVE)
+            self.assertEqual(record_b.tx_error_streak, 0)
+            self.assertEqual(record_b.rx_error_streak, 0)
+            self.assertTrue(audio_b.written)
+            # A's leg closes and evicts; B is untouched.
+            adapter._on_native_closed(session_a.call_id, "OK")  # noqa: SLF001
+            self.assertEqual(session_a.state, CallState.ENDED)
+            self.assertIsNone(core.get_session(session_a.call_id))
+            self.assertEqual(session_b.state, CallState.ACTIVE)
+            self.assertIsNotNone(core.get_session(session_b.call_id))
+            self.assertEqual(hangups, [session_a.call_id])
+        finally:
+            adapter.hangup = orig_hangup
+
+
+class MediaFailureHangupRaceTest(unittest.TestCase):
+    """Test D: a media-error trip racing a remote BYE converges on one
+    terminal outcome -- one hangup, one eviction, no zombie, and late
+    events after close are inert. Both arrival orders are covered
+    through the single per-call serialization (the production
+    dispatcher processes both events on one thread)."""
+
+    def _race_once(self, media_first: bool) -> None:
+        from receptionist.baresip_adapter import (
+            MEDIA_ERROR_STREAK_LIMIT,
+            _CallRecord,
+        )
+        from receptionist.call_session import CallState
+
+        core, adapter, voice, _ = _wired_adapter_core()
+        session = core.incoming_call("+34910000031")
+        call_id = session.call_id
+        record = _CallRecord(
+            app_id=call_id, native=_StubNative(_StubAudio(fail_write=True))
+        )
+        adapter._calls[call_id] = record  # noqa: SLF001
+        core.on_answered(call_id)
+        adapter.send_audio(call_id, make_frame(
+            tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+
+        hangups: list = []
+        orig_hangup = adapter.hangup
+        adapter.hangup = lambda cid: (  # noqa: E731
+            hangups.append(cid), orig_hangup(cid))
+        try:
+            for _ in range(MEDIA_ERROR_STREAK_LIMIT):
+                adapter._pump_tx(record)  # noqa: SLF001
+            if media_first:
+                adapter._drain_native_events(call_id)  # noqa: SLF001
+                self.assertEqual(session.state, CallState.TERMINATING)
+                core.on_caller_hangup(call_id)
+            else:
+                core.on_caller_hangup(call_id)
+                self.assertEqual(session.state, CallState.TERMINATING)
+                adapter._drain_native_events(call_id)  # noqa: SLF001
+            # Exactly one leg teardown was requested, whichever won.
+            self.assertEqual(hangups, [call_id])
+            self.assertEqual(session.state, CallState.TERMINATING)
+            # The close completes the single terminal outcome ...
+            adapter._on_native_closed(call_id, "OK")  # noqa: SLF001
+            self.assertEqual(session.state, CallState.ENDED)
+            self.assertIsNone(core.get_session(call_id))
+            self.assertTrue(voice.sessions[call_id].closed)
+            # ... and everything late is inert: duplicate close, a
+            # repeated media signal, and post-close DTMF change
+            # nothing and resurrect nothing.
+            adapter._on_native_closed(call_id, "OK")  # noqa: SLF001
+            core.on_media_failed(call_id, "late duplicate")
+            adapter._enqueue_native_event(  # noqa: SLF001
+                call_id, ("dtmf", "5"))
+            adapter._drain_native_events(call_id)  # noqa: SLF001
+            self.assertEqual(hangups, [call_id])
+            self.assertEqual(session.state, CallState.ENDED)
+            self.assertNotIn(call_id, adapter._calls)  # noqa: SLF001
+            self.assertNotIn(call_id, adapter._cb_locks)  # noqa: SLF001
+        finally:
+            adapter.hangup = orig_hangup
+
+    def test_media_then_bye_converges(self) -> None:
+        self._race_once(media_first=True)
+
+    def test_bye_then_media_converges(self) -> None:
+        self._race_once(media_first=False)
+
+
+class _GatedVoiceSession(FakeVoiceSession):
+    """Voice session whose output cancellation blocks until released
+    (slow STT/LLM/process teardown, signalled through Events)."""
+
+    def __init__(self, call_id, listener, entered, release) -> None:  # noqa: ANN001, ANN202
+        super().__init__(call_id, listener)
+        self._entered = entered
+        self._release = release
+
+    def cancel_output(self, reason) -> None:  # noqa: ANN001
+        self.cancels.append(reason)
+        self._entered.set()
+        self._release.wait(timeout=10)
+
+
+class _GatedVoiceBackend(FakeVoiceBackend):
+    """Backend blocking cancellation for one configured call only."""
+
+    def __init__(self, gated_call_id: str, entered, release) -> None:  # noqa: ANN001, ANN202
+        super().__init__()
+        self._gated_call_id = gated_call_id
+        self._entered = entered
+        self._release = release
+
+    def open_session(self, call_id: str, listener) -> FakeVoiceSession:  # noqa: ANN001, ANN202
+        if call_id == self._gated_call_id:
+            session = _GatedVoiceSession(
+                call_id, listener, self._entered, self._release
+            )
+        else:
+            session = FakeVoiceSession(call_id, listener)
+        self.sessions[call_id] = session
+        self.all_sessions.append(session)
+        return session
+
+
+class SlowTeardownNonBlockingTest(unittest.TestCase):
+    """Tests E+F: call A blocks inside slow application cancellation
+    while call B's signaling (DTMF, hold/resume, close) and the
+    registration/health path keep progressing -- nothing shared
+    waits for A. Event waits carry timeouts as fail-safes only,
+    never as the correctness mechanism."""
+
+    def test_blocked_cancel_never_stalls_other_call_or_registration(
+        self,
+    ) -> None:
+        import threading
+        import time
+
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+            wire_baresip_core,
+        )
+        from receptionist.call_session import CallState
+        from receptionist.health import HealthStatus
+        from receptionist.resilience import ResilienceConfig
+        from receptionist.telephony_config import TelephonyConfig
+
+        entered_a = threading.Event()
+        release_a = threading.Event()
+
+        voice = FakeVoiceBackend()
+        clock = FakeClock()
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        core = ReceptionistCore(
+            telephony=adapter,
+            voice=voice,
+            config_service=ConfigService(InMemoryConfigRepository(dict(
+                {"greeting": GREETING, "language": "es"}))),
+            policy=FakePolicy(),
+            clock=clock,
+            resilience=ResilienceConfig(max_ai_sessions=2),
+            policy_engine=PolicyEngine(
+                destinations={}, fallback_id="none", limits=Limits()),
+            runtime=RuntimeStorage(
+                calls=InMemoryCallRepository(),
+                messages=InMemoryMessageRepository(clock=clock),
+                transcripts=InMemoryTranscriptStore(),
+                audit=InMemoryAuditLog(),
+            ),
+            retention=RetentionPolicy(),
+            call_ids=FakeCallIds(),
+        )
+        # Swap in the gated backend before any session opens.
+        core._voice = _GatedVoiceBackend(  # noqa: SLF001
+            "call-1", entered_a, release_a)
+        wire_baresip_core(core, adapter)
+        adapter._running = True  # noqa: SLF001
+        core.start()
+        core.report_telephony_state(TelephonyRegistrationState.REGISTERED)
+
+        session_a = core.incoming_call("+34910000041")
+        session_b = core.incoming_call("+34910000042")
+        adapter._calls[session_a.call_id] = _CallRecord(  # noqa: SLF001
+            app_id=session_a.call_id,
+            native=_StubNative(_StubAudio()),
+        )
+        adapter._calls[session_b.call_id] = _CallRecord(  # noqa: SLF001
+            app_id=session_b.call_id,
+            native=_StubNative(_StubAudio()),
+        )
+        core.on_answered(session_a.call_id)
+        core.on_answered(session_b.call_id)
+        self.assertEqual(session_a.state, CallState.ACTIVE)
+        self.assertEqual(session_b.state, CallState.ACTIVE)
+
+        observed: list = []
+        b_step: dict = {}
+        for _name in ("dtmf", "hold:True", "hold:False"):
+            b_step[_name] = threading.Event()
+        orig_dtmf = core.on_dtmf
+        orig_hold = core.on_remote_hold
+
+        def _dtmf(call_id: str, digit: str) -> None:
+            observed.append(("dtmf", call_id, digit))
+            if call_id == session_b.call_id:
+                b_step["dtmf"].set()
+            orig_dtmf(call_id, digit)
+
+        def _hold(call_id: str, held: bool) -> None:
+            observed.append(("hold", call_id, held))
+            if call_id == session_b.call_id:
+                b_step[f"hold:{held}"].set()
+            orig_hold(call_id, held)
+
+        core.on_dtmf = _dtmf  # type: ignore[method-assign]
+        core.on_remote_hold = _hold  # type: ignore[method-assign]
+        hangups: list = []
+        orig_hangup = adapter.hangup
+        adapter.hangup = lambda cid: (  # noqa: E731
+            hangups.append(cid), orig_hangup(cid))
+        try:
+            # Remote BYE on A enters the slow cancel path on A's own
+            # dispatcher (the enqueue returns immediately, exactly as
+            # the stack callback would).
+            adapter._enqueue_native_event(  # noqa: SLF001
+                session_a.call_id, ("closed", "remote BYE"))
+            self.assertTrue(entered_a.wait(timeout=5))
+            self.assertNotIn(session_a.call_id, hangups)
+            # While A is blocked: B's full signaling sequence plus a
+            # registration/health update must all progress. Paced so
+            # each hold is processed before the next is enqueued
+            # (coalescing only merges unprocessed holds).
+            adapter._enqueue_native_event(  # noqa: SLF001
+                session_b.call_id, ("dtmf", "5"))
+            self.assertTrue(b_step["dtmf"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                session_b.call_id, ("hold", True))
+            self.assertTrue(b_step["hold:True"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                session_b.call_id, ("hold", False))
+            self.assertTrue(b_step["hold:False"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                session_b.call_id, ("closed", "remote BYE"))
+            core.report_telephony_state(TelephonyRegistrationState.REGISTERED)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if (
+                    ("dtmf", session_b.call_id, "5") in observed
+                    and ("hold", session_b.call_id, True) in observed
+                    and ("hold", session_b.call_id, False) in observed
+                    and session_b.call_id in hangups
+                    and core.health.status is HealthStatus.READY
+                ):
+                    break
+            self.assertIn(("dtmf", session_b.call_id, "5"), observed)
+            self.assertIn(("hold", session_b.call_id, True), observed)
+            self.assertIn(("hold", session_b.call_id, False), observed)
+            self.assertIn(session_b.call_id, hangups)
+            # B ran the full two-step re-entrantly on its own
+            # dispatcher (caller hangup -> hangup -> completed) while A
+            # stayed blocked: ended and evicted without waiting for A.
+            self.assertEqual(session_b.state, CallState.ENDED)
+            self.assertIsNone(core.get_session(session_b.call_id))
+            self.assertIs(core.health.status, HealthStatus.READY)
+            # A is still blocked: nothing above waited for it.
+            self.assertNotIn(session_a.call_id, hangups)
+            # Release A: its close completes exactly once; both legs
+            # then finish and evict.
+            release_a.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if session_a.call_id in hangups:
+                    break
+            self.assertIn(session_a.call_id, hangups)
+            adapter._on_native_closed(  # noqa: SLF001
+                session_a.call_id, "OK")
+            self.assertEqual(session_a.state, CallState.ENDED)
+            self.assertIsNone(core.get_session(session_a.call_id))
+            self.assertEqual(hangups.count(session_a.call_id), 1)
+            self.assertEqual(hangups.count(session_b.call_id), 1)
+        finally:
+            release_a.set()
+            core.on_dtmf = orig_dtmf  # type: ignore[method-assign]
+            core.on_remote_hold = orig_hold  # type: ignore[method-assign]
+            adapter.hangup = orig_hangup
+
+
+class SignalingOrderTest(unittest.TestCase):
+    """Test G: one call's lifecycle keeps causal order on its
+    dispatcher (answered -> hold -> DTMF -> resume -> hangup), exactly
+    as enqueued, even though delivery runs on another thread."""
+
+    def test_lifecycle_order_is_fifo_per_call(self) -> None:
+        import threading
+
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        observed: list = []
+        terminal = threading.Event()
+
+        class _OrderRecorder:
+            def on_answered(self, call_id: str) -> None:  # noqa: ANN202
+                observed.append("answered")
+                seen["answered"].set()
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                observed.append(f"hold:{held}")
+                seen[f"hold:{held}"].set()
+
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                observed.append(f"dtmf:{digit}")
+                seen[f"dtmf:{digit}"].set()
+
+            def on_caller_hangup(self, call_id: str) -> None:  # noqa: ANN202
+                observed.append("caller_hangup")
+                terminal.set()
+
+        seen: dict = {}
+        for _name in ("answered", "hold:True", "dtmf:5", "hold:False"):
+            seen[_name] = threading.Event()
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_OrderRecorder())
+        adapter._running = True  # noqa: SLF001
+        adapter._calls["call-o"] = _CallRecord(  # noqa: SLF001
+            app_id="call-o", native=_StubNative(_StubAudio()))
+        try:
+            # Paced through the live dispatcher: each step is only
+            # enqueued after the previous one was delivered, so the
+            # test observes dispatch order without any timing
+            # assumption (coalescing only merges unprocessed holds).
+            adapter._enqueue_native_event("call-o", ("established",))  # noqa: SLF001
+            self.assertTrue(seen["answered"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-o", ("hold", True))
+            self.assertTrue(seen["hold:True"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-o", ("dtmf", "5"))
+            self.assertTrue(seen["dtmf:5"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-o", ("hold", False))
+            self.assertTrue(seen["hold:False"].wait(timeout=5))
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-o", ("closed", "remote BYE"))
+            self.assertTrue(terminal.wait(timeout=5))
+            self.assertEqual(
+                observed,
+                ["answered", "hold:True", "dtmf:5", "hold:False",
+                 "caller_hangup"],
+            )
+        finally:
+            adapter._calls.pop("call-o", None)  # noqa: SLF001
+            thread = adapter._rx_threads.get("call-o")  # noqa: SLF001
+            if thread is not None:
+                thread.join(timeout=5)
+            self.assertFalse(thread is not None and thread.is_alive())
+
+
+class TerminalBackpressureTest(unittest.TestCase):
+    """Test H: a flooded non-terminal backlog (DTMF + hold churn)
+    stays bounded, holds coalesce to the final state, and a terminal
+    close is never dropped -- it arrives after the kept backlog."""
+
+    def test_terminal_close_survives_nonterminal_flood(self) -> None:
+        from receptionist.baresip_adapter import (
+            EV_DISPATCH_MAX_NONTERMINAL,
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        observed: list = []
+
+        class _FloodRecorder:
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                observed.append(("dtmf", digit))
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                observed.append(("hold", held))
+
+            def on_caller_hangup(self, call_id: str) -> None:  # noqa: ANN202
+                observed.append(("hangup",))
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_FloodRecorder())
+        adapter._running = True  # noqa: SLF001
+        record = _CallRecord(app_id="call-f")
+        # Deterministic queue pressure without dispatcher threads: the
+        # production enqueue/backpressure unit runs inline; delivery
+        # is drained explicitly below.
+        record.rx_dispatch_started = True
+        adapter._calls["call-f"] = record  # noqa: SLF001
+        try:
+            for index in range(200):
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    "call-f", ("dtmf", str(index % 10)))
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    "call-f", ("hold", bool(index % 2)))
+            pending_dtmf = [
+                event for event in record.ev_dispatch
+                if event and event[0] == "dtmf"
+            ]
+            pending_holds = [
+                event for event in record.ev_dispatch
+                if event and event[0] == "hold"
+            ]
+            self.assertLessEqual(len(pending_dtmf), EV_DISPATCH_MAX_NONTERMINAL)
+            self.assertLessEqual(len(pending_holds), 1)
+            # Holds coalesced to the single latest state.
+            self.assertEqual(
+                [event for event in record.ev_dispatch
+                 if event and event[0] == "hold"],
+                [("hold", True)],
+            )
+            adapter._enqueue_native_event("call-f", ("closed", "OK"))  # noqa: SLF001
+            drained = adapter._drain_native_events("call-f")  # noqa: SLF001
+            self.assertGreater(drained, 0)
+            # Terminal close arrived exactly once, last.
+            self.assertEqual(observed[-1], ("hangup",))
+            self.assertEqual(observed.count(("hangup",)), 1)
+            # Exactly one (coalesced) hold, carrying the final state.
+            self.assertEqual(
+                [entry for entry in observed if entry[0] == "hold"],
+                [("hold", True)],
+            )
+            # DTMF kept the newest backlog in order (oldest dropped).
+            kept = [entry[1] for entry in observed if entry[0] == "dtmf"]
+            self.assertEqual(len(kept), EV_DISPATCH_MAX_NONTERMINAL)
+            self.assertEqual(
+                kept, [str(index % 10) for index in range(72, 200)])
+        finally:
+            adapter._calls.pop("call-f", None)  # noqa: SLF001
+
+
+class ShutdownBoundedTest(unittest.TestCase):
+    """Test I: shutdown with a callback blocked inside slow
+    application work, queued signaling, and pending RX audio returns
+    boundedly, leaves no call/lock state behind, and dispatcher
+    threads exit once released."""
+
+    def test_shutdown_returns_bounded_with_blocked_dispatcher(self) -> None:
+        import threading
+
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _BlockingCloseListener:
+            def on_caller_hangup(self, call_id: str) -> None:  # noqa: ANN202
+                entered.set()
+                release.wait(timeout=30)
+
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                pass
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_BlockingCloseListener())
+        adapter._running = True  # noqa: SLF001
+        adapter._started_once = True  # noqa: SLF001 (started adapter)
+        record = _CallRecord(app_id="call-s")
+        adapter._calls["call-s"] = record  # noqa: SLF001
+        try:
+            adapter._ensure_rx_dispatch("call-s")  # noqa: SLF001
+            thread = record.rx_thread
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-s", ("closed", "remote BYE"))
+            self.assertTrue(entered.wait(timeout=5))
+            # More signaling + RX audio queue behind the blocked close.
+            adapter._enqueue_native_event("call-s", ("dtmf", "5"))  # noqa: SLF001
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-s", ("hold", True))
+            record.rx_dispatch.append(assistant_frame())
+            record.rx_ready.set()
+            # Shutdown must return boundedly even though application
+            # work is still blocked (internal joins all carry
+            # timeouts); the 30 s listener gate is only a fail-safe
+            # so the test can never hang the suite.
+            done = threading.Event()
+            worker = threading.Thread(
+                target=lambda: (adapter.shutdown(), done.set()),
+                name="test-shutdown",
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(done.wait(timeout=25))
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(adapter._calls, {})  # noqa: SLF001
+            self.assertEqual(adapter._cb_locks, {})  # noqa: SLF001
+        finally:
+            release.set()
+            if thread is not None:
+                thread.join(timeout=5)
+            self.assertFalse(thread is not None and thread.is_alive())
+            self.assertEqual(adapter._rx_threads, {})  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
+
+
+class DispatcherLeakTest(unittest.TestCase):
+    """Callback/event lifecycle: N calls open and close leaving no
+    per-call state behind (records, serializers, dispatcher threads,
+    queued events)."""
+
+    def test_open_close_cycles_leave_no_per_call_state(self) -> None:
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        closed: list = []
+
+        class _LeakRecorder:
+            def on_answered(self, call_id: str) -> None:  # noqa: ANN202
+                pass
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                pass
+
+            def on_caller_hangup(self, call_id: str) -> None:  # noqa: ANN202
+                closed.append(call_id)
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_LeakRecorder())
+        adapter._running = True  # noqa: SLF001
+        try:
+            for index in range(25):
+                call_id = f"call-leak-{index}"
+                adapter._calls[call_id] = _CallRecord(  # noqa: SLF001
+                    app_id=call_id)
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    call_id, ("established",))
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    call_id, ("hold", True))
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    call_id, ("dtmf", "5"))
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    call_id, ("hold", False))
+                adapter._enqueue_native_event(  # noqa: SLF001
+                    call_id, ("closed", "remote BYE"))
+                # Deterministic drain (a live dispatcher thread may
+                # also be draining: every event is popped exactly
+                # once, so delivery stays exactly-once either way).
+                adapter._drain_native_events(call_id)  # noqa: SLF001
+                # Remote close parks the record for the core's hangup
+                # (production two-step); completing it drops the leg.
+                adapter.hangup(call_id)
+                self.assertNotIn(call_id, adapter._calls)  # noqa: SLF001
+            threads = list(adapter._rx_threads.values())  # noqa: SLF001
+            for thread in threads:
+                thread.join(timeout=5)
+            self.assertEqual(len(closed), 25)
+            self.assertEqual(adapter._calls, {})  # noqa: SLF001
+            self.assertEqual(adapter._cb_locks, {})  # noqa: SLF001
+            self.assertEqual(adapter._rx_threads, {})  # noqa: SLF001
+        finally:
+            adapter._running = False  # noqa: SLF001
+            for thread in list(adapter._rx_threads.values()):  # noqa: SLF001
+                thread.join(timeout=5)
 
 
 class TelephonyConfigTest(unittest.TestCase):

@@ -267,6 +267,7 @@ class CancelReason(Enum):
     FALLBACK_HANDOFF = "fallback_handoff"
     CALL_LIMIT = "call_limit"
     SHUTDOWN = "shutdown"
+    PROVIDER_FAILED = "provider_failed"
 
 
 class VoiceListener(Protocol):
