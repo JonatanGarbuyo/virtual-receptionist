@@ -1403,6 +1403,11 @@ class _StubAudio:
         self._fail_read = fail_read
         self.written: list = []
         self.reads = 0
+        self.flush_tx_calls = 0
+        # Optional scripted reads modeling stale native buffers: when
+        # set, reads drain this list first (then empty); when None,
+        # reads return live tone like a flowing call.
+        self.read_script: list | None = None
 
     def info(self):  # noqa: ANN202
         return self._info
@@ -1417,7 +1422,12 @@ class _StubAudio:
         if self._fail_read:
             raise RuntimeError("aumem read broken")
         self.reads += 1
+        if self.read_script is not None:
+            return self.read_script.pop(0) if self.read_script else b""
         return tone_pcm(duration_seconds=0.02, sample_rate=8000)[:max_bytes]
+
+    def flush_tx(self) -> None:
+        self.flush_tx_calls += 1
 
 
 class _StubNative:
@@ -2300,19 +2310,27 @@ class RemoteHoldGateTest(unittest.TestCase):
             self.assertEqual(len(audio["call-r"].written), 1)
             record = adapter._calls["call-r"]  # noqa: SLF001
             self.assertGreater(record.tx_bytes, 0)
-            # RESUME flushes the stale backlog before reopening media.
+            # RESUME is accepted at the stack gate but the gate stays
+            # CLOSED there (native cleanup is dispatcher work, never
+            # SIP-loop work).
             self.assertTrue(adapter._gate_remote_hold("call-r", False))  # noqa: SLF001
             adapter._enqueue_native_event(  # noqa: SLF001
                 "call-r", ("hold", False))
+            self.assertTrue(record.remote_hold)
+            self.assertGreater(record.tx_bytes, 0)
+            # The dispatcher runs native cleanup first (queued backlog
+            # dropped, flush_tx, bounded stale RX drain), and only
+            # then reopens the gate and notifies.
+            adapter._drain_native_events("call-r")  # noqa: SLF001
             self.assertFalse(record.remote_hold)
             self.assertEqual(record.tx_bytes, 0)
             self.assertEqual(list(record.rx_dispatch), [])
+            self.assertEqual(audio["call-r"].flush_tx_calls, 1)
             # Fresh media flows again both ways.
             adapter.send_audio("call-r", make_frame(
                 tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
             adapter._pump_once()  # noqa: SLF001
             self.assertEqual(len(audio["call-r"].written), 2)
-            adapter._drain_native_events("call-r")  # noqa: SLF001
             adapter._dispatch_once("call-r")  # noqa: SLF001
             signals = [entry[1] for entry in delivered
                        if entry[0] == "call-r"
@@ -2326,6 +2344,121 @@ class RemoteHoldGateTest(unittest.TestCase):
         finally:
             adapter._calls.pop("call-r", None)  # noqa: SLF001
             adapter._running = False  # noqa: SLF001
+
+
+class ResumeNativeCleanupTest(unittest.TestCase):
+    """RESUME invariant regression: the remote-hold gate stays closed
+    until native stale media is cleaned off the SIP loop.
+
+    Stack RESUME only enqueues; the per-call dispatcher runs native
+    cleanup (``flush_tx`` + bounded stale RX drain) while the gate is
+    still closed, and only then reopens the gate and delivers
+    ``hold(False)``. A pump racing the pending resume moves zero
+    TX/RX. Event waits are fail-safes only."""
+
+    def test_gate_stays_closed_through_native_cleanup(self) -> None:
+        import threading
+
+        from receptionist.baresip_adapter import (
+            BaresipTelephonyAdapter,
+            _CallRecord,
+        )
+        from receptionist.telephony_config import TelephonyConfig
+
+        delivered: list = []
+        entered = threading.Event()
+        release = threading.Event()
+        resumed = threading.Event()
+
+        class _ResumeRecorder:
+            def on_caller_audio(self, call_id: str, frame) -> None:  # noqa: ANN001, ANN202
+                delivered.append((call_id, "audio"))
+
+            def on_dtmf(self, call_id: str, digit: str) -> None:  # noqa: ANN001, ANN202
+                if digit == "0":
+                    # Park the dispatcher here: everything behind this
+                    # event (hold, DTMF, resume) stays queued while the
+                    # test drives the pump against the closed gate.
+                    entered.set()
+                    release.wait(timeout=10)
+                delivered.append((call_id, f"dtmf:{digit}"))
+
+            def on_remote_hold(self, call_id: str, held: bool) -> None:  # noqa: ANN001, ANN202
+                delivered.append((call_id, f"hold:{held}"))
+                if not held:
+                    resumed.set()
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_listener(_ResumeRecorder())
+        adapter._running = True  # noqa: SLF001
+        stub = _StubAudio()
+        # Stale native buffers: three chunks the dispatcher cleanup
+        # must drain (then empty, so the bounded drain terminates).
+        stub.read_script = [b"\x01" * 640, b"\x02" * 640, b"\x03" * 640]
+        record = _CallRecord(app_id="call-n", native=_StubNative(stub))
+        adapter._calls["call-n"] = record  # noqa: SLF001
+        try:
+            adapter._ensure_rx_dispatch("call-n")  # noqa: SLF001
+            thread = record.rx_thread
+            # Live dispatcher, then HOLD with stale app-side TX.
+            adapter._enqueue_native_event("call-n", ("dtmf", "0"))  # noqa: SLF001
+            self.assertTrue(entered.wait(timeout=5))
+            self.assertTrue(adapter._gate_remote_hold("call-n", True))  # noqa: SLF001
+            adapter._enqueue_native_event("call-n", ("hold", True))  # noqa: SLF001
+            adapter.send_audio("call-n", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            self.assertGreater(record.tx_bytes, 0)
+            # DTMF between hold and resume (causal order must survive).
+            adapter._enqueue_native_event("call-n", ("dtmf", "5"))  # noqa: SLF001
+            # Stack RESUME while the dispatcher is still parked: the
+            # gate must stay closed (native cleanup pending).
+            self.assertTrue(adapter._gate_remote_hold("call-n", False))  # noqa: SLF001
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-n", ("hold", False))
+            self.assertTrue(record.remote_hold)
+            # A pump racing the pending resume moves zero TX/RX: no
+            # writes, no reads, nothing newly deliverable.
+            writes_before = len(stub.written)
+            reads_before = stub.reads
+            delivered_before = len(delivered)
+            adapter._pump_once()  # noqa: SLF001
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(stub.written), writes_before)
+            self.assertEqual(stub.reads, reads_before)
+            self.assertEqual(len(delivered), delivered_before)
+            self.assertTrue(record.remote_hold)
+            self.assertEqual(stub.flush_tx_calls, 0)
+            # Release the dispatcher: native cleanup runs first
+            # (flush_tx + stale RX drained), and only then the gate
+            # reopens and hold(False) is delivered.
+            release.set()
+            self.assertTrue(resumed.wait(timeout=5))
+            self.assertEqual(stub.flush_tx_calls, 1)
+            self.assertEqual(stub.read_script, [])
+            self.assertFalse(record.remote_hold)
+            self.assertEqual(record.tx_bytes, 0)
+            self.assertEqual(
+                delivered,
+                [("call-n", "dtmf:0"), ("call-n", "hold:True"),
+                 ("call-n", "dtmf:5"), ("call-n", "hold:False")],
+            )
+            # Fresh media flows again both ways after the cleanup.
+            stub.read_script = None
+            adapter.send_audio("call-n", make_frame(
+                tone_pcm(duration_seconds=0.02, sample_rate=16000), 16000))
+            adapter._pump_once()  # noqa: SLF001
+            self.assertEqual(len(stub.written), writes_before + 1)
+            adapter._dispatch_once("call-n")  # noqa: SLF001
+            self.assertEqual(delivered[-1], ("call-n", "audio"))
+        finally:
+            release.set()
+            adapter._calls.pop("call-n", None)  # noqa: SLF001
+            adapter._running = False  # noqa: SLF001
+            if thread is not None:
+                thread.join(timeout=5)
+            self.assertFalse(thread is not None and thread.is_alive())
 
 
 class TelephonyConfigTest(unittest.TestCase):

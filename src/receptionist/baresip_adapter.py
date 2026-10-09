@@ -979,12 +979,16 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         through the per-call dispatcher. Deliberately lightweight:
         in-memory flag plus queue mutation under the adapter lock only
         -- no listener, no core, no AI, no SQLite, no native I/O, never
-        blocking. Returns True when the gate changed state.
+        blocking. Returns True when the record is known (gate engaged
+        or resume accepted for dispatch).
 
-        Entry (False -> True) also discards already-queued caller RX:
-        a frame read before the HOLD must never reach
-        ``on_caller_audio`` after it. Resume (True -> False) flushes
-        stale TX/RX first, so only fresh media flows afterwards.
+        Entry (False -> True) engages the gate immediately and discards
+        already-queued caller RX: a frame read before the HOLD must
+        never reach ``on_caller_audio`` after it. Resume (True -> *)
+        deliberately leaves the gate CLOSED here: native stale-media
+        cleanup (``flush_tx`` plus a bounded RX drain) is native I/O
+        and belongs to the per-call dispatcher, which reopens the gate
+        only after the cleanup -- see :meth:`_on_native_remote_hold`.
         Unknown ids (close already handled) are ignored.
         """
         with self._lock:
@@ -994,25 +998,34 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             if held and not record.remote_hold:
                 record.remote_hold = True
                 record.rx_dispatch.clear()
-                return True
-            if not held and record.remote_hold:
-                record.tx.clear()
-                record.tx_bytes = 0
-                record.rx_dispatch.clear()
-                record.remote_hold = False
-                return True
-            return False
+            return True
 
     def _on_native_remote_hold(self, app_id: str, held: bool) -> None:
+        """Deliver one queued hold/resume on the per-call dispatcher.
+
+        The gate stays closed across RESUME until native stale media
+        is cleaned: on ``held=False`` this runs the native cleanup
+        (queued TX/RX dropped, ``flush_tx``, bounded stale RX drain --
+        all off the SIP loop) while ``remote_hold`` is still True, and
+        only then reopens the gate and notifies the core. The pump and
+        the dispatch gate therefore observe a closed gate for the whole
+        native-cleanup window, so no stale frame can flow and no fresh
+        frame flows early.
+        """
         with self._lock:
             record = self._calls.get(app_id)
             if record is None:
                 return
-            was_held = record.remote_hold
-            record.remote_hold = held
-        if was_held and not held:
-            # Peer resumed: same freshness rule as local resume.
+        if not held:
+            # Still gated: purge native stale media first (dispatcher
+            # thread, never the SIP loop), then reopen the gate, then
+            # notify -- in exactly this order.
             self._flush_record(record)
+            with self._lock:
+                record.remote_hold = False
+        else:
+            with self._lock:
+                record.remote_hold = True
         self._deliver(app_id, "on_remote_hold", held)
 
     def _on_native_established(self, app_id: str) -> None:
