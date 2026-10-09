@@ -58,7 +58,7 @@
       "id": "sipp-answer-bye",
       "name": "INVITE answered, remote BYE completed",
       "result": "pass",
-      "detail": "---------------------- Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-08\t21:03:56.409481\t1791493436.409481: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 200 Answering\n> ACK sip:127.0.0.1:5070 SIP/2.0\n< INVITE sip:sipp@127.0.0.1:5061 SIP/2.0\n> SIP/2.0 200 OK\n< ACK sip:sipp@127.0.0.1:5061 SIP/2.0\n> BYE sip:127.0.0.1:5070 SIP/2.0\n< SIP/2.0 200 OK"
+      "detail": "---------------------- Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-09\t12:55:00.858754\t1791550500.858754: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 200 Answering\n> ACK sip:127.0.0.1:5070 SIP/2.0\n< INVITE sip:sipp@127.0.0.1:5061 SIP/2.0\n> SIP/2.0 200 OK\n< ACK sip:sipp@127.0.0.1:5061 SIP/2.0\n> BYE sip:127.0.0.1:5070 SIP/2.0\n< SIP/2.0 200 OK"
     },
     {
       "id": "evt-remote-bye",
@@ -76,7 +76,7 @@
       "id": "sipp-reject",
       "name": "declined INVITE gets 486, no media",
       "result": "pass",
-      "detail": "0:00:00:000000           | 00:00:00:000000          \n  Call Length            | 00:00:00:000000           | 00:00:00:000000          \n------------------------------ Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-08\t21:03:57.934081\t1791493437.934081: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 486 Busy Here\n> ACK sip:700@127.0.0.1:5070 SIP/2.0"
+      "detail": "0:00:00:000000           | 00:00:00:000000          \n  Call Length            | 00:00:00:000000           | 00:00:00:000000          \n------------------------------ Test Terminated --------------------------------\n\nResolving remote host '127.0.0.1'... Done.\n2026-10-09\t12:55:02.403775\t1791550502.403775: Failed to delete FD from epoll, errno = 1 (Operation not permitted)\n\nSIPT\n> INVITE sip:700@127.0.0.1:5070 SIP/2.0\n< SIP/2.0 180 Ringing\n< SIP/2.0 486 Busy Here\n> ACK sip:700@127.0.0.1:5070 SIP/2.0"
     },
     {
       "id": "sipp-hold",
@@ -112,13 +112,13 @@
       "id": "pcm-rx",
       "name": "caller PCM reaches app seam (pcma)",
       "result": "pass",
-      "detail": "bytes=138240 rms=0.156 voice_pushed=137600"
+      "detail": "bytes=138880 rms=0.156 voice_pushed=138880"
     },
     {
       "id": "pcm-rx-format",
       "name": "inbound normalized to 16kHz mono pcm16",
       "result": "pass",
-      "detail": "frames=216"
+      "detail": "frames=217"
     },
     {
       "id": "codec-negotiated",
@@ -136,7 +136,7 @@
       "id": "pcm-tx",
       "name": "assistant PCM reaches the caller over RTP",
       "result": "pass",
-      "detail": "rms_tail=0.2819 rms=0.2768 bytes=64000 rx_cap=32768 adapter={'tx_bytes': 0, 'tx_dropped': 0, 'tx_rate': 8000, 'established': True, 'native': {'tx_silence': 284, 'tx_starved': 0, 'tx_buffered': 320, 'tx_rejected': 0, 'tx_flushed': 0}, 'accepted_total': 64320, 'restarts': 0, 'first_tx_at': 1791493452.9669578}"
+      "detail": "rms_tail=0.2804 rms=0.2761 bytes=64320 rx_cap=32768 adapter={'tx_bytes': 0, 'tx_dropped': 0, 'tx_rate': 8000, 'established': True, 'native': {'tx_silence': 285, 'tx_starved': 0, 'tx_buffered': 320, 'tx_rejected': 0, 'tx_flushed': 0}, 'accepted_total': 64320, 'restarts': 0, 'first_tx_at': 1791550517.4056323}"
     },
     {
       "id": "dtmf-rx",
@@ -362,7 +362,6 @@
       "SIP/2.0 180 Ringing",
       "SIP/2.0 200 Answering",
       "ACK sip:127.0.0.1:5070 SIP/2.0",
-      "SIP/2.0 486 Busy Here",
       "INVITE sip:sipp@127.0.0.1:5063 SIP/2.0",
       "SIP/2.0 200 OK",
       "ACK sip:sipp@127.0.0.1:5063 SIP/2.0",
@@ -370,12 +369,13 @@
       "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
       "SIP/2.0 200 OK",
       "ACK sip:127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 486 Busy Here",
       "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
       "SIP/2.0 200 OK",
       "ACK sip:127.0.0.1:5070 SIP/2.0",
-      "SIP/2.0 486 Busy Here",
       "BYE sip:127.0.0.1:5070 SIP/2.0",
       "SIP/2.0 200 OK",
+      "SIP/2.0 486 Busy Here",
       "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
       "SIP/2.0 180 Ringing",
       "SIP/2.0 200 Answering",
@@ -423,16 +423,16 @@
       "baresip-rx-call-10"
     ]
   },
-  "keep": true,
+  "keep": false,
   "meta": {
     "os": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
     "arch": "x86_64",
     "python": "3.12.3",
     "codec_run": "pcma",
-    "run_id": "m25-1791493419-558483",
-    "started_at": "2026-10-08T21:03:39Z",
-    "head_sha": "a4cb1671036439729ce7f81f4b63286ed598c4ae",
-    "tested_code_sha": "a4cb1671036439729ce7f81f4b63286ed598c4ae",
+    "run_id": "m25-1791550482-135776",
+    "started_at": "2026-10-09T12:54:42Z",
+    "head_sha": "da8d73f5f08ee5191c6e1917eb5e2c66bdc0e8b8",
+    "tested_code_sha": "da8d73f5f08ee5191c6e1917eb5e2c66bdc0e8b8",
     "worktree_dirty": [],
     "allow_dirty": false,
     "baresip_python": "0.5.2a3",
@@ -440,7 +440,7 @@
     "sipp": [
       "SIPp v3.7.2-TLS-SCTP-PCAP."
     ],
-    "finished_at": "2026-10-08T21:05:25Z"
+    "finished_at": "2026-10-09T12:56:29Z"
   },
   "reg_aor_initial": "\n      Aor:  <Aor..............................................>  <MaxContact>\n    Contact:  <Aor/ContactUri............................> <Hash....> <Status> <RTT(ms)..>\n==========================================================================================\n\n      Aor:  700                                                  2\n    Contact:  700/sip:700@127.0.0.1:5070                   26759a928f NonQual         nan\n\n\n ParameterName        : ParameterValue\n =============================================\n authenticate_qualify : false\n contact              : sip:700@127.0.0.1:5070\n default_expiration   : 3600\n mailboxes            : \n max_contacts         : 2\n maximum_expiration   : 7200\n minimum_expiration   : 60\n outbound_proxy       : \n qualify_frequency    : 0\n qualify_timeout      : 3.000000\n remove_existing      : true\n remove_unavailable   : false\n support_path         : false\n voicemail_extension  : \n\n",
   "tx_debug": {
@@ -449,7 +449,7 @@
     "tx_rate": 8000,
     "established": true,
     "native": {
-      "tx_silence": 284,
+      "tx_silence": 285,
       "tx_starved": 0,
       "tx_buffered": 320,
       "tx_rejected": 0,
@@ -457,561 +457,571 @@
     },
     "accepted_total": 64320,
     "restarts": 0,
-    "first_tx_at": 1791493452.9669578
+    "first_tx_at": 1791550517.4056323
   },
   "adapter_events": [
     {
-      "t": 1791493433.3,
+      "t": 1791550497.72,
       "call": "call-1",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493433.3,
+      "t": 1791550497.72,
       "call": "call-1",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493433.31,
+      "t": 1791550497.72,
       "call": "call-1",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493433.41,
+      "t": 1791550497.86,
       "call": "call-1",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493433.41,
+      "t": 1791550497.86,
       "call": "call-1",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493433.41,
+      "t": 1791550497.86,
       "call": "call-1",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493436.45,
+      "t": 1791550500.86,
       "call": "call-1",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493437.93,
+      "t": 1791550502.4,
       "call": "declined-1",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493438.43,
+      "t": 1791550502.81,
       "call": "call-2",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493438.43,
+      "t": 1791550502.81,
       "call": "call-2",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493438.43,
+      "t": 1791550502.81,
       "call": "call-2",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493438.51,
+      "t": 1791550502.88,
       "call": "call-2",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493438.51,
+      "t": 1791550502.88,
       "call": "call-2",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493438.51,
+      "t": 1791550502.88,
       "call": "call-2",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493439.51,
+      "t": 1791550503.88,
       "call": "call-2",
       "kind": "stack:CALL_HOLD"
     },
     {
-      "t": 1791493439.51,
+      "t": 1791550503.88,
       "call": "call-2",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493439.53,
+      "t": 1791550503.89,
       "call": "call-2",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493439.53,
+      "t": 1791550503.89,
       "call": "call-2",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493440.53,
+      "t": 1791550504.89,
       "call": "call-2",
       "kind": "stack:CALL_RESUME"
     },
     {
-      "t": 1791493440.53,
+      "t": 1791550504.89,
       "call": "call-2",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493440.53,
+      "t": 1791550504.89,
       "call": "call-2",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493440.53,
+      "t": 1791550504.89,
       "call": "call-2",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493441.57,
+      "t": 1791550505.93,
       "call": "call-2",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493442.04,
+      "t": 1791550506.39,
       "call": "call-3",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493442.04,
+      "t": 1791550506.39,
       "call": "call-3",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493442.04,
+      "t": 1791550506.39,
       "call": "call-3",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493442.09,
+      "t": 1791550506.52,
       "call": "call-3",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493442.09,
+      "t": 1791550506.52,
       "call": "call-3",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493442.09,
+      "t": 1791550506.52,
       "call": "call-3",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493447.08,
+      "t": 1791550511.43,
       "call": "call-3",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493448.36,
+      "t": 1791550512.79,
+      "call": "call-4",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791550512.79,
+      "call": "call-4",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791550512.79,
       "call": "call-4",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493448.37,
+      "t": 1791550512.79,
       "call": "call-4",
       "kind": "stack:CALL_RTPESTAB"
     },
     {
-      "t": 1791493448.51,
+      "t": 1791550512.87,
       "call": "call-4",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493448.51,
+      "t": 1791550512.87,
       "call": "call-4",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493448.51,
+      "t": 1791550512.87,
       "call": "call-4",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493453.37,
+      "t": 1791550517.79,
       "call": "call-4",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493458.05,
+      "t": 1791550522.5,
       "call": "call-4",
       "kind": "stack:CALL_DTMF_START"
     },
     {
-      "t": 1791493458.23,
+      "t": 1791550522.67,
       "call": "call-4",
       "kind": "stack:CALL_DTMF_END"
     },
     {
-      "t": 1791493458.37,
+      "t": 1791550522.79,
       "call": "call-4",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493458.43,
+      "t": 1791550522.88,
       "call": "call-4",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493458.43,
+      "t": 1791550522.88,
       "call": "call-4",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493458.45,
+      "t": 1791550522.89,
       "call": "call-4",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493460.44,
+      "t": 1791550524.89,
       "call": "call-4",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493460.44,
+      "t": 1791550524.89,
       "call": "call-4",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493460.44,
+      "t": 1791550524.89,
       "call": "call-4",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493461.45,
+      "t": 1791550525.9,
       "call": "call-5",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493461.45,
+      "t": 1791550525.9,
       "call": "call-5",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493461.45,
+      "t": 1791550525.9,
       "call": "call-5",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493461.49,
+      "t": 1791550525.94,
       "call": "call-5",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493461.7,
+      "t": 1791550525.94,
       "call": "call-6",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493461.7,
+      "t": 1791550525.94,
       "call": "call-6",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493461.7,
+      "t": 1791550525.94,
       "call": "call-6",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493461.7,
+      "t": 1791550525.95,
       "call": "call-6",
       "kind": "stack:CALL_RTPESTAB"
     },
     {
-      "t": 1791493461.8,
+      "t": 1791550526.08,
       "call": "call-6",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493461.8,
+      "t": 1791550526.08,
       "call": "call-6",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493461.8,
+      "t": 1791550526.08,
       "call": "call-6",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493463.74,
+      "t": 1791550527.99,
       "call": "call-4",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493464.99,
+      "t": 1791550529.24,
       "call": "call-7",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493464.99,
+      "t": 1791550529.24,
       "call": "call-7",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493464.99,
+      "t": 1791550529.24,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493464.99,
+      "t": 1791550529.24,
       "call": "call-7",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493464.99,
+      "t": 1791550529.24,
       "call": "call-7",
       "kind": "stack:CALL_RTPESTAB"
     },
     {
-      "t": 1791493465.1,
+      "t": 1791550529.37,
       "call": "call-7",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493465.1,
+      "t": 1791550529.37,
       "call": "call-7",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493465.1,
+      "t": 1791550529.37,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493465.1,
+      "t": 1791550529.37,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493465.1,
+      "t": 1791550529.38,
       "call": "call-7",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493466.7,
+      "t": 1791550530.95,
       "call": "call-6",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493470.1,
+      "t": 1791550534.37,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493471.7,
+      "t": 1791550535.95,
       "call": "call-6",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493473.05,
+      "t": 1791550537.3,
       "call": "call-7",
       "kind": "stack:CALL_HOLD"
     },
     {
-      "t": 1791493473.05,
+      "t": 1791550537.3,
       "call": "call-7",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493473.07,
+      "t": 1791550537.32,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_RESUME"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493474.55,
+      "t": 1791550538.8,
       "call": "call-7",
       "kind": "stack:CALL_RTCP"
     },
     {
-      "t": 1791493474.59,
+      "t": 1791550538.84,
       "call": "call-7",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493474.88,
+      "t": 1791550539.14,
       "call": "call-6",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493474.95,
+      "t": 1791550539.21,
       "call": "call-8",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493474.95,
+      "t": 1791550539.21,
       "call": "call-8",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493474.95,
+      "t": 1791550539.21,
       "call": "call-8",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493475.02,
+      "t": 1791550539.33,
       "call": "call-8",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493475.02,
+      "t": 1791550539.33,
       "call": "call-8",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493475.02,
+      "t": 1791550539.33,
       "call": "call-8",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493475.05,
+      "t": 1791550539.37,
       "call": "call-8",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493476.4,
+      "t": 1791550540.72,
       "call": "call-9",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493476.4,
+      "t": 1791550540.72,
       "call": "call-9",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493476.4,
+      "t": 1791550540.72,
       "call": "call-9",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493476.41,
+      "t": 1791550540.73,
       "call": "call-9",
       "kind": "stack:CALL_RTPESTAB"
     },
     {
-      "t": 1791493476.46,
+      "t": 1791550540.82,
       "call": "call-9",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493476.46,
+      "t": 1791550540.82,
       "call": "call-9",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493476.46,
+      "t": 1791550540.82,
       "call": "call-9",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493483.45,
+      "t": 1791550547.76,
       "call": "call-9",
       "kind": "stack:CALL_CLOSED"
     },
     {
-      "t": 1791493518.0,
+      "t": 1791550582.43,
       "call": "call-10",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493518.0,
+      "t": 1791550582.43,
       "call": "call-10",
       "kind": "local-sdp:answer"
     },
     {
-      "t": 1791493518.0,
+      "t": 1791550582.43,
       "call": "call-10",
       "kind": "stack:CALL_ESTABLISHED"
     },
     {
-      "t": 1791493518.0,
+      "t": 1791550582.44,
       "call": "call-10",
       "kind": "stack:CALL_RTPESTAB"
     },
     {
-      "t": 1791493518.05,
+      "t": 1791550582.51,
       "call": "call-10",
       "kind": "stack:CALL_LOCAL_SDP"
     },
     {
-      "t": 1791493518.05,
+      "t": 1791550582.51,
       "call": "call-10",
       "kind": "local-sdp:offer"
     },
     {
-      "t": 1791493518.05,
+      "t": 1791550582.52,
       "call": "call-10",
       "kind": "stack:CALL_REMOTE_SDP"
     },
     {
-      "t": 1791493519.04,
+      "t": 1791550583.47,
       "call": "call-10",
       "kind": "stack:CALL_CLOSED"
     }
