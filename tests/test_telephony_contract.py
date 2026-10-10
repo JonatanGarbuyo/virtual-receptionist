@@ -2461,6 +2461,295 @@ class ResumeNativeCleanupTest(unittest.TestCase):
             self.assertFalse(thread is not None and thread.is_alive())
 
 
+class RefreshSequentialTest(unittest.TestCase):
+    """B1: refresh is two sequential single-leg dances, never one
+    concurrent race. unregister() is awaited first (binding
+    deterministically gone), then register() (binding
+    deterministically back); fresh requires both legs confirmed.
+    A scripted UA plus a real loop thread drives the production
+    seam; Event-free settle bounds each case by ~1 s."""
+
+    def _loop_adapter(self, ua):
+        import asyncio
+        import threading
+
+        from receptionist.baresip_adapter import BaresipTelephonyAdapter
+        from receptionist.telephony_config import TelephonyConfig
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        adapter._loop = loop  # noqa: SLF001
+        adapter._running = True  # noqa: SLF001
+        adapter._ua = ua  # noqa: SLF001
+        adapter._reg_state = TelephonyRegistrationState.REGISTERED  # noqa: SLF001
+        return adapter, loop, thread
+
+    def _close_loop(self, loop, thread) -> None:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+    class _ScriptedUA:
+        """Fake stack UA: records primitive order, confirms each leg
+        with one REGISTER_OK like the binding (one opaque event per
+        dance leg), or raises scripted failures."""
+
+        def __init__(self, adapter, fail_unregister=None, fail_register=None) -> None:  # noqa: ANN001, ANN202
+            self._adapter = adapter
+            self._fail_unregister = fail_unregister
+            self._fail_register = fail_register
+            self.calls: list = []
+
+        async def unregister(self) -> None:
+            self.calls.append("unregister")
+            if self._fail_unregister is not None:
+                raise self._fail_unregister
+            with self._adapter._lock:  # noqa: SLF001
+                self._adapter._register_ok_count += 1  # noqa: SLF001
+
+        async def register(self) -> None:
+            self.calls.append("register")
+            if self._fail_register is not None:
+                raise self._fail_register
+            with self._adapter._lock:  # noqa: SLF001
+                self._adapter._register_ok_count += 1  # noqa: SLF001
+
+    def test_refresh_unregisters_first_then_registers(self) -> None:
+        ua_holder: dict = {}
+        adapter, loop, thread = self._loop_adapter(None)  # type: ignore[arg-type]
+        try:
+            ua = self._ScriptedUA(adapter)
+            ua_holder["ua"] = ua
+            adapter._ua = ua  # noqa: SLF001
+            state, fresh = adapter.refresh_registration(timeout=10)
+            # Sequential, unregister first: no concurrent legs means
+            # server scheduling cannot reorder the outcome.
+            self.assertEqual(ua.calls, ["unregister", "register"])
+            self.assertTrue(fresh)
+            self.assertIs(state, TelephonyRegistrationState.REGISTERED)
+        finally:
+            self._close_loop(loop, thread)
+
+    def test_refresh_register_failure_is_not_fresh(self) -> None:
+        class _RegFailed(Exception):
+            pass
+
+        adapter, loop, thread = self._loop_adapter(None)  # type: ignore[arg-type]
+        try:
+            ua = self._ScriptedUA(
+                adapter, fail_register=_RegFailed(" registrar rejected"))
+            adapter._ua = ua  # noqa: SLF001
+            _, fresh = adapter.refresh_registration(timeout=10)
+            # The unregister leg ran (and confirmed deletion); the
+            # register leg never confirmed a live binding.
+            self.assertEqual(ua.calls, ["unregister", "register"])
+            self.assertFalse(fresh)
+        finally:
+            self._close_loop(loop, thread)
+
+    def test_refresh_unregister_failure_skips_register(self) -> None:
+        class _UnregFailed(Exception):
+            pass
+
+        adapter, loop, thread = self._loop_adapter(None)  # type: ignore[arg-type]
+        try:
+            ua = self._ScriptedUA(
+                adapter, fail_unregister=_UnregFailed("no answer"))
+            adapter._ua = ua  # noqa: SLF001
+            _, fresh = adapter.refresh_registration(timeout=10)
+            self.assertEqual(ua.calls, ["unregister"])
+            self.assertFalse(fresh)
+        finally:
+            self._close_loop(loop, thread)
+
+
+def _named_error(name: str) -> Exception:
+    """Vendor-named error double without importing the native binding
+    (the adapter branches on ``type(error).__name__`` only)."""
+    return type(name, (Exception,), {})()
+
+
+class DeclineFallbackTest(unittest.TestCase):
+    """M1: a 486 decline is never silently abandoned. Stale-handle
+    races retry with backoff; every other failure falls through to
+    answer+BYE release, which pops the record even when the 486 did
+    take effect. Deterministic: the shared coroutine runs under
+    ``asyncio.run`` with stub natives (no loop thread, no sleeps)."""
+
+    def _adapter(self):
+        from receptionist.baresip_adapter import BaresipTelephonyAdapter
+        from receptionist.telephony_config import TelephonyConfig
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter._running = True  # noqa: SLF001
+        adapter._REJECT_RETRY_DELAYS = ()  # noqa: SLF001 (no timing in tests)
+        return adapter
+
+    def _loop_adapter(self):
+        """Adapter with a real loop thread so the fire-and-forget
+        answer+BYE release executes (its answer-failure path pops
+        immediately, never the 15 s safety wait)."""
+        import asyncio
+        import threading
+
+        adapter = self._adapter()
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        adapter._loop = loop  # noqa: SLF001
+        return adapter, loop, thread
+
+    def _close_loop(self, loop, thread) -> None:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+    def _await_pop(self, adapter, call_id: str, timeout: float = 5.0) -> None:
+        """Bounded pop wait: the release coroutine pops synchronously
+        right after answer() settles, so this is a fail-safe join,
+        never the mechanism (answer invocation is event-observed)."""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while call_id in adapter._calls:  # noqa: SLF001
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        self.assertNotIn(call_id, adapter._calls)  # noqa: SLF001
+
+    class _DeclineNative:
+        def __init__(self, reject_error=None, answer_error=None) -> None:  # noqa: ANN001, ANN202
+            self._reject_error = reject_error
+            self._answer_error = answer_error
+            self.reject_calls = 0
+            self.answer_calls = 0
+
+        def reject(self):  # noqa: ANN202
+            self.reject_calls += 1
+            if self._reject_error is not None:
+                raise self._reject_error
+            return None
+
+        def answer(self):  # noqa: ANN202
+            self.answer_calls += 1
+            if self._answer_error is not None:
+                raise self._answer_error
+            return None
+
+        def hangup(self):  # noqa: ANN202
+            return None
+
+    def _record(self, adapter, native, call_id="call-d"):
+        from receptionist.baresip_adapter import _CallRecord
+
+        record = _CallRecord(app_id=call_id, native=native)
+        adapter._calls[call_id] = record  # noqa: SLF001
+        return record
+
+    def test_non_stale_errors_fall_through_to_release(self) -> None:
+        import asyncio
+        import threading
+
+        for name in (
+            "CommandQueueFull",
+            "CommandTimeout",
+            "RuntimeDead",
+            "BaresipError",
+        ):
+            adapter, loop, thread = self._loop_adapter()
+            try:
+                answered = threading.Event()
+                stale = _named_error("StaleHandleError")
+                native = self._DeclineNative(
+                    reject_error=_named_error(name),
+                    answer_error=stale)
+                orig_answer = native.answer
+
+                def _answer_and_signal():  # noqa: ANN202
+                    try:
+                        return orig_answer()
+                    finally:
+                        answered.set()
+
+                native.answer = _answer_and_signal  # type: ignore[method-assign]
+                record = self._record(adapter, native)
+                asyncio.run(adapter._decline_with_fallback(  # noqa: SLF001
+                    record, native.reject))
+                # No silent abandon: the fallback answered (the 486
+                # path failed with a non-stale error) ...
+                self.assertEqual(native.reject_calls, 1)
+                self.assertTrue(answered.wait(timeout=5))
+                self.assertEqual(native.answer_calls, 1)
+                # ... saw the gone leg, and popped the record + lock.
+                self._await_pop(adapter, "call-d")
+                self.assertNotIn("call-d", adapter._cb_locks)  # noqa: SLF001
+            finally:
+                self._close_loop(loop, thread)
+
+    def test_stale_exhaustion_falls_through_to_release(self) -> None:
+        import asyncio
+        import threading
+
+        adapter, loop, thread = self._loop_adapter()
+        try:
+            answered = threading.Event()
+            stale = _named_error("StaleHandleError")
+            native = self._DeclineNative(
+                reject_error=stale, answer_error=stale)
+            orig_answer = native.answer
+
+            def _answer_and_signal():  # noqa: ANN202
+                try:
+                    return orig_answer()
+                finally:
+                    answered.set()
+
+            native.answer = _answer_and_signal  # type: ignore[method-assign]
+            record = self._record(adapter, native)
+            asyncio.run(adapter._decline_with_fallback(  # noqa: SLF001
+                record, native.reject))
+            self.assertEqual(native.reject_calls, 1)
+            self.assertTrue(answered.wait(timeout=5))
+            self.assertEqual(native.answer_calls, 1)
+            self._await_pop(adapter, "call-d")
+        finally:
+            self._close_loop(loop, thread)
+
+    def test_successful_reject_never_falls_back(self) -> None:
+        import asyncio
+
+        adapter = self._adapter()
+        native = self._DeclineNative()
+        record = self._record(adapter, native)
+        asyncio.run(adapter._decline_with_fallback(  # noqa: SLF001
+            record, native.reject))
+        self.assertEqual(native.reject_calls, 1)
+        self.assertEqual(native.answer_calls, 0)
+        # Normal close routing still owns the leg.
+        self.assertIn("call-d", adapter._calls)  # noqa: SLF001
+
+    def test_reject_without_stack_drops_record(self) -> None:
+        adapter = self._adapter()
+        native = self._DeclineNative()
+        self._record(adapter, native)
+        # No loop thread: no close will ever arrive, so reject() must
+        # drop the record instead of leaking the admission slot.
+        adapter.reject("call-d")
+        self.assertNotIn("call-d", adapter._calls)  # noqa: SLF001
+        self.assertNotIn("call-d", adapter._cb_locks)  # noqa: SLF001
+
+    def test_decline_native_without_stack_retains_nothing(self) -> None:
+        adapter = self._adapter()
+        native = self._DeclineNative()
+        adapter._decline_native(native)  # noqa: SLF001
+        self.assertEqual(adapter._calls, {})  # noqa: SLF001
+        self.assertEqual(adapter._cb_locks, {})  # noqa: SLF001
+
+
 class TelephonyConfigTest(unittest.TestCase):
     def test_strict_integers_and_typed_listen(self) -> None:
         from receptionist.telephony_config import telephony_config_from_mapping

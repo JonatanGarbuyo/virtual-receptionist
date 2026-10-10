@@ -396,17 +396,22 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         so operators and tests can verify re-registration deterministically
         without waiting out ``reg_interval``. Returns ``(state, fresh)``
         where ``fresh`` is True only if the registrar confirmed *this*
-        refresh (a REGISTER_OK arrived while waiting) -- never a stale
-        previous state. The outcome also surfaces through the status
+        refresh (both sequential legs below confirmed with a REGISTER_OK
+        while waiting) -- never a stale previous state. The outcome also surfaces through the status
         listener (REGISTERED, or REGISTRATION_FAILED/LOST); transport
         errors never propagate to the caller as vendor types.
 
-        Stack note: the native ``ua_register()`` refreshes by first
-        unregistering the old dialog (expires-0 REGISTER, itself answered
-        with 200 OK and therefore a REGISTER_OK event) and then
-        registering a new dialog (challenged, retried with auth, answered
-        200 OK -- a second REGISTER_OK). ``ua.register()`` resolves on the
-        *first* outcome, so this method additionally waits for outcome
+        Stack note: a bare ``ua.register()`` refresh races itself. The
+        stack issues the expires-0 unregister and the new registration
+        as two *concurrent* dialogs on different Call-IDs, and digest
+        challenge latency decides which 200 OK lands last -- when the
+        unregister wins, the contact is deleted and nothing re-creates
+        it, while the adapter would still report REGISTERED/fresh (the
+        single opaque REGISTER_OK per dance cannot say which leg won).
+        Sequentializing (unregister awaited, then register awaited)
+        removes the race instead of out-retrying it: no concurrent legs
+        means server thread scheduling cannot reorder the outcome.
+        This method additionally waits for outcome quiescence (no new
         quiescence (no new REGISTER_OK for ``_SETTLE_QUIET_S``) bounded by
         ``_SETTLE_CAP_S`` before returning. Without the settle, a caller
         querying the registrar immediately after ``fresh=True`` can catch
@@ -422,6 +427,14 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
 
         async def run() -> None:
             try:
+                # Sequentialized refresh (B1): unregister first (one
+                # expires-0, awaited -- binding deterministically
+                # gone), then register (no current binding, so a
+                # single expires-N dialog, awaited -- binding
+                # deterministically back). A bare ua.register()
+                # issues both legs concurrently and the unregister
+                # 200 can land last, deleting the contact.
+                await ua.unregister()
                 await ua.register()
             except Exception as error:
                 name = type(error).__name__
@@ -451,7 +464,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             elif time.monotonic() - last_change >= _REFRESH_SETTLE_QUIET_S:
                 break
         with self._lock:
-            fresh = self._register_ok_count > mark
+            # Both sequential legs confirmed: an unregister 200 alone
+            # proves deletion, never a live binding.
+            fresh = self._register_ok_count - mark >= 2
             state = self._reg_state
         return state, fresh
 
@@ -553,12 +568,14 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         """Decline an inbound call with a SIP rejection (486).
 
         The native ``reject()`` is attempted first, retried with
-        backoff on ``StaleHandleError``; only a leg that never validates
-        is released via public answer+BYE (:meth:`_answer_then_release`)
-        so the slot never leaks. Either way the core outcome is
-        identical (released, slot freed, exactly-once close, no AI
-        resources opened). No patching, no unsafe handles, no vendor
-        types cross the boundary either way.
+        backoff on ``StaleHandleError``; any other failure (queue
+        full, command timeout, dead runtime, ...) falls through to
+        the same answer+BYE release (:meth:`_answer_then_release`) so
+        the slot never leaks -- a leg the core already finished can
+        never be left open. Either way the core outcome is identical
+        (released, slot freed, exactly-once close, no AI resources
+        opened). No patching, no unsafe handles, no vendor types
+        cross the boundary either way.
         """
         record = self._bind_pending_if_needed(call_id)
         with self._lock:
@@ -575,29 +592,18 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             record.decline_release = True
         loop = self._current_loop()
         if loop is None or not self._is_running():
+            # Stack unavailable: no close will ever arrive for this
+            # leg, so drop the record now instead of leaking the
+            # admission slot for the life of the process.
+            with self._lock:
+                self._calls.pop(call_id, None)
+                self._drop_cb_lock(call_id)
             return
 
         async def run() -> None:
-            for attempt, delay in enumerate(
-                (0.0,) + self._REJECT_RETRY_DELAYS
-            ):
-                if delay:
-                    await asyncio.sleep(delay)
-                try:
-                    result = record.native.reject()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    return
-                except Exception as error:
-                    if type(error).__name__ != "StaleHandleError":
-                        LOG.debug(
-                            "telephony op failed: %s", type(error).__name__
-                        )
-                        return
-                    LOG.debug("decline reject race, attempt %d", attempt)
-            # Genuinely gone (or never validated): release via
-            # answer+BYE so no slot leaks.
-            self._answer_then_release(record)
+            await self._decline_with_fallback(
+                record, lambda: record.native.reject()
+            )
 
         try:
             asyncio.run_coroutine_threadsafe(run(), loop)
@@ -1206,13 +1212,51 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         else:
             self._deliver(app_id, "on_transfer_result", result)
 
+    async def _decline_with_fallback(
+        self, record: _CallRecord, reject_op: Callable[[], Any]
+    ) -> None:
+        """Attempt a native 486 decline, releasing via answer+BYE on any
+        failure path so the admission slot never leaks.
+
+        ``StaleHandleError`` (leg validating concurrently) is retried
+        with backoff; any other failure -- queue full, command timeout,
+        dead runtime, transport error -- falls through to
+        :meth:`_answer_then_release` immediately. That fallback is safe
+        even when the 486 did take effect: the subsequent
+        ``answer()`` then raises ``StaleHandleError``, which pops the
+        already-closing record. Must run on the loop thread.
+        """
+        for attempt, delay in enumerate(
+            (0.0,) + self._REJECT_RETRY_DELAYS
+        ):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                result = reject_op()
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as error:
+                if type(error).__name__ == "StaleHandleError":
+                    LOG.debug("decline reject race, attempt %d", attempt)
+                    continue
+                LOG.debug(
+                    "decline falling back after %s", type(error).__name__
+                )
+                break
+        # Genuinely gone, never validated, or the decline primitive
+        # itself failed: release via answer+BYE so no slot leaks.
+        self._answer_then_release(record)
+
     def _decline_native(self, native_call: Any) -> None:
         """SIP-level decline for a native leg with no application id
         (inbound handler returned None): ``reject()`` first (486), with
-        the same answer-then-release fallback as :meth:`reject` on
-        ``StaleHandleError``. The leg gets a synthetic ``declined-N``
-        record so its close routes sanely (unknown to the core, which
-        ignores it) and no slot leaks."""
+        the same answer-then-release fallback as :meth:`reject` on *any*
+        failure -- not only ``StaleHandleError`` -- so a saturated
+        command queue or dead runtime cannot strand the leg. The leg
+        gets a synthetic ``declined-N`` record so its close routes
+        sanely (unknown to the core, which ignores it) and no slot
+        leaks."""
         with self._lock:
             self._declined_total += 1
             app_id = f"declined-{self._declined_total}"
@@ -1229,24 +1273,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             return
 
         async def run() -> None:
-            for attempt, delay in enumerate(
-                (0.0,) + self._REJECT_RETRY_DELAYS
-            ):
-                if delay:
-                    await asyncio.sleep(delay)
-                try:
-                    result = native_call.reject()
-                    if asyncio.iscoroutine(result):
-                        await result
-                    return
-                except Exception as error:
-                    if type(error).__name__ != "StaleHandleError":
-                        LOG.debug(
-                            "telephony op failed: %s", type(error).__name__
-                        )
-                        return
-                    LOG.debug("decline reject race, attempt %d", attempt)
-            self._answer_then_release(record)
+            await self._decline_with_fallback(
+                record, lambda: native_call.reject()
+            )
 
         try:
             asyncio.run_coroutine_threadsafe(run(), loop)
