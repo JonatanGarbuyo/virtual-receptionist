@@ -162,8 +162,43 @@ class ConversationLoopTest(unittest.TestCase):
         self.assertEqual(session.current_turn, 3)
         self.assertEqual(session.mode, ActiveMode.INFERENCE)
 
-    def test_caller_speech_while_greeting_barges_in(self) -> None:
-        # Barge-in is enabled by default (#24): speech over the greeting
+    def test_drain_finishes_on_tick_without_inbound_audio(self) -> None:
+        # M2: generation finished with TX still queued and the peer then
+        # sends no RTP (silence suppression). Driving only the periodic
+        # app clock must flip SPEAKING to LISTENING once TX drains, and
+        # the normal silence policy must resume afterwards.
+        from receptionist.audio import make_frame, tone_pcm
+        from receptionist.call_session import NO_INPUT_REPROMPT
+
+        core, telephony, voice, clock, _ = make_core()
+        core.start()
+        session = core.incoming_call("+34910000001")
+        backend = voice.sessions["call-1"]
+        backend.finish_playback(1)
+        backend.deliver_caller_speech("Quisiera hablar con ventas")
+        backend.deliver_response("Le comunico con ventas.", 2)
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        telephony.send_audio(
+            "call-1",
+            make_frame(tone_pcm(duration_seconds=0.5, sample_rate=16000), 16000),
+        )
+        backend.finish_playback(2)
+        # Generation end with playout pending: still speaking, drain
+        # armed, and no inbound frames arrive from here on.
+        self.assertEqual(session.mode, ActiveMode.SPEAKING)
+        self.assertGreater(telephony.playout_pending_bytes("call-1"), 0)
+        # TX drains with zero inbound RTP; only the tick runs.
+        telephony.drain_playout("call-1", 1 << 30)
+        self.assertEqual(telephony.playout_pending_bytes("call-1"), 0)
+        core.tick()
+        self.assertEqual(session.mode, ActiveMode.LISTENING)
+        # Normal silence policy resumes: reprompt after one window.
+        clock.advance(30.0)
+        core.tick()
+        spoken = [text for text, _ in backend.spoken]
+        self.assertIn(NO_INPUT_REPROMPT, spoken)
+
+    def test_caller_speech_while_greeting_barges_in(self) -> None:        # Barge-in is enabled by default (#24): speech over the greeting
         # cancels the greeting output and opens a fresh inference turn.
         from receptionist.boundaries import CancelReason
 
@@ -279,6 +314,48 @@ class EndCallTest(unittest.TestCase):
 
         self.assertEqual(telephony.hung_up, ["call-1"])
         self.assertEqual(len(calls.list_all()), 1)
+
+
+class PreAnswerCallerHangupTest(unittest.TestCase):
+    """CANCEL-equivalent at session level, deterministic: the caller
+    hangs up before the call is ever answered (INCOMING state). SIPp
+    cannot script this deterministically against a fast responder (the
+    200/CANCEL race), so the session contract carries the proof: reject
+    without answer, CALLER_HANGUP outcome, no voice resources."""
+
+    def test_hangup_while_incoming_rejects_without_answering(self) -> None:
+        from receptionist.call_session import CallSession
+        from receptionist.persistence import RuntimeStorage
+        from receptionist.policy import PolicyEngine
+
+        clock = FakeClock()
+        telephony = FakeTelephony()
+        session = CallSession(
+            call_id="call-9",
+            caller_id="+34910000009",
+            telephony=telephony,
+            voice=FakeVoiceBackend(),
+            greeting="Hola",
+            clock=clock,
+            policy_engine=PolicyEngine(
+                destinations={}, fallback_id="none", limits=Limits()
+            ),
+            runtime=RuntimeStorage(
+                calls=InMemoryCallRepository(),
+                messages=InMemoryMessageRepository(clock=clock),
+                transcripts=InMemoryTranscriptStore(),
+                audit=InMemoryAuditLog(),
+            ),
+        )
+        self.assertEqual(session.state, CallState.INCOMING)
+        # CANCEL before any answer: refuse, persist CALLER_HANGUP, open
+        # nothing (no answer, no voice session, no media).
+        session.handle_caller_hangup()
+        self.assertEqual(session.state, CallState.ENDED)
+        self.assertEqual(session.history, [CallState.INCOMING, CallState.ENDED])
+        self.assertEqual(telephony.answered, [])
+        self.assertEqual(telephony.rejected, ["call-9"])
+        self.assertIsNone(session.voice_session)
 
 
 class PolicyRejectTest(unittest.TestCase):

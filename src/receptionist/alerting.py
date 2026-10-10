@@ -44,6 +44,9 @@ CODE_AUDIT_UNAVAILABLE = "runtime.audit_unavailable"
 CODE_TRANSCRIPT_UNAVAILABLE = "transcript.unavailable"
 CODE_CAPACITY_SATURATED = "capacity.saturated"
 CODE_VOICE_BACKEND_NOT_READY = "voice_backend.not_ready"
+CODE_TELEPHONY_NOT_REGISTERED = "telephony.not_registered"
+CODE_TELEPHONY_LOST = "telephony.registration_lost"
+CODE_TELEPHONY_MEDIA_LOST = "telephony.media_lost"
 
 #: Project-owned safe phrases, one per code. Transition detail comes
 #: only from this registry, never from caller text, exception strings,
@@ -57,6 +60,9 @@ DETAIL_BY_CODE = {
     CODE_TRANSCRIPT_UNAVAILABLE: "transcript sidecar write failed",
     CODE_CAPACITY_SATURATED: "ai capacity saturated",
     CODE_VOICE_BACKEND_NOT_READY: "voice backend not ready",
+    CODE_TELEPHONY_NOT_REGISTERED: "telephony endpoint not registered",
+    CODE_TELEPHONY_LOST: "telephony registration lost",
+    CODE_TELEPHONY_MEDIA_LOST: "telephony media path lost",
 }
 
 
@@ -68,6 +74,7 @@ class HealthComponent(Enum):
     RUNTIME = "runtime"
     TRANSCRIPT = "transcript"
     CAPACITY = "capacity"
+    TELEPHONY = "telephony"
 
 
 class TransitionKind(Enum):
