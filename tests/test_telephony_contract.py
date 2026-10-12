@@ -2485,7 +2485,9 @@ class RefreshSequentialTest(unittest.TestCase):
         adapter._loop = loop  # noqa: SLF001
         adapter._running = True  # noqa: SLF001
         adapter._ua = ua  # noqa: SLF001
-        adapter._reg_state = TelephonyRegistrationState.REGISTERED  # noqa: SLF001
+        # Start unregistered: every REGISTERED below must be earned
+        # by an explicit leg outcome, never preset.
+        adapter._reg_state = TelephonyRegistrationState.REGISTRATION_LOST  # noqa: SLF001
         return adapter, loop, thread
 
     def _close_loop(self, loop, thread) -> None:
@@ -2493,20 +2495,26 @@ class RefreshSequentialTest(unittest.TestCase):
         thread.join(timeout=5)
 
     class _ScriptedUA:
-        """Fake stack UA: records primitive order, confirms each leg
-        with one REGISTER_OK like the binding (one opaque event per
-        dance leg), or raises scripted failures."""
+        """Fake stack UA: records primitive order and confirms each leg
+        the way the runtime hook does (counter bump only, never a
+        state set -- an unregister 200 must not report REGISTERED),
+        or raises scripted failures."""
 
-        def __init__(self, adapter, fail_unregister=None, fail_register=None) -> None:  # noqa: ANN001, ANN202
+        def __init__(self, adapter, fail_unregister=None, fail_register=None, noop_unregister=False) -> None:  # noqa: ANN001, ANN202
             self._adapter = adapter
             self._fail_unregister = fail_unregister
             self._fail_register = fail_register
+            self._noop_unregister = noop_unregister
             self.calls: list = []
 
         async def unregister(self) -> None:
             self.calls.append("unregister")
             if self._fail_unregister is not None:
                 raise self._fail_unregister
+            if self._noop_unregister:
+                # Binding short-circuit (already down): clean return,
+                # zero REGISTER_OK emitted, like the real primitive.
+                return
             with self._adapter._lock:  # noqa: SLF001
                 self._adapter._register_ok_count += 1  # noqa: SLF001
 
@@ -2518,15 +2526,15 @@ class RefreshSequentialTest(unittest.TestCase):
                 self._adapter._register_ok_count += 1  # noqa: SLF001
 
     def test_refresh_unregisters_first_then_registers(self) -> None:
-        ua_holder: dict = {}
         adapter, loop, thread = self._loop_adapter(None)  # type: ignore[arg-type]
         try:
             ua = self._ScriptedUA(adapter)
-            ua_holder["ua"] = ua
             adapter._ua = ua  # noqa: SLF001
             state, fresh = adapter.refresh_registration(timeout=10)
             # Sequential, unregister first: no concurrent legs means
-            # server scheduling cannot reorder the outcome.
+            # server scheduling cannot reorder the outcome. The
+            # REGISTERED state below is set by the completed register
+            # leg, never preset (started LOST) nor inferred.
             self.assertEqual(ua.calls, ["unregister", "register"])
             self.assertTrue(fresh)
             self.assertIs(state, TelephonyRegistrationState.REGISTERED)
@@ -2542,11 +2550,13 @@ class RefreshSequentialTest(unittest.TestCase):
             ua = self._ScriptedUA(
                 adapter, fail_register=_RegFailed(" registrar rejected"))
             adapter._ua = ua  # noqa: SLF001
-            _, fresh = adapter.refresh_registration(timeout=10)
+            state, fresh = adapter.refresh_registration(timeout=10)
             # The unregister leg ran (and confirmed deletion); the
-            # register leg never confirmed a live binding.
+            # register leg never confirmed a live binding, so the
+            # state must not claim REGISTERED either (B2).
             self.assertEqual(ua.calls, ["unregister", "register"])
             self.assertFalse(fresh)
+            self.assertIsNot(state, TelephonyRegistrationState.REGISTERED)
         finally:
             self._close_loop(loop, thread)
 
@@ -2559,11 +2569,65 @@ class RefreshSequentialTest(unittest.TestCase):
             ua = self._ScriptedUA(
                 adapter, fail_unregister=_UnregFailed("no answer"))
             adapter._ua = ua  # noqa: SLF001
-            _, fresh = adapter.refresh_registration(timeout=10)
+            state, fresh = adapter.refresh_registration(timeout=10)
             self.assertEqual(ua.calls, ["unregister"])
             self.assertFalse(fresh)
+            self.assertIsNot(state, TelephonyRegistrationState.REGISTERED)
         finally:
             self._close_loop(loop, thread)
+
+    def test_refresh_after_noop_unregister_stays_fresh(self) -> None:
+        """M4: when the binding is already down, unregister() no-ops
+        with zero events; a succeeding register leg must still report
+        fresh (booleans, not the shared counter)."""
+        adapter, loop, thread = self._loop_adapter(None)  # type: ignore[arg-type]
+        try:
+            ua = self._ScriptedUA(adapter, noop_unregister=True)
+            adapter._ua = ua  # noqa: SLF001
+            state, fresh = adapter.refresh_registration(timeout=10)
+            self.assertEqual(ua.calls, ["unregister", "register"])
+            self.assertTrue(fresh)
+            self.assertIs(state, TelephonyRegistrationState.REGISTERED)
+        finally:
+            self._close_loop(loop, thread)
+
+    def test_register_ok_never_sets_state(self) -> None:
+        """B2 (shutdown half): an expires-0 unbind confirmation arrives
+        as REGISTER_OK and must never report REGISTERED -- not while
+        stopping, not ever. Only explicit leg outcomes set state."""
+        from receptionist.baresip_adapter import BaresipTelephonyAdapter
+        from receptionist.telephony_config import TelephonyConfig
+
+        states: list = []
+
+        class _StatusSpy:
+            def on_registration_state(self, state, detail="") -> None:  # noqa: ANN001, ANN202
+                states.append(state)
+
+            def on_media_state(self, healthy, call_id="", detail="") -> None:  # noqa: ANN001, ANN202
+                pass
+
+        adapter = BaresipTelephonyAdapter(
+            TelephonyConfig(username="u", domain="d", password="p")
+        )
+        adapter.set_status_listener(_StatusSpy())
+        adapter._running = False  # noqa: SLF001 (mid-shutdown)
+        adapter._reg_state = TelephonyRegistrationState.STOPPING  # noqa: SLF001
+        states.clear()  # drop the subscribe-time snapshot
+        adapter._on_register_ok()  # noqa: SLF001 (unbind confirmation)
+        adapter._on_register_ok()  # noqa: SLF001
+        self.assertIs(
+            adapter.registration_state, TelephonyRegistrationState.STOPPING)
+        self.assertEqual(states, [])
+        self.assertEqual(adapter._register_ok_count, 2)  # noqa: SLF001
+        # And while running: still count-only, no implicit promotion.
+        adapter._running = True  # noqa: SLF001
+        adapter._reg_state = TelephonyRegistrationState.REGISTRATION_LOST  # noqa: SLF001
+        adapter._on_register_ok()  # noqa: SLF001
+        self.assertIs(
+            adapter.registration_state,
+            TelephonyRegistrationState.REGISTRATION_LOST)
+        self.assertEqual(states, [])
 
 
 def _named_error(name: str) -> Exception:

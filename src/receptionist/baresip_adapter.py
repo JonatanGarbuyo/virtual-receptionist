@@ -396,8 +396,8 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         so operators and tests can verify re-registration deterministically
         without waiting out ``reg_interval``. Returns ``(state, fresh)``
         where ``fresh`` is True only if the registrar confirmed *this*
-        refresh (both sequential legs below confirmed with a REGISTER_OK
-        while waiting) -- never a stale previous state. The outcome also surfaces through the status
+        refresh (both sequential legs awaited without error) -- never a
+        stale previous state. The outcome also surfaces through the status
         listener (REGISTERED, or REGISTRATION_FAILED/LOST); transport
         errors never propagate to the caller as vendor types.
 
@@ -411,19 +411,25 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         Sequentializing (unregister awaited, then register awaited)
         removes the race instead of out-retrying it: no concurrent legs
         means server thread scheduling cannot reorder the outcome.
-        This method additionally waits for outcome quiescence (no new
-        quiescence (no new REGISTER_OK for ``_SETTLE_QUIET_S``) bounded by
-        ``_SETTLE_CAP_S`` before returning. Without the settle, a caller
-        querying the registrar immediately after ``fresh=True`` can catch
-        the contact deleted (unregister processed, re-register still in
-        flight) -- a real, registrar-observable race, not a stale read.
+        ``fresh`` is two booleans from the awaited primitives
+        themselves, never inferred from the shared REGISTER_OK counter
+        (an unregister no-op emits zero events, and foreign outcomes
+        such as auto-refresh can land mid-refresh). This method still
+        waits for outcome quiescence (no new REGISTER_OK for
+        ``_REFRESH_SETTLE_QUIET_S``, bounded by ``_REFRESH_SETTLE_CAP_S``)
+        before returning, so stragglers never leak into the next call.
         """
         loop = self._current_loop()
         with self._lock:
             ua = self._ua
-            mark = self._register_ok_count
         if loop is None or ua is None or not self._is_running():
             return self.registration_state, False
+
+        # Per-leg outcomes (M4): booleans from the awaited primitives
+        # themselves, never inferred from the shared REGISTER_OK
+        # counter (an unregister no-op emits zero events, and foreign
+        # outcomes such as auto-refresh can land mid-refresh).
+        legs = {"unregister": False, "register": False}
 
         async def run() -> None:
             try:
@@ -435,7 +441,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 # issues both legs concurrently and the unregister
                 # 200 can land last, deleting the contact.
                 await ua.unregister()
+                legs["unregister"] = True
                 await ua.register()
+                legs["register"] = True
             except Exception as error:
                 name = type(error).__name__
                 LOG.debug("registration refresh failed: %s", name)
@@ -445,11 +453,11 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             future.result(timeout=timeout)
         except Exception:
             pass
-        # Settle past the re-register outcome(s): the first REGISTER_OK
-        # may belong to the unregister leg. Quiescence (no new REGISTER_OK
-        # for _SETTLE_QUIET_S, bounded by _SETTLE_CAP_S) is behaviour
-        # agnostic -- it works whether the stack sends one outcome or
-        # several -- and never fails the call, it only delays it.
+        # Settle past straggler outcomes (an auto-refresh firing
+        # mid-refresh, a late duplicate): quiescence (no new
+        # REGISTER_OK for _REFRESH_SETTLE_QUIET_S, bounded by
+        # _REFRESH_SETTLE_CAP_S) is behaviour agnostic and never fails
+        # the call, it only delays it.
         settle_end = time.monotonic() + _REFRESH_SETTLE_CAP_S
         last_change = time.monotonic()
         with self._lock:
@@ -464,9 +472,31 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             elif time.monotonic() - last_change >= _REFRESH_SETTLE_QUIET_S:
                 break
         with self._lock:
-            # Both sequential legs confirmed: an unregister 200 alone
-            # proves deletion, never a live binding.
-            fresh = self._register_ok_count - mark >= 2
+            # Freshness is per-leg truth (M4): both awaited primitives
+            # confirmed, so the registrar holds a live binding from
+            # *this* refresh. A lone unregister confirmation proves
+            # deletion, never a live binding.
+            fresh = legs["unregister"] and legs["register"]
+            running = self._running
+            was_registered = (
+                self._reg_state is TelephonyRegistrationState.REGISTERED
+            )
+        # Carry the leg outcome into the state (B2) instead of trusting
+        # the global REGISTER_OK hook: only a completed register leg
+        # may report REGISTERED; anything else follows the same
+        # LOST/FAILED mapping as a REGISTER_FAIL. Skipped once
+        # stopping so a racing unregister can never emit REGISTERED
+        # after STOPPING (or lift media-lost via "re-registered").
+        if running:
+            if legs["register"]:
+                self._set_reg_state(TelephonyRegistrationState.REGISTERED)
+            else:
+                self._set_reg_state(
+                    TelephonyRegistrationState.REGISTRATION_LOST
+                    if was_registered
+                    else TelephonyRegistrationState.REGISTRATION_FAILED
+                )
+        with self._lock:
             state = self._reg_state
         return state, fresh
 
@@ -1482,19 +1512,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 return
             if kind is _Event.REGISTER_OK:
-                with self._lock:
-                    self._register_ok_count += 1
-                self._set_reg_state(TelephonyRegistrationState.REGISTERED)
+                self._on_register_ok()
             elif kind is _Event.REGISTER_FAIL:
-                with self._lock:
-                    was_registered = (
-                        self._reg_state is TelephonyRegistrationState.REGISTERED
-                    )
-                self._set_reg_state(
-                    TelephonyRegistrationState.REGISTRATION_LOST
-                    if was_registered
-                    else TelephonyRegistrationState.REGISTRATION_FAILED
-                )
+                self._on_register_fail()
 
         runtime.subscribe(on_runtime_event)
         ua.on_incoming(self._on_native_incoming)
@@ -1502,9 +1522,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             TelephonyRegistrationState.REGISTRATION_LOST
         )
         await ua.register()
-        # register() returning means REGISTER_OK arrived (it awaits the
-        # outcome); the event hook above already set REGISTERED, but set
-        # it explicitly in case of ordering subtleties.
+        # register() returning means its 200 OK arrived (it awaits the
+        # outcome); set REGISTERED explicitly -- the runtime hook
+        # counts REGISTER_OKs but never sets state, since an
+        # expires-0 unbind confirmation arrives as REGISTER_OK too.
         self._set_reg_state(TelephonyRegistrationState.REGISTERED)
         LOG.info("telephony registered: %s", self.config_summary)
 
@@ -1947,6 +1968,33 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 getattr(listener, method)(call_id, *args)
             except Exception:
                 pass
+
+    def _on_register_ok(self) -> None:
+        """Account one REGISTER_OK from the runtime event hook.
+
+        Count only, never set state (B2): the binding emits the
+        identical REGISTER_OK for an expires-0 unbind confirmation,
+        which must not report REGISTERED (nor lift media-lost via
+        "re-registered", nor appear after STOPPING during shutdown).
+        Liveness is decided explicitly by the requester that awaited
+        the outcome: the initial register, or refresh_registration's
+        leg booleans. Periodic auto-refresh needs nothing: it only
+        fires while already REGISTERED.
+        """
+        with self._lock:
+            self._register_ok_count += 1
+
+    def _on_register_fail(self) -> None:
+        """Map one REGISTER_FAIL to LOST/FAILED by previous state."""
+        with self._lock:
+            was_registered = (
+                self._reg_state is TelephonyRegistrationState.REGISTERED
+            )
+        self._set_reg_state(
+            TelephonyRegistrationState.REGISTRATION_LOST
+            if was_registered
+            else TelephonyRegistrationState.REGISTRATION_FAILED
+        )
 
     def _set_reg_state(self, state: TelephonyRegistrationState) -> None:
         with self._lock:
