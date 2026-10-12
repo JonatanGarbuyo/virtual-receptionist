@@ -208,6 +208,12 @@ class _CallRecord:
     local_close: bool = False
     transfer_open: bool = False
     transfer_watchdog: Any = None
+    # Project-owned transfer attempt identity (#26): the application
+    # issues one id per blind_transfer; the adapter echoes it on the
+    # single outcome for that attempt. Late/duplicate native outcomes
+    # with a mismatched or already-settled id are suppressed here, so
+    # a stale primary result can never be mistaken for the fallback's.
+    transfer_attempt_id: str | None = None
     # Decline-release legs skip the media pump entirely (no RX delivery,
     # no TX, no audio probing): the call is being released, media is
     # meaningless, and keeping audio idle also keeps the post-answer
@@ -519,6 +525,18 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             rx_threads = list(self._rx_threads.values())
             for record in list(self._calls.values()):
                 record.rx_ready.set()
+                # Bounded transfer shutdown (#26): cancel every watchdog
+                # so no late TIMEOUT can fire after the record map is
+                # cleared, and mark attempts settled so racing native
+                # completions suppress instead of emitting.
+                try:
+                    if record.transfer_watchdog is not None:
+                        record.transfer_watchdog.cancel()
+                except Exception:
+                    pass
+                record.transfer_watchdog = None
+                record.transfer_open = False
+                record.transfer_attempt_id = None
             calls = list(self._calls.values())
             self._pending.clear()
         for record in calls:
@@ -662,16 +680,23 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             return
         self._submit(record, lambda call: call.hangup())
 
-    def blind_transfer(self, call_id: str, pbx_target: str) -> None:
+    def blind_transfer(
+        self, call_id: str, pbx_target: str, attempt_id: str | None = None
+    ) -> None:
         """Emit the REFER primitive to an already-trusted PBX target.
 
         No parsing, no resolution, no caller/model-derived destinations:
-        ``pbx_target`` arrives resolved by policy. Outcomes normalize to
-        :class:`TransferResult` on the listener; synchronous failures
-        (unknown call, unestablished leg) emit TRANSPORT_ERROR instead
-        of raising, so the session can fall back deterministically."""
+        ``pbx_target`` arrives resolved by policy. ``attempt_id`` is the
+        project-owned attempt token issued by the application; it is
+        echoed on the single outcome for this attempt. Outcomes
+        normalize to :class:`TransferResult` on the listener;
+        synchronous failures (unknown call, unestablished leg) emit
+        TRANSPORT_ERROR instead of raising, so the session can fall
+        back deterministically."""
         if not isinstance(pbx_target, str) or not pbx_target.strip():
-            self._emit_transfer_result(call_id, TransferResult.TRANSPORT_ERROR)
+            self._emit_transfer_result(
+                call_id, TransferResult.TRANSPORT_ERROR, attempt_id
+            )
             return
         record = self._bind_pending_if_needed(call_id)
         with self._lock:
@@ -683,31 +708,48 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 LOG.info("blind_transfer: transfer already open, ignoring")
                 return
             record.transfer_open = True
+            record.transfer_attempt_id = attempt_id
             # Host-thread watchdog: if the binding never resolves the
             # transfer (stuck command, lost NOTIFY), report TIMEOUT so
             # the session can fall back instead of hanging forever. It
-            # only fires while the transfer is still open; the normal
-            # outcome cancels it. Loop-independent by construction.
+            # only fires while the transfer is still open *for this
+            # attempt*; the normal outcome cancels it. The timeout is
+            # declarative config (shortened by the transfer harness),
+            # never a sleep-based correctness mechanism.
+            # Loop-independent by construction.
+            try:
+                timeout = float(
+                    getattr(self._config, "transfer_timeout_seconds", 70.0) or 70.0
+                )
+            except Exception:
+                timeout = 70.0
             try:
                 timer = threading.Timer(
-                    70.0, self._transfer_watchdog_fired, args=(record.app_id,)
+                    timeout,
+                    self._transfer_watchdog_fired,
+                    args=(record.app_id, attempt_id),
                 )
                 timer.daemon = True
                 record.transfer_watchdog = timer
                 timer.start()
             except Exception:
                 pass
-        self._submit_transfer(record, pbx_target.strip())
+        self._submit_transfer(record, pbx_target.strip(), attempt_id)
 
-    def _transfer_watchdog_fired(self, app_id: str) -> None:
+    def _transfer_watchdog_fired(
+        self, app_id: str, attempt_id: str | None = None
+    ) -> None:
         with self._lock:
             record = self._calls.get(app_id)
             if record is None or not record.transfer_open:
                 return
+            if record.transfer_attempt_id != attempt_id:
+                return  # superseded attempt: stale watchdog, suppress
             record.transfer_open = False
+            record.transfer_attempt_id = None
             record.transfer_watchdog = None
         LOG.warning("transfer watchdog: no outcome, reporting TIMEOUT")
-        self._emit_transfer_result(app_id, TransferResult.TIMEOUT)
+        self._emit_transfer_result(app_id, TransferResult.TIMEOUT, attempt_id)
 
     def hold(self, call_id: str) -> None:
         with self._lock:
@@ -1156,12 +1198,21 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         except Exception:
             pass
 
-    def _submit_transfer(self, record: _CallRecord, target: str) -> None:
+    def _submit_transfer(
+        self, record: _CallRecord, target: str, attempt_id: str | None = None
+    ) -> None:
         loop = self._current_loop()
         if loop is None or not self._is_running():
             with self._lock:
-                record.transfer_open = False
-            self._emit_transfer_result(record.app_id, TransferResult.TRANSPORT_ERROR)
+                if record.transfer_open and record.transfer_attempt_id == attempt_id:
+                    record.transfer_open = False
+                    record.transfer_attempt_id = None
+                    self._cancel_transfer_watchdog(record)
+                else:
+                    return  # superseded/settled: no outcome for this attempt
+            self._emit_transfer_result(
+                record.app_id, TransferResult.TRANSPORT_ERROR, attempt_id
+            )
             return
 
         async def run() -> None:
@@ -1176,23 +1227,39 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                     type(error).__name__,
                     record.app_id,
                 )
-                self._transfer_failed(record, error)
+                self._transfer_failed(record, error, attempt_id)
                 return
             LOG.info("transfer: accepted for %s", record.app_id)
             with self._lock:
-                already = record.app_id not in self._calls
+                if record.app_id not in self._calls:
+                    return  # record gone (shutdown/close): suppress
+                if (
+                    not record.transfer_open
+                    or record.transfer_attempt_id != attempt_id
+                ):
+                    return  # stale primary outcome after fallback: suppress
                 record.transfer_open = False
+                record.transfer_attempt_id = None
                 self._cancel_transfer_watchdog(record)
-            if not already:
-                self._emit_transfer_result(record.app_id, TransferResult.ACCEPTED_BY_PBX)
+            self._emit_transfer_result(
+                record.app_id, TransferResult.ACCEPTED_BY_PBX, attempt_id
+            )
 
         try:
             asyncio.run_coroutine_threadsafe(run(), loop)
         except Exception as error:
             LOG.info("transfer: submit failed (%s)", type(error).__name__)
             with self._lock:
+                if not (
+                    record.transfer_open
+                    and record.transfer_attempt_id == attempt_id
+                ):
+                    return
                 record.transfer_open = False
-            self._emit_transfer_result(record.app_id, TransferResult.TRANSPORT_ERROR)
+                record.transfer_attempt_id = None
+            self._emit_transfer_result(
+                record.app_id, TransferResult.TRANSPORT_ERROR, attempt_id
+            )
 
     def _cancel_transfer_watchdog(self, record: _CallRecord) -> None:
         timer = record.transfer_watchdog
@@ -1203,9 +1270,16 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 pass
 
-    def _transfer_failed(self, record: _CallRecord, error: Exception) -> None:
+    def _transfer_failed(
+        self, record: _CallRecord, error: Exception, attempt_id: str | None = None
+    ) -> None:
         with self._lock:
+            if record.app_id not in self._calls:
+                return
+            if not record.transfer_open or record.transfer_attempt_id != attempt_id:
+                return  # stale primary failure after fallback: suppress
             record.transfer_open = False
+            record.transfer_attempt_id = None
             self._cancel_transfer_watchdog(record)
         status = getattr(error, "status", None)
         message = str(error).lower()
@@ -1217,17 +1291,20 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             result = TransferResult.REJECTED
         else:
             result = TransferResult.TRANSPORT_ERROR
-        self._emit_transfer_result(record.app_id, result)
+        self._emit_transfer_result(record.app_id, result, attempt_id)
 
-    def _emit_transfer_result(self, app_id: str, result: TransferResult) -> None:
+    def _emit_transfer_result(
+        self, app_id: str, result: TransferResult, attempt_id: str | None = None
+    ) -> None:
         """Route a normalized transfer outcome to the call dispatcher.
 
         Always emitted, even if the call record is already gone:
         transfer results race dialog teardown (the close event and the
         outcome callback arrive in either order), and the core safely
-        ignores unknown/ended ids. Exactly-once per transfer is
-        enforced by the transfer_open guard and watchdog cancellation
-        at the call sites, not here.
+        ignores unknown/ended ids. Exactly-once per attempt is enforced
+        by the transfer_open + attempt-id guard and watchdog
+        cancellation at the call sites, not here: stale completions
+        never reach this method.
 
         Known records enqueue (loop/watchdog threads snapshot and
         return; slow core work runs on the per-call dispatcher, never
@@ -1238,9 +1315,9 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         with self._lock:
             known = app_id in self._calls
         if known:
-            self._enqueue_native_event(app_id, ("transfer", result))
+            self._enqueue_native_event(app_id, ("transfer", result, attempt_id))
         else:
-            self._deliver(app_id, "on_transfer_result", result)
+            self._deliver(app_id, "on_transfer_result", result, attempt_id)
 
     async def _decline_with_fallback(
         self, record: _CallRecord, reject_op: Callable[[], Any]
@@ -1842,6 +1919,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 app_id,
                 "on_transfer_result",
                 event[1] if len(event) > 1 else TransferResult.TRANSPORT_ERROR,
+                event[2] if len(event) > 2 else None,
             )
         elif kind == "media_failed":
             self._deliver(
@@ -1951,23 +2029,33 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         listener = self._current_listener()
         if listener is None:
             return
+
+        def _invoke() -> None:
+            try:
+                getattr(listener, method)(call_id, *args)
+            except TypeError:
+                # Backward compatibility: listeners written against the
+                # pre-#26 two-argument transfer shape still receive the
+                # outcome without the project-owned attempt token.
+                if args:
+                    try:
+                        getattr(listener, method)(call_id, *args[:-1])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         with self._lock:
             known = call_id in self._calls
         if not known:
             if not self._is_running():
                 return
-            try:
-                getattr(listener, method)(call_id, *args)
-            except Exception:
-                pass
+            _invoke()
             return
         with self._cb_lock_for(call_id):
             if not self._is_running():
                 return
-            try:
-                getattr(listener, method)(call_id, *args)
-            except Exception:
-                pass
+            _invoke()
 
     def _on_register_ok(self) -> None:
         """Account one REGISTER_OK from the runtime event hook.

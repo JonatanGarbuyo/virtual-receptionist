@@ -16,12 +16,19 @@ from enum import Enum
 
 @dataclass(frozen=True)
 class Destination:
-    """One configured symbolic destination and its trusted PBX-local target."""
+    """One configured symbolic destination and its trusted PBX-local target.
+
+    ``id`` is the only symbolic value the model/application may name;
+    ``label`` is the human/admin display name (safe for model context);
+    ``target`` is the trusted PBX-local dial string resolved by policy
+    (never model-visible, never caller-controlled).
+    """
 
     id: str
     target: str
     kind: str
     enabled: bool = True
+    label: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,26 @@ class PolicyEngine:
         if resolution.status is not DestinationStatus.OK:
             return None
         return resolution.destination
+
+    def allowed_destination_ids(self) -> tuple[str, ...]:
+        """Enabled symbolic ids, sorted. The model context may carry
+        these (plus labels); trusted targets and secrets never cross."""
+        return tuple(
+            sorted(d.id for d in self._destinations.values() if d.enabled)
+        )
+
+    def model_visible_destinations(self) -> tuple[tuple[str, str], ...]:
+        """Model-safe (id, label) pairs for enabled destinations.
+
+        Carries no PBX target, no secret, no vendor dial string: the
+        model plans with symbolic ids only and PolicyEngine keeps the
+        last word when resolving them to trusted targets.
+        """
+        return tuple(
+            sorted(
+                ((d.id, d.label) for d in self._destinations.values() if d.enabled),
+            )
+        )
 
     def transfer_allowed(self, attempts_used: int) -> bool:
         """Whether another telephony transfer attempt fits the budget."""

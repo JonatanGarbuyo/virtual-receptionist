@@ -63,6 +63,7 @@ class FakeTelephony:
         self.rejected: list[str] = []
         self.hung_up: list[str] = []
         self.transfers: list[tuple[str, str]] = []
+        self.transfer_attempts: list[tuple[str, str, str | None]] = []
         self.playout: dict[str, list[AudioFrame]] = {}
         self.playout_bytes: dict[str, int] = {}
         self.flushed: list[str] = []
@@ -148,14 +149,33 @@ class FakeTelephony:
         self.closed.add(call_id)
         self._listener.on_caller_hangup(call_id)
 
-    def blind_transfer(self, call_id: str, pbx_target: str) -> None:
+    def blind_transfer(
+        self, call_id: str, pbx_target: str, attempt_id: str | None = None
+    ) -> None:
         """Record a transfer. The test completes it via :meth:`complete_transfer`."""
         self.transfers.append((call_id, pbx_target))
+        self.transfer_attempts.append((call_id, pbx_target, attempt_id))
 
-    def complete_transfer(self, call_id: str, result: TransferResult) -> None:
+    def complete_transfer(
+        self, call_id: str, result: TransferResult, attempt_id: str | None = None
+    ) -> None:
         """Test driver: the PBX answers the transfer with a normalized result."""
         assert self._listener is not None
-        self._listener.on_transfer_result(call_id, result)
+        if attempt_id is None and self.transfer_attempts:
+            # Default to the currently open attempt so legacy tests keep
+            # exercising the token path without spelling it out.
+            for open_call, _, open_attempt in reversed(self.transfer_attempts):
+                if open_call == call_id and open_attempt is not None:
+                    attempt_id = open_attempt
+                    break
+        self._listener.on_transfer_result(call_id, result, attempt_id)
+
+    def open_attempt_id(self, call_id: str) -> str | None:
+        """Most recent project-owned attempt id issued for one call."""
+        for open_call, _, open_attempt in reversed(self.transfer_attempts):
+            if open_call == call_id:
+                return open_attempt
+        return None
 
     # -- media ------------------------------------------------------
 
