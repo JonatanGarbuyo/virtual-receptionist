@@ -492,8 +492,10 @@ class ReceptionistCore:
         follows the session's terminal transition through _dispatch."""
         self._dispatch(call_id, CallSession.handle_media_failed, detail)
 
-    def on_transfer_result(self, call_id: str, result: TransferResult) -> None:
-        self._dispatch(call_id, CallSession.handle_transfer_result, result)
+    def on_transfer_result(
+        self, call_id: str, result: TransferResult, attempt_id: str | None = None
+    ) -> None:
+        self._dispatch(call_id, CallSession.handle_transfer_result, result, attempt_id)
 
     def on_caller_audio(self, call_id: str, frame: AudioFrame) -> None:
         """Route decoded caller PCM into the session media path.

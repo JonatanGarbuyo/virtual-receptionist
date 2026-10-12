@@ -1,0 +1,820 @@
+{
+  "checks": [
+    {
+      "id": "worktree-clean",
+      "name": "matrix runs from a clean input tree",
+      "result": "pass",
+      "detail": "clean"
+    },
+    {
+      "id": "img-asterisk",
+      "name": "asterisk image builds",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "pbx-start",
+      "name": "asterisk container starts",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "pbx-ready",
+      "name": "asterisk PJSIP ready with 700",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "reg-initial",
+      "name": "REGISTER 200 OK against Asterisk",
+      "result": "pass",
+      "detail": "registered"
+    },
+    {
+      "id": "ready-telephony",
+      "name": "service READY once registered",
+      "result": "pass",
+      "detail": "ready"
+    },
+    {
+      "id": "caller-reg",
+      "name": "counterparty REGISTERs as 701",
+      "result": "pass",
+      "detail": ""
+    },
+    {
+      "id": "xfer-target-ready",
+      "name": "transfer target 702 registered + answering",
+      "result": "pass",
+      "detail": "reg=True armed=True"
+    },
+    {
+      "id": "M1-accepted",
+      "name": "primary accepted -> HANDED_OFF, fallback never called",
+      "result": "pass",
+      "detail": "result=TransferResult.ACCEPTED_BY_PBX target_up=True gone=True counts={'transfer_handoff': 1, 'fallback_handoff': 0, 'handed_off': 1, 'ended': 1}"
+    },
+    {
+      "id": "M2-rejected-fallback",
+      "name": "rejected -> fallback once -> HANDED_OFF",
+      "result": "pass",
+      "detail": "first=TransferResult.REJECTED second=TransferResult.ACCEPTED_BY_PBX target_up=True gone=True counts={'transfer_handoff': 1, 'fallback_handoff': 1, 'handed_off': 1, 'ended': 1}"
+    },
+    {
+      "id": "M3-timeout-fallback",
+      "name": "timeout -> fallback once -> HANDED_OFF",
+      "result": "pass",
+      "detail": "timeline=[(8.0, 'TransferResult.TIMEOUT'), (8.01, 'TransferResult.ACCEPTED_BY_PBX')] first=TransferResult.TIMEOUT second=TransferResult.ACCEPTED_BY_PBX target_up=True gone=True counts={'transfer_handoff': 1, 'fallback_handoff': 1, 'handed_off': 1, 'ended': 1}"
+    },
+    {
+      "id": "M4-transport-fallback",
+      "name": "transport-error -> fallback once -> HANDED_OFF",
+      "result": "pass",
+      "detail": "first=TransferResult.TRANSPORT_ERROR second=TransferResult.ACCEPTED_BY_PBX target_up=True gone=True counts={'transfer_handoff': 1, 'fallback_handoff': 1, 'handed_off': 1, 'ended': 1}"
+    },
+    {
+      "id": "M5-double-failure",
+      "name": "primary+fallback rejected -> apology/terminate -> ENDED",
+      "result": "pass",
+      "detail": "first=TransferResult.REJECTED second=TransferResult.REJECTED bye_seen=True gone=True counts={'transfer_handoff': 1, 'fallback_handoff': 1, 'handed_off': 0, 'ended': 1}"
+    }
+  ],
+  "scenarios": {
+    "M1-primary-accepted": {
+      "destination_ids": [
+        "primaria-ok"
+      ],
+      "primary_outcome": "TransferResult.ACCEPTED_BY_PBX",
+      "fallback_outcomes": [],
+      "fallback_attempts": 0,
+      "final_state": "ended",
+      "history": [
+        "incoming",
+        "answering",
+        "active",
+        "transfer_handoff",
+        "handed_off",
+        "ended"
+      ],
+      "duration_seconds": 0.1,
+      "history_counts": {
+        "transfer_handoff": 1,
+        "fallback_handoff": 0,
+        "handed_off": 1,
+        "ended": 1
+      },
+      "transfer_attempts_used": 1,
+      "audit": [
+        {
+          "decision": "requested",
+          "destination": "primaria-ok",
+          "result": null,
+          "detail": ""
+        },
+        {
+          "decision": "allowed",
+          "destination": "primaria-ok",
+          "result": null,
+          "detail": "target sip:702@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "primaria-ok",
+          "result": "TransferResult.ACCEPTED_BY_PBX",
+          "detail": ""
+        }
+      ],
+      "outcomes": [
+        "TransferResult.ACCEPTED_BY_PBX"
+      ]
+    },
+    "M2-rejected-fallback-accepted": {
+      "destination_ids": [
+        "primaria-inexistente",
+        "guardia"
+      ],
+      "primary_outcome": "TransferResult.REJECTED",
+      "fallback_outcomes": [
+        "TransferResult.ACCEPTED_BY_PBX"
+      ],
+      "fallback_attempts": 1,
+      "final_state": "ended",
+      "history": [
+        "incoming",
+        "answering",
+        "active",
+        "transfer_handoff",
+        "fallback_handoff",
+        "handed_off",
+        "ended"
+      ],
+      "duration_seconds": 0.1,
+      "history_counts": {
+        "transfer_handoff": 1,
+        "fallback_handoff": 1,
+        "handed_off": 1,
+        "ended": 1
+      },
+      "transfer_attempts_used": 2,
+      "audit": [
+        {
+          "decision": "requested",
+          "destination": "primaria-inexistente",
+          "result": null,
+          "detail": ""
+        },
+        {
+          "decision": "allowed",
+          "destination": "primaria-inexistente",
+          "result": null,
+          "detail": "target sip:999@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "primaria-inexistente",
+          "result": "TransferResult.REJECTED",
+          "detail": ""
+        },
+        {
+          "decision": "requested",
+          "destination": "guardia",
+          "result": null,
+          "detail": "fallback after transfer rejected"
+        },
+        {
+          "decision": "allowed",
+          "destination": "guardia",
+          "result": null,
+          "detail": "target sip:702@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "guardia",
+          "result": "TransferResult.ACCEPTED_BY_PBX",
+          "detail": ""
+        }
+      ],
+      "outcomes": [
+        "TransferResult.REJECTED",
+        "TransferResult.ACCEPTED_BY_PBX"
+      ]
+    },
+    "M3-timeout-fallback-accepted": {
+      "destination_ids": [
+        "primaria-lenta",
+        "guardia"
+      ],
+      "primary_outcome": "TransferResult.TIMEOUT",
+      "fallback_outcomes": [
+        "TransferResult.ACCEPTED_BY_PBX"
+      ],
+      "fallback_attempts": 1,
+      "final_state": "ended",
+      "history": [
+        "incoming",
+        "answering",
+        "active",
+        "transfer_handoff",
+        "fallback_handoff",
+        "handed_off",
+        "ended"
+      ],
+      "timeout_mechanism": "single-shot stuck transfer command on a real leg; real declarative watchdog; real fallback REFER",
+      "outcome_timeline_seconds": [
+        [
+          8.0,
+          "TransferResult.TIMEOUT"
+        ],
+        [
+          8.01,
+          "TransferResult.ACCEPTED_BY_PBX"
+        ]
+      ],
+      "duration_seconds": 8.0,
+      "history_counts": {
+        "transfer_handoff": 1,
+        "fallback_handoff": 1,
+        "handed_off": 1,
+        "ended": 1
+      },
+      "transfer_attempts_used": 2,
+      "audit": [
+        {
+          "decision": "requested",
+          "destination": "primaria-lenta",
+          "result": null,
+          "detail": ""
+        },
+        {
+          "decision": "allowed",
+          "destination": "primaria-lenta",
+          "result": null,
+          "detail": "target sip:299@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "primaria-lenta",
+          "result": "TransferResult.TIMEOUT",
+          "detail": ""
+        },
+        {
+          "decision": "requested",
+          "destination": "guardia",
+          "result": null,
+          "detail": "fallback after transfer timeout"
+        },
+        {
+          "decision": "allowed",
+          "destination": "guardia",
+          "result": null,
+          "detail": "target sip:702@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "guardia",
+          "result": "TransferResult.ACCEPTED_BY_PBX",
+          "detail": ""
+        }
+      ],
+      "outcomes": [
+        "TransferResult.TIMEOUT",
+        "TransferResult.ACCEPTED_BY_PBX"
+      ]
+    },
+    "M4-transport-error-fallback-accepted": {
+      "destination_ids": [
+        "primaria-rota",
+        "guardia"
+      ],
+      "primary_outcome": "TransferResult.TRANSPORT_ERROR",
+      "fallback_outcomes": [
+        "TransferResult.ACCEPTED_BY_PBX"
+      ],
+      "fallback_attempts": 1,
+      "final_state": "ended",
+      "history": [
+        "incoming",
+        "answering",
+        "active",
+        "transfer_handoff",
+        "fallback_handoff",
+        "handed_off",
+        "ended"
+      ],
+      "duration_seconds": 0.1,
+      "transport_mechanism": "single-shot native-seam OSError on a real leg, delegating afterwards",
+      "history_counts": {
+        "transfer_handoff": 1,
+        "fallback_handoff": 1,
+        "handed_off": 1,
+        "ended": 1
+      },
+      "transfer_attempts_used": 2,
+      "audit": [
+        {
+          "decision": "requested",
+          "destination": "primaria-rota",
+          "result": null,
+          "detail": ""
+        },
+        {
+          "decision": "allowed",
+          "destination": "primaria-rota",
+          "result": null,
+          "detail": "target sip:702@nonexistent.invalid"
+        },
+        {
+          "decision": "completed",
+          "destination": "primaria-rota",
+          "result": "TransferResult.TRANSPORT_ERROR",
+          "detail": ""
+        },
+        {
+          "decision": "requested",
+          "destination": "guardia",
+          "result": null,
+          "detail": "fallback after transfer transport_error"
+        },
+        {
+          "decision": "allowed",
+          "destination": "guardia",
+          "result": null,
+          "detail": "target sip:702@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "guardia",
+          "result": "TransferResult.ACCEPTED_BY_PBX",
+          "detail": ""
+        }
+      ],
+      "outcomes": [
+        "TransferResult.TRANSPORT_ERROR",
+        "TransferResult.ACCEPTED_BY_PBX"
+      ]
+    },
+    "M5-double-failure-exit": {
+      "destination_ids": [
+        "primaria-inexistente",
+        "guardia-caida"
+      ],
+      "primary_outcome": "TransferResult.REJECTED",
+      "fallback_outcomes": [
+        "TransferResult.REJECTED"
+      ],
+      "fallback_attempts": 1,
+      "final_state": "ended",
+      "history": [
+        "incoming",
+        "answering",
+        "active",
+        "transfer_handoff",
+        "fallback_handoff",
+        "terminating",
+        "ended"
+      ],
+      "duration_seconds": 0.1,
+      "history_counts": {
+        "transfer_handoff": 1,
+        "fallback_handoff": 1,
+        "handed_off": 0,
+        "ended": 1
+      },
+      "transfer_attempts_used": 2,
+      "audit": [
+        {
+          "decision": "requested",
+          "destination": "primaria-inexistente",
+          "result": null,
+          "detail": ""
+        },
+        {
+          "decision": "allowed",
+          "destination": "primaria-inexistente",
+          "result": null,
+          "detail": "target sip:999@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "primaria-inexistente",
+          "result": "TransferResult.REJECTED",
+          "detail": ""
+        },
+        {
+          "decision": "requested",
+          "destination": "guardia-caida",
+          "result": null,
+          "detail": "fallback after transfer rejected"
+        },
+        {
+          "decision": "allowed",
+          "destination": "guardia-caida",
+          "result": null,
+          "detail": "target sip:998@127.0.0.1:5060"
+        },
+        {
+          "decision": "completed",
+          "destination": "guardia-caida",
+          "result": "TransferResult.REJECTED",
+          "detail": ""
+        }
+      ],
+      "outcomes": [
+        "TransferResult.REJECTED",
+        "TransferResult.REJECTED"
+      ]
+    }
+  },
+  "sip_timelines": {
+    "adapter_trace": [
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "INVITE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK"
+    ],
+    "adapter_trace_full": [
+      "REGISTER sip:127.0.0.1;transport=udp SIP/2.0",
+      "SIP/2.0 401 Unauthorized",
+      "REGISTER sip:127.0.0.1;transport=udp SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "INVITE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "ACK sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK",
+      "INVITE sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 180 Ringing",
+      "SIP/2.0 200 Answering",
+      "ACK sip:700@127.0.0.1:5070 SIP/2.0",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "REFER sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 202 Accepted",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 100 Trying",
+      "SIP/2.0 200 OK",
+      "NOTIFY sip:700@127.0.0.1:5070 SIP/2.0",
+      "SIP/2.0 404 Not Found",
+      "SIP/2.0 200 OK",
+      "BYE sip:asterisk@127.0.0.1:5060 SIP/2.0",
+      "SIP/2.0 200 OK"
+    ]
+  },
+  "keep": false,
+  "meta": {
+    "os": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "arch": "x86_64",
+    "python": "3.12.3",
+    "codec_run": "pcma",
+    "transfer_timeout_seconds": 8.0,
+    "run_id": "m26-1791813910-846362",
+    "started_at": "2026-10-12T14:05:10Z",
+    "head_sha": "aeeb882486df70fc2e2040762cc88ad8fbbaa8ad",
+    "tested_code_sha": "aeeb882486df70fc2e2040762cc88ad8fbbaa8ad",
+    "worktree_dirty": [],
+    "allow_dirty": false,
+    "baresip_python": "0.5.2a3",
+    "asterisk": "Asterisk 20.6.0~dfsg+~cs6.13.40431414-2build5",
+    "finished_at": "2026-10-12T14:05:27Z"
+  },
+  "adapter_events": [
+    {
+      "t": 1791813913.43,
+      "call": "call-1",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813913.43,
+      "call": "call-1",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791813913.43,
+      "call": "call-1",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791813913.44,
+      "call": "call-1",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791813913.49,
+      "call": "call-2",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813913.49,
+      "call": "call-2",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791813913.5,
+      "call": "call-2",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791813913.5,
+      "call": "call-2",
+      "kind": "stack:CALL_TRANSFER_FAILED"
+    },
+    {
+      "t": 1791813913.52,
+      "call": "call-2",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791813913.58,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813913.58,
+      "call": "call-3",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791813913.58,
+      "call": "call-3",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791813913.59,
+      "call": "call-3",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791813913.73,
+      "call": "call-3",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813913.73,
+      "call": "call-3",
+      "kind": "local-sdp:offer"
+    },
+    {
+      "t": 1791813913.73,
+      "call": "call-3",
+      "kind": "stack:CALL_REMOTE_SDP"
+    },
+    {
+      "t": 1791813916.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813917.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813918.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813918.59,
+      "call": "call-3",
+      "kind": "stack:CALL_RTCP"
+    },
+    {
+      "t": 1791813919.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813920.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813921.26,
+      "call": "call-3",
+      "kind": "stack:AUDIO_WARNING"
+    },
+    {
+      "t": 1791813921.59,
+      "call": "call-3",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791813921.63,
+      "call": "call-4",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813921.63,
+      "call": "call-4",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791813921.63,
+      "call": "call-4",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791813921.64,
+      "call": "call-4",
+      "kind": "stack:CALL_CLOSED"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "stack:CALL_LOCAL_SDP"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "local-sdp:answer"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "stack:CALL_ESTABLISHED"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "stack:CALL_TRANSFER_FAILED"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "stack:CALL_TRANSFER_FAILED"
+    },
+    {
+      "t": 1791813921.72,
+      "call": "call-5",
+      "kind": "stack:CALL_RTPESTAB"
+    },
+    {
+      "t": 1791813921.76,
+      "call": "call-5",
+      "kind": "stack:CALL_CLOSED"
+    }
+  ],
+  "adapter_calls_left": [
+    "call-2"
+  ],
+  "summary": {
+    "total": 13,
+    "failed": 0
+  }
+}

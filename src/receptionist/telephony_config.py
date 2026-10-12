@@ -23,6 +23,7 @@ SIP_BIND_KEY = "sip.bind"
 SIP_LISTEN_KEY = "sip.listen"
 SIP_MAX_CALLS_KEY = "sip.max_calls"
 SIP_RTP_TIMEOUT_KEY = "sip.rtp_timeout"
+SIP_TRANSFER_TIMEOUT_KEY = "sip.transfer_timeout"
 
 _VALID_TRANSPORTS = ("udp", "tcp", "tls")
 _VALID_DTMF_MODES = ("rtpevent", "info", "auto")
@@ -57,6 +58,7 @@ class TelephonyConfig:
     sip_listen: str | None = None
     max_calls: int = 2
     rtp_timeout: int = 30
+    transfer_timeout_seconds: float = 70.0
     sip_trace: bool = False
 
     def __post_init__(self) -> None:
@@ -77,6 +79,8 @@ class TelephonyConfig:
             raise ValueError("sip.reg_interval must be >= 0")
         if self.max_calls < 1:
             raise ValueError("sip.max_calls must be >= 1")
+        if self.transfer_timeout_seconds <= 0:
+            raise ValueError("sip.transfer_timeout must be > 0")
 
     @property
     def redacted_summary(self) -> str:
@@ -119,6 +123,14 @@ def telephony_config_from_mapping(get: object) -> TelephonyConfig:
         part.strip().lower() for part in codecs_raw.split(",") if part.strip()
     ) or ("pcmu", "pcma")
 
+    transfer_raw = raw(SIP_TRANSFER_TIMEOUT_KEY)
+    try:
+        transfer_timeout = float(transfer_raw) if transfer_raw else 70.0
+    except ValueError:
+        raise ValueError(
+            f"{SIP_TRANSFER_TIMEOUT_KEY} must be a number, got {transfer_raw!r}"
+        )
+
     return TelephonyConfig(
         username=raw(SIP_USERNAME_KEY),
         domain=raw(SIP_DOMAIN_KEY),
@@ -133,4 +145,5 @@ def telephony_config_from_mapping(get: object) -> TelephonyConfig:
         sip_listen=raw(SIP_LISTEN_KEY) or None,
         max_calls=_int(SIP_MAX_CALLS_KEY, 2),
         rtp_timeout=_int(SIP_RTP_TIMEOUT_KEY, 30),
+        transfer_timeout_seconds=transfer_timeout,
     )

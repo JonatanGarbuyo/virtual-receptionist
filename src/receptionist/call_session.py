@@ -137,6 +137,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PendingTransfer:
     destination_id: str
+    attempt_id: str = ""
 
 
 class CallSession:
@@ -202,6 +203,16 @@ class CallSession:
         self._turn_count = 0
         self._attempts_used = 0
         self._pending_transfer: PendingTransfer | None = None
+        # Project-owned transfer attempt identity (#26): monotonic per
+        # call. ``_transfer_open_id`` names the one attempt awaiting a
+        # normalized outcome; ``_transfer_done`` holds consumed ids so
+        # duplicates and late outcomes from a superseded attempt stay
+        # inert and can never complete or alter the current attempt.
+        # Never a vendor handle, never model-controlled.
+        self._transfer_seq = 0
+        self._transfer_open_id: str | None = None
+        self._transfer_done: set[str] = set()
+        self._hangup_requested = False
         self._pending_outcome: CallOutcome | None = None
         self._message_draft: MessageDraft | None = None
         self._message_id: str | None = None
@@ -428,21 +439,31 @@ class CallSession:
         self._speak(self._greeting, self._turn)
 
     def handle_caller_hangup(self) -> None:
-        if self._state in (CallState.TERMINATING, CallState.ENDED):
-            return
-        self._cancel_voice_output(CancelReason.CALLER_HANGUP)
-        if self._state is CallState.INCOMING:
-            self._telephony.reject(self.call_id)
-            self._finish(CallOutcome.CALLER_HANGUP)
-            return
-        self._pending_outcome = CallOutcome.CALLER_HANGUP
-        self._transition(CallState.TERMINATING)
-        self._telephony.hangup(self.call_id)
+        with self._lock:
+            if self._state in (CallState.TERMINATING, CallState.ENDED):
+                return
+            # An open transfer is abandoned: its late outcome must stay
+            # inert and can never complete the teardown already starting.
+            self._abandon_open_transfer_locked()
+            self._cancel_voice_output(CancelReason.CALLER_HANGUP)
+            if self._state is CallState.INCOMING:
+                self._telephony.reject(self.call_id)
+                self._finish(CallOutcome.CALLER_HANGUP)
+                return
+            if self._state is CallState.HANDED_OFF:
+                # The PBX already owns the call: a racing BYE converges
+                # to the handoff outcome, never to a teardown that would
+                # kill the PBX-owned leg.
+                return
+            self._pending_outcome = CallOutcome.CALLER_HANGUP
+            self._transition(CallState.TERMINATING)
+            self._request_hangup_locked()
 
     def handle_hangup_completed(self) -> None:
-        if self._state is not CallState.TERMINATING:
-            return
-        self._finish(self._pending_outcome or CallOutcome.COMPLETED)
+        with self._lock:
+            if self._state is not CallState.TERMINATING:
+                return
+            self._finish(self._pending_outcome or CallOutcome.COMPLETED)
 
     def handle_media_failed(self, detail: str = "") -> None:
         """Application decision for a dead local media stack on a live
@@ -453,11 +474,12 @@ class CallSession:
         sessions already own their outcome, and an in-flight failure is
         never double-handled (late/repeated signals are no-ops)."""
         del detail
-        if self._state is not CallState.ACTIVE:
-            return
-        if self._provider_terminal_failure:
-            return
-        self._fail_provider_path("local_media_failure")
+        with self._lock:
+            if self._state is not CallState.ACTIVE:
+                return
+            if self._provider_terminal_failure:
+                return
+            self._fail_provider_path("local_media_failure")
 
     # -- voice events ------------------------------------------------------
 
@@ -856,6 +878,15 @@ class CallSession:
             self._on_action_request_locked(action)
 
     def _on_action_request_locked(self, action: object) -> None:
+        if self._state in (
+            CallState.HANDED_OFF,
+            CallState.TERMINATING,
+            CallState.ENDED,
+        ):
+            # Post-handoff/terminal model actions are inert and leave no
+            # audit trail: the PBX owns the call now and late callbacks
+            # must never duplicate events.
+            return
         if self._terminate_if_over_limit():
             return
         self._last_input_at = self._clock.now()
@@ -997,7 +1028,8 @@ class CallSession:
             return
         assert resolution.destination is not None
         self._attempts_used += 1
-        self._pending_transfer = PendingTransfer(str(destination_id))
+        attempt_id = self._next_transfer_attempt_locked()
+        self._pending_transfer = PendingTransfer(str(destination_id), attempt_id)
         self._handoff_destination_id = str(destination_id)
         self._audit_action(
             str(destination_id),
@@ -1007,7 +1039,9 @@ class CallSession:
         self._cancel_voice_output(CancelReason.TRANSFER_HANDOFF)
         self._transition(CallState.TRANSFER_HANDOFF)
         self._mode = None
-        self._telephony.blind_transfer(self.call_id, resolution.destination.target)
+        self._telephony.blind_transfer(
+            self.call_id, resolution.destination.target, attempt_id
+        )
 
     # -- message capture ---------------------------------------------------
 
@@ -1093,7 +1127,15 @@ class CallSession:
         if not self._attempt_fallback("message persist failed"):
             self._exit_after_failed_handoff()
 
-    def handle_transfer_result(self, result: TransferResult) -> None:
+    def handle_transfer_result(
+        self, result: TransferResult, attempt_id: str | None = None
+    ) -> None:
+        with self._lock:
+            self._handle_transfer_result_locked(result, attempt_id)
+
+    def _handle_transfer_result_locked(
+        self, result: TransferResult, attempt_id: str | None
+    ) -> None:
         if self._state not in (CallState.TRANSFER_HANDOFF, CallState.FALLBACK_HANDOFF):
             return
         pending = self._pending_transfer
@@ -1107,6 +1149,12 @@ class CallSession:
                 detail=f"invalid transfer result: {type(result).__name__}",
             )
             return
+        if not self._claim_transfer_result_locked(attempt_id):
+            # Stale or duplicate outcome: inert, no audit, no state move.
+            # A late primary result arriving after fallback started can
+            # never complete or alter the current fallback attempt, and
+            # a repeated outcome can never double-handoff.
+            return
         self._audit_action(destination_id, AuditDecision.COMPLETED, result=result)
         if result is TransferResult.ACCEPTED_BY_PBX:
             self._pending_transfer = None
@@ -1119,6 +1167,55 @@ class CallSession:
             if self._attempt_fallback(f"transfer {result.value}"):
                 return
         self._exit_after_failed_handoff()
+
+    def _next_transfer_attempt_locked(self) -> str:
+        """Issue the next project-owned transfer attempt id.
+
+        Monotonic per call, never model-controlled, never a vendor
+        handle. The adapter echoes it back; only the matching id may
+        settle the open attempt.
+        """
+        self._transfer_seq += 1
+        attempt_id = f"{self.call_id}:xfer:{self._transfer_seq}"
+        self._transfer_open_id = attempt_id
+        return attempt_id
+
+    def _claim_transfer_result_locked(self, attempt_id: str | None) -> bool:
+        """Consume the open attempt iff this outcome owns it.
+
+        Legacy ``None`` outcomes (older doubles) settle whatever is
+        open, preserving the previous contract. Token-carrying outcomes
+        must name the open attempt exactly once: mismatches and repeats
+        are stale/duplicate and return False.
+        """
+        open_id = self._transfer_open_id
+        if open_id is None:
+            return False
+        if attempt_id is None:
+            self._transfer_open_id = None
+            self._transfer_done.add(open_id)
+            return True
+        if attempt_id != open_id or attempt_id in self._transfer_done:
+            return False
+        self._transfer_open_id = None
+        self._transfer_done.add(attempt_id)
+        return True
+
+    def _abandon_open_transfer_locked(self) -> None:
+        """Mark the open attempt settled-without-result (hangup/media
+        failure/shutdown): its late outcome turns stale by construction."""
+        open_id = self._transfer_open_id
+        self._transfer_open_id = None
+        if open_id is not None:
+            self._transfer_done.add(open_id)
+        self._pending_transfer = None
+
+    def _request_hangup_locked(self) -> None:
+        """Send exactly one hangup per call, however teardown started."""
+        if self._hangup_requested:
+            return
+        self._hangup_requested = True
+        self._telephony.hangup(self.call_id)
 
     def _attempt_fallback(self, origin: str) -> bool:
         """Start the configured fallback transfer. False when skipped."""
@@ -1141,7 +1238,8 @@ class CallSession:
             )
             return False
         self._attempts_used += 1
-        self._pending_transfer = PendingTransfer(fallback.id)
+        attempt_id = self._next_transfer_attempt_locked()
+        self._pending_transfer = PendingTransfer(fallback.id, attempt_id)
         self._handoff_destination_id = fallback.id
         self._audit_action(
             fallback.id, AuditDecision.REQUESTED, detail=f"fallback after {origin}"
@@ -1152,7 +1250,7 @@ class CallSession:
         self._cancel_voice_output(CancelReason.FALLBACK_HANDOFF)
         self._transition(CallState.FALLBACK_HANDOFF)
         self._mode = None
-        self._telephony.blind_transfer(self.call_id, fallback.target)
+        self._telephony.blind_transfer(self.call_id, fallback.target, attempt_id)
         return True
 
     def _exit_after_failed_handoff(self) -> None:
@@ -1163,6 +1261,11 @@ class CallSession:
         depends on the broken component. TERMINATING -> ENDED happens
         exactly once either way.
         """
+        if self._state in (CallState.TERMINATING, CallState.ENDED):
+            return
+        if self._state is CallState.HANDED_OFF:
+            # Handoff already won: never tear down the PBX-owned leg.
+            return
         # Discard any stale queued assistant audio before the apology so
         # only the apology itself can play.
         self._flush_telephony_playout()
@@ -1173,7 +1276,7 @@ class CallSession:
                 pass  # apology unavailable; terminate anyway, unconditionally
         self._pending_outcome = CallOutcome.COMPLETED
         self._transition(CallState.TERMINATING)
-        self._telephony.hangup(self.call_id)
+        self._request_hangup_locked()
 
     def _deny(self, destination_id: str, reason: str) -> None:
         self._audit_action(destination_id, AuditDecision.DENIED, detail=reason)
@@ -1213,19 +1316,57 @@ class CallSession:
     # -- local actions -----------------------------------------------------
 
     def end_call(self) -> None:
-        if self._state in (CallState.TERMINATING, CallState.ENDED):
-            return
-        if self._state is CallState.INCOMING:
-            self.reject()
-            return
-        self._cancel_voice_output(CancelReason.SHUTDOWN)
-        self._pending_outcome = CallOutcome.COMPLETED
-        self._transition(CallState.TERMINATING)
-        self._telephony.hangup(self.call_id)
+        with self._lock:
+            if self._state in (CallState.TERMINATING, CallState.ENDED):
+                return
+            if self._state is CallState.INCOMING:
+                self.reject()
+                return
+            if self._state is CallState.HANDED_OFF:
+                return
+            self._abandon_open_transfer_locked()
+            self._cancel_voice_output(CancelReason.SHUTDOWN)
+            self._pending_outcome = CallOutcome.COMPLETED
+            self._transition(CallState.TERMINATING)
+            self._request_hangup_locked()
+
+    def shutdown(self) -> None:
+        """Bounded shutdown during any phase, including transfers.
+
+        Cancels output, abandons the open transfer attempt (its watchdog
+        outcome turns stale and stays inert), closes the voice session,
+        and requests exactly one hangup unless the PBX already owns the
+        call (HANDED_OFF) or teardown already ran. No timers or threads
+        are owned here, so nothing zombie survives; the adapter owns
+        watchdog cancellation on its own shutdown path.
+        """
+        with self._lock:
+            if self._state is CallState.ENDED:
+                return
+            if self._state is CallState.HANDED_OFF:
+                self._abandon_open_transfer_locked()
+                self._finish(CallOutcome.TRANSFERRED)
+                return
+            if self._state is CallState.INCOMING:
+                self._abandon_open_transfer_locked()
+                self._cancel_voice_output(CancelReason.SHUTDOWN)
+                self._telephony.reject(self.call_id)
+                self._finish(CallOutcome.COMPLETED)
+                return
+            if self._state is CallState.TERMINATING:
+                return
+            self._abandon_open_transfer_locked()
+            self._cancel_voice_output(CancelReason.SHUTDOWN)
+            self._pending_outcome = self._pending_outcome or CallOutcome.COMPLETED
+            self._transition(CallState.TERMINATING)
+            self._request_hangup_locked()
 
     # -- internals ---------------------------------------------------------
 
     def _finish(self, outcome: CallOutcome) -> None:
+        if self._state is CallState.ENDED:
+            return
+        self._abandon_open_transfer_locked()
         self._transition(CallState.ENDED)
         self._awaiting_drain = False
         self._flush_telephony_playout()
