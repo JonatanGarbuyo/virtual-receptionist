@@ -1949,7 +1949,26 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                         if pending and pending[0] == "dtmf":
                             record.ev_dispatch.remove(pending)
                             break
-            record.ev_dispatch.append(event)
+            if kind == "transfer":
+                # Race-A ordering (#26): a dialog close (far-end BYE) is
+                # routinely enqueued just ahead of the REFER outcome it
+                # was caused by (the BYE wins the network race while the
+                # outcome still travels through NOTIFY processing). The
+                # outcome owns the handoff decision, so it jumps ahead
+                # of still-queued closes for the same call: ACCEPTED is
+                # then consumed before the close, while a non-accepted
+                # outcome still lets the close terminate the session.
+                # Processing-time deferral (pending_close_reason) covers
+                # the reverse arrival order; together both orders
+                # converge to a single terminal lifecycle.
+                for index, pending in enumerate(record.ev_dispatch):
+                    if pending and pending[0] == "closed":
+                        record.ev_dispatch.insert(index, event)
+                        break
+                else:
+                    record.ev_dispatch.append(event)
+            else:
+                record.ev_dispatch.append(event)
             record.rx_ready.set()
         self._ensure_rx_dispatch(app_id)
 

@@ -861,6 +861,48 @@ class AdapterAttemptIdentityTest(unittest.TestCase):
         # Close first (session terminates), result second (inert there).
         self.assertEqual(kinds, ["hangup", "transfer"])
 
+    def test_transfer_outcome_jumps_ahead_of_queued_close(self) -> None:
+        """Race-A FIFO order: a close enqueued ahead of the REFER outcome
+        must not decide the handoff; the outcome is processed first."""
+        from receptionist.baresip_adapter import _CallRecord
+        from receptionist.boundaries import TransferResult
+
+        adapter = self._adapter()
+        adapter._running = True  # noqa: SLF001
+        events: list = []
+
+        class _Recorder:
+            def on_transfer_result(self, call_id, result, attempt_id=None):  # noqa: ANN202
+                events.append(("transfer", result, attempt_id))
+
+            def on_caller_hangup(self, call_id):  # noqa: ANN202
+                events.append(("hangup", call_id))
+
+        adapter.set_listener(_Recorder())
+        record = _CallRecord(app_id="call-1", native=None)
+        adapter._calls["call-1"] = record  # noqa: SLF001
+        adapter._ensure_rx_dispatch("call-1")  # noqa: SLF001
+        try:
+            # BYE wins the network race and queues first.
+            adapter._enqueue_native_event("call-1", ("closed", "OK"))  # noqa: SLF001
+            # The REFER outcome arrives just behind it.
+            adapter._enqueue_native_event(  # noqa: SLF001
+                "call-1", ("transfer", TransferResult.ACCEPTED_BY_PBX, "call-1:xfer:1")
+            )
+            drained = adapter._drain_native_events("call-1")  # noqa: SLF001
+        finally:
+            adapter._running = False  # noqa: SLF001
+            thread = record.rx_thread
+            if thread is not None:
+                thread.join(timeout=5)
+        self.assertEqual(drained, 2)
+        # Outcome first (owns the handoff), close second (inert there).
+        self.assertEqual(
+            [kind for kind, *_ in events],
+            ["transfer", "hangup"],
+        )
+        self.assertIs(events[0][1], TransferResult.ACCEPTED_BY_PBX)
+
     def test_local_close_while_open_wins_immediately(self) -> None:
         from receptionist.baresip_adapter import _CallRecord
 
