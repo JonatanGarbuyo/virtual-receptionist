@@ -218,6 +218,9 @@ class CallSession:
         # Whether the current turn was opened by an audio barge-in and
         # still awaits its app-owned end-of-turn commit.
         self._audio_turn_open = False
+        # Whether playback generation finished while adapter playout was
+        # still draining (barge-in stays armed until it drains).
+        self._awaiting_drain = False
         # Whether caller PCM ingest already failed on this turn: the
         # commit then fails the provider path terminally instead of
         # retrying an empty buffer forever.
@@ -340,15 +343,17 @@ class CallSession:
         invalidation still applies), and a raising backend is contained.
         """
         session = self._voice_session
-        if session is None:
-            return
-        cancel = getattr(session, "cancel_output", None)
-        if not callable(cancel):
-            return
-        try:
-            cancel(reason)
-        except Exception:
-            pass
+        if session is not None:
+            cancel = getattr(session, "cancel_output", None)
+            if callable(cancel):
+                try:
+                    cancel(reason)
+                except Exception:
+                    pass
+        # Telephony playout always flushes, even when there is no voice
+        # session (or it lacks cancel_output): queued RTP media for a
+        # cancelled turn must never keep playing.
+        self._flush_telephony_playout()
 
     def _provides_playback(self) -> bool:
         """Whether the live voice session streams its own AssistantAudio.
@@ -439,6 +444,21 @@ class CallSession:
             return
         self._finish(self._pending_outcome or CallOutcome.COMPLETED)
 
+    def handle_media_failed(self, detail: str = "") -> None:
+        """Application decision for a dead local media stack on a live
+        dialog (adapter streak trip). The caller is still there and the
+        SIP leg still signals, so this enters the normal provider
+        failure path: PBX fallback handoff when configured, otherwise a
+        deterministic exit. Only ACTIVE sessions decide; closing/closed
+        sessions already own their outcome, and an in-flight failure is
+        never double-handled (late/repeated signals are no-ops)."""
+        del detail
+        if self._state is not CallState.ACTIVE:
+            return
+        if self._provider_terminal_failure:
+            return
+        self._fail_provider_path("local_media_failure")
+
     # -- voice events ------------------------------------------------------
 
     def _over_call_limit(self) -> bool:
@@ -460,14 +480,24 @@ class CallSession:
 
         Terminates past-deadline calls; exits expired message capture
         back to listening; reprompts once after a silence window and
-        falls back after the second. Returns True when the call was
-        terminated.
+        falls back after the second. Completes a deferred
+        playback-finished transition whose playout drained without any
+        inbound media (silence-suppressed peer): without this poll the
+        session would stay SPEAKING forever and no-input handling would
+        never start. Returns True when the call was terminated.
         """
         with self._lock:
             if self._state in (CallState.TERMINATING, CallState.ENDED):
                 return False
             if self._terminate_if_over_limit():
                 return True
+            # Drain completion is independent of inbound RTP: the peer
+            # may send nothing while listening, so the periodic tick is
+            # the backstop that flips SPEAKING to LISTENING once TX
+            # drained. Cancellation/handoff clear _awaiting_drain, and a
+            # newer turn ignores the stale flag via turn identity, so a
+            # late drain can never move a newer turn.
+            self._maybe_finish_drain()
             self._enforce_capture_expiry()
             self._enforce_no_input()
             return False
@@ -560,6 +590,7 @@ class CallSession:
         """
         self._cancel_voice_output(reason)
         self._open_voice_attempt()
+        self._awaiting_drain = False
         self._pending_turn_audio = []
         self._pending_audio_bytes = 0
         self._last_committed_audio = []
@@ -605,6 +636,7 @@ class CallSession:
             return
         if not isinstance(frame, AudioFrame):
             return
+        self._maybe_finish_drain()
         if self._mode is ActiveMode.MESSAGE_CAPTURE:
             self._enforce_capture_expiry()
             return
@@ -659,6 +691,7 @@ class CallSession:
     def _commit_caller_turn_locked(self) -> None:
         if self._state is not CallState.ACTIVE:
             return
+        self._maybe_finish_drain()
         if self._mode is not ActiveMode.LISTENING:
             return
         if self._terminate_if_over_limit():
@@ -709,6 +742,45 @@ class CallSession:
             self._mode = ActiveMode.SPEAKING
         elif self._mode is not ActiveMode.SPEAKING:
             return
+        # Close the playout seam (#25): valid assistant audio for the live
+        # turn flows to the telephony media path. Late/cancelled audio was
+        # already discarded above, so everything reaching here plays. The
+        # adapter owns resampling/codec conversion; the session never
+        # re-synthesizes text and never opens a second playback path.
+        self._playout_to_telephony(frame)
+
+    def _playout_to_telephony(self, frame: AudioFrame) -> None:
+        """Forward one validated assistant frame to telephony playout.
+
+        Best-effort and contained: a telephony failure must never break
+        the conversational state machine (the mode transition above
+        already happened). Adapters without a media path (legacy doubles
+        in older tests) simply skip via duck-typing.
+        """
+        send = getattr(self._telephony, "send_audio", None)
+        if not callable(send):
+            return
+        try:
+            send(self.call_id, frame)
+        except Exception:
+            LOG.warning(
+                "assistant playout failed call_id=%s turn=%s",
+                self.call_id,
+                self._turn,
+            )
+
+    def _flush_telephony_playout(self) -> None:
+        """Discard queued TTS/RTP playout for this call (barge-in,
+        hangup, handoff, failure). The voice-backend cancellation stops
+        synthesis; this stops audio already handed to telephony so a
+        cancelled turn cannot keep playing for seconds."""
+        flush = getattr(self._telephony, "flush_audio", None)
+        if not callable(flush):
+            return
+        try:
+            flush(self.call_id)
+        except Exception:
+            pass
 
     def on_response(self, turn_id: int, text: str) -> None:
         with self._lock:
@@ -742,6 +814,40 @@ class CallSession:
             return  # late event from an obsolete turn: ignore
         if self._terminate_if_over_limit():
             return
+        if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
+            # Generation end is not RTP drain: the adapter may still
+            # hold seconds of queued playout. Stay speaking (barge-in
+            # armed) until the queue actually drains; the flip happens
+            # in _maybe_finish_drain on the next media/commit event or
+            # periodic tick.
+            if self._playout_drained():
+                self._mode = ActiveMode.LISTENING
+            else:
+                self._awaiting_drain = True
+
+    def _playout_drained(self) -> bool:
+        """Whether no assistant playout is still queued in telephony."""
+        pending = getattr(self._telephony, "playout_pending_bytes", None)
+        if not callable(pending):
+            return True
+        try:
+            return int(pending(self.call_id)) <= 0
+        except Exception:
+            return True
+
+    def _maybe_finish_drain(self) -> None:
+        """Complete a deferred playback-finished transition once RTP
+        actually drained. Called on media/commit entry points and on the
+        periodic timeout tick (caller must hold the session lock). Only
+        acts while _awaiting_drain is set; cancellation, barge-in,
+        handoff, and finish all clear the flag, and turn identity guards
+        the playback-finished setter, so a late drain never moves a
+        newer turn."""
+        if not self._awaiting_drain:
+            return
+        if not self._playout_drained():
+            return
+        self._awaiting_drain = False
         if self._mode in (ActiveMode.GREETING, ActiveMode.SPEAKING):
             self._mode = ActiveMode.LISTENING
 
@@ -858,11 +964,16 @@ class CallSession:
 
     def _fail_provider_path(self, failure_category: str) -> None:
         """Record one terminal conversational failure and leave the AI
-        path exactly once, toward PBX fallback or a safe exit."""
+        path exactly once, toward PBX fallback or a safe exit. In-flight
+        provider output is cancelled first (best-effort, contained):
+        no more inference/TTS burns on a path already declared dead.
+        The fallback handoff cancels again with its own reason when it
+        runs; both are idempotent by backend contract."""
         self._provider_terminal_failure = True
         if self._breaker is not None:
             self._breaker.record_failure()
         self._failure_category = failure_category
+        self._cancel_voice_output(CancelReason.PROVIDER_FAILED)
         if not self._attempt_fallback("provider failed"):
             self._exit_after_failed_handoff()
 
@@ -1052,6 +1163,9 @@ class CallSession:
         depends on the broken component. TERMINATING -> ENDED happens
         exactly once either way.
         """
+        # Discard any stale queued assistant audio before the apology so
+        # only the apology itself can play.
+        self._flush_telephony_playout()
         if self._voice_session is not None:
             try:
                 self._speak(EXIT_APOLOGY, self._turn)
@@ -1113,6 +1227,8 @@ class CallSession:
 
     def _finish(self, outcome: CallOutcome) -> None:
         self._transition(CallState.ENDED)
+        self._awaiting_drain = False
+        self._flush_telephony_playout()
         if self._voice_session is not None:
             self._voice_session.close()
         try:

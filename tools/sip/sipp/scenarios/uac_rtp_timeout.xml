@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- #25 s4 (fault): established dialog with zero RTP from the peer.
+     Target: the adapter's direct SIP listener (loopback bench).
+     Script: INVITE -> 200 -> ACK, answer the stack's post-answer
+     in-dialog media refresh (re-INVITE, same Call-ID) like s1, then
+     send NO RTP at all and wait for the adapter's RTP-timeout BYE.
+     Pass = BYE arrives (adapter detected dead media with the dialog
+     still established) and is answered 200. If no BYE arrives within
+     the bound the scenario itself fails, so a silent timeout can
+     never be mistaken for coverage. -->
+<scenario name="uac_rtp_timeout">
+  <send retrans="500">
+    <![CDATA[
+      INVITE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]-s4
+      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag04[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>
+      Call-ID: [call_id]
+      CSeq: 1 INVITE
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Subject: Performance Test
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 1 1 IN IP[local_ip_type] [local_ip]
+      s=call
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8 101
+      a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+    ]]>
+  </send>
+
+  <recv response="100" optional="true"/>
+  <recv response="180" optional="true"/>
+  <recv response="200" rtd="true"/>
+
+  <send>
+    <![CDATA[
+      ACK sip:[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]-s4
+      From: sipp <sip:sipp@[local_ip]:[local_port]>;tag=[pid]SIPpTag04[call_number]
+      To: <sip:[service]@[remote_ip]:[remote_port]>[peer_tag_param]
+      Call-ID: [call_id]
+      CSeq: 1 ACK
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Content-Length: 0
+    ]]>
+  </send>
+
+  <!-- Same deterministic post-answer media refresh as s1: the stack
+       re-INVITEs in-dialog and any peer answers. -->
+  <recv request="INVITE" rtd="true"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Content-Type: application/sdp
+      Content-Length: [len]
+
+      v=0
+      o=sipp 1 2 IN IP[local_ip_type] [local_ip]
+      s=call
+      c=IN IP[media_ip_type] [media_ip]
+      t=0 0
+      m=audio [media_port] RTP/AVP 0 8 101
+      a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+      a=rtpmap:101 telephone-event/8000
+      a=fmtp:101 0-15
+    ]]>
+  </send>
+
+  <recv request="ACK"/>
+
+  <!-- Fault window: deliberately zero RTP. The adapter's rtp_timeout
+       (5 s in the matrix harness) must close the still-established
+       dialog with a BYE. Event-driven wait, not a fixed sleep: the
+       BYE itself ends the window. -->
+  <recv request="BYE" timeout="12000"/>
+
+  <send>
+    <![CDATA[
+      SIP/2.0 200 OK
+      [last_Via:]
+      [last_From:]
+      [last_To:]
+      [last_Call-ID:]
+      [last_CSeq:]
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Content-Length: 0
+    ]]>
+  </send>
+</scenario>

@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from receptionist.boundaries import (
+    VALID_DTMF_DIGITS,
+    AudioFrame,
     CallIdGenerator,
     Clock,
     KnowledgeQuery,
@@ -12,6 +14,7 @@ from receptionist.boundaries import (
     KnowledgeService,
     Policy,
     TelephonyAdapter,
+    TelephonyRegistrationState,
     TransferResult,
     VoiceBackend,
 )
@@ -22,6 +25,9 @@ from receptionist.alerting import (
     CODE_CONFIG_INCOMPLETE,
     CODE_CONFIG_UNAVAILABLE,
     CODE_HISTORY_UNAVAILABLE,
+    CODE_TELEPHONY_LOST,
+    CODE_TELEPHONY_MEDIA_LOST,
+    CODE_TELEPHONY_NOT_REGISTERED,
     CODE_TRANSCRIPT_UNAVAILABLE,
     CODE_VOICE_BACKEND_NOT_READY,
     HealthComponent,
@@ -327,6 +333,12 @@ class ReceptionistCore:
             self.health.mark_not_ready("required configuration missing")
         elif (HealthComponent.PROVIDER, CODE_VOICE_BACKEND_NOT_READY) in active:
             self.health.mark_not_ready(_VOICE_NOT_READY_DETAIL)
+        elif (HealthComponent.TELEPHONY, CODE_TELEPHONY_NOT_REGISTERED) in active:
+            self.health.mark_not_ready("telephony endpoint not registered")
+        elif (HealthComponent.TELEPHONY, CODE_TELEPHONY_LOST) in active:
+            self.health.mark_not_ready("telephony registration lost")
+        elif (HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST) in active:
+            self.health.mark_degraded("telephony media path lost")
         elif (HealthComponent.PROVIDER, CODE_CIRCUIT_OPEN) in active:
             self.health.mark_degraded(_CIRCUIT_DEGRADED_DETAIL)
         elif (HealthComponent.RUNTIME, CODE_HISTORY_UNAVAILABLE) in active or (
@@ -474,5 +486,112 @@ class ReceptionistCore:
     def on_hangup_completed(self, call_id: str) -> None:
         self._dispatch(call_id, CallSession.handle_hangup_completed)
 
+    def on_media_failed(self, call_id: str, detail: str = "") -> None:
+        """Route a dead-local-media signal; the session owns the
+        fallback/termination decision. Eviction (and AI slot release)
+        follows the session's terminal transition through _dispatch."""
+        self._dispatch(call_id, CallSession.handle_media_failed, detail)
+
     def on_transfer_result(self, call_id: str, result: TransferResult) -> None:
         self._dispatch(call_id, CallSession.handle_transfer_result, result)
+
+    def on_caller_audio(self, call_id: str, frame: AudioFrame) -> None:
+        """Route decoded caller PCM into the session media path.
+
+        Unknown call ids (late frames after eviction) are ignored. The
+        frame itself is project-owned PCM16 mono; vendor types never
+        reach here.
+        """
+        session = self._sessions.get(call_id)
+        if session is None:
+            return
+        try:
+            session.push_caller_audio(frame)
+        except Exception:
+            pass
+
+    def on_dtmf(self, call_id: str, digit: str) -> None:
+        """Observe one DTMF digit for a live call.
+
+        v0.1 carries no DTMF business logic (#25 transports only): the
+        event is validated (known call, single valid digit) and otherwise
+        ignored so digits can never become privileged actions. Unknown
+        calls and malformed digits are dropped.
+        """
+        if self._sessions.get(call_id) is None:
+            return
+        if not isinstance(digit, str) or len(digit) != 1:
+            return
+        if digit.upper() not in VALID_DTMF_DIGITS:
+            return
+
+    def on_remote_hold(self, call_id: str, held: bool) -> None:
+        """Observe a remote hold/resume re-INVITE. Transport-level only:
+        the adapter pauses TX/RX while held and flushes stale media on
+        resume, so the session needs no state change in v0.1."""
+        if self._sessions.get(call_id) is None:
+            return
+
+    def report_telephony_media(
+        self, healthy: bool, call_id: str = "", detail: str = ""
+    ) -> None:
+        """Project-owned media-health hook (story 23: registration *and*
+        media health). An RTP-timeout teardown degrades the service while
+        the media path is unverified; the next established call or a
+        fresh registration recovers it. Sanitized and edge-triggered
+        like every other condition: per-call details never alert."""
+        if healthy:
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST
+            )
+        else:
+            self.monitor.report_unhealthy(
+                HealthComponent.TELEPHONY,
+                CODE_TELEPHONY_MEDIA_LOST,
+            )
+        self._reconcile_health()
+
+    # -- telephony registration health -----------------------------------
+
+    def report_telephony_state(
+        self, state: TelephonyRegistrationState, detail: str = ""
+    ) -> None:
+        """Project-owned hook wiring telephony registration into READY.
+
+        REGISTERED lifts telephony conditions; anything else raises the
+        stable sanitized condition (no REGISTER retries alert per call:
+        edge-triggering in the monitor dedups). Re-registration recovers
+        through the same path. Never touches STARTING.
+        """
+        if state is TelephonyRegistrationState.REGISTERED:
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_NOT_REGISTERED
+            )
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_LOST
+            )
+            # Fresh registration epoch invalidates pre-restart media
+            # evidence (mirrors the adapter's own recovery report).
+            self.monitor.report_recovered(
+                HealthComponent.TELEPHONY, CODE_TELEPHONY_MEDIA_LOST
+            )
+        elif state in (
+            TelephonyRegistrationState.STARTING,
+            TelephonyRegistrationState.STOPPING,
+            TelephonyRegistrationState.STOPPED,
+        ):
+            self.monitor.report_unhealthy(
+                HealthComponent.TELEPHONY,
+                CODE_TELEPHONY_NOT_REGISTERED,
+            )
+        elif state is TelephonyRegistrationState.REGISTRATION_FAILED:
+            self.monitor.report_unhealthy(
+                HealthComponent.TELEPHONY,
+                CODE_TELEPHONY_NOT_REGISTERED,
+            )
+        else:  # REGISTRATION_LOST
+            self.monitor.report_unhealthy(
+                HealthComponent.TELEPHONY,
+                CODE_TELEPHONY_LOST,
+            )
+        self._reconcile_health()

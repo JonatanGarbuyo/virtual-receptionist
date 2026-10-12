@@ -1,0 +1,7 @@
+# Pinned telephony runtime for #25 (v0.1 SIP/media path only).
+# The application core is stdlib-only; install this extra only where the
+# baresip adapter runs. The adapter also enforces the pin at startup
+# (BaresipTelephonyAdapter.BARESIP_PYTHON_PIN equivalent) and refuses to
+# run against any other build.
+baresip-python==0.5.2a3
+cffi>=2.0

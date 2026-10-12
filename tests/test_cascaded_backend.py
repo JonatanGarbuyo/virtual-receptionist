@@ -183,6 +183,21 @@ def settle(session) -> None:
         assert wait(timeout=10.0), "backend worker did not finish"
 
 
+def settle_media(session, telephony) -> None:
+    """Model RTP time passing after a turn's audio: drain everything the
+    backend queued for playout, then push one silence frame so the
+    session observes the drained queue. Without this the session
+    correctly stays SPEAKING (barge-in armed until RTP drains, #25)."""
+    telephony.drain_playout(session.call_id, 10**9)
+    session.push_caller_audio(
+        make_frame(
+            silence_pcm(duration_seconds=0.1, sample_rate=16000),
+            16000,
+            call_id=session.call_id,
+        )
+    )
+
+
 def make_core_with_backend(
     backend,
     destinations: dict | None = None,
@@ -385,7 +400,9 @@ class SessionAudioPathTest(unittest.TestCase):
         settle(session)
 
         # The pipeline completed the turn: sidecar text was not
-        # re-spoken and playback already returned to listening.
+        # re-spoken and playback already returned to listening once RTP
+        # drained the queued playout.
+        settle_media(session, telephony)
         self.assertEqual(session.mode, ActiveMode.LISTENING)
         self.assertEqual(session.current_turn, 2)
 
@@ -413,7 +430,7 @@ class SessionAudioPathTest(unittest.TestCase):
         backend = ready_backend(
             stt=stt, llm=FakeLLMAdapter([spoken_document("Le atiendo.")])
         )
-        core, _, _, _ = make_core_with_backend(backend)
+        core, telephony, _, _ = make_core_with_backend(backend)
         core.start()
         session = core.incoming_call("+34910000001")
         settle(session)
@@ -428,6 +445,8 @@ class SessionAudioPathTest(unittest.TestCase):
 
         # First attempt failed transiently; the bounded retry re-drove
         # the same audio on a fresh attempt and completed the turn.
+        # Listening resumes once RTP drains the queued playout.
+        settle_media(session, telephony)
         self.assertEqual(session.mode, ActiveMode.LISTENING)
         self.assertEqual(len(stt.calls), 2)
 
@@ -460,7 +479,7 @@ class BargeInAdversarialTest(unittest.TestCase):
             ),
             rec,
         )
-        core, _, _, _ = make_core_with_backend(backend)
+        core, telephony, _, _ = make_core_with_backend(backend)
         core.start()
         session = core.incoming_call("+34910000001")
         settle(session)
@@ -488,6 +507,7 @@ class BargeInAdversarialTest(unittest.TestCase):
         session.push_caller_audio(speech_frame(call_id=session.call_id))
         session.commit_caller_turn()
         settle(session)
+        settle_media(session, telephony)
         self.assertEqual(session.mode, ActiveMode.LISTENING)
         self.assertEqual(session.current_turn, 3)
         turn_b = [frame for turn, frame in rec.audios if turn == 3]
@@ -1860,8 +1880,9 @@ class TranscriptSidecarTest(unittest.TestCase):
         clock = FakeClock()
         transcripts = InMemoryTranscriptStore()
         backend = ready_backend()
+        telephony = FakeTelephony()
         core = ReceptionistCore(
-            telephony=FakeTelephony(),
+            telephony=telephony,
             voice=backend,
             config_service=ConfigService(
                 InMemoryConfigRepository(
@@ -1895,8 +1916,10 @@ class TranscriptSidecarTest(unittest.TestCase):
         caller_lines = [e for e in entries if e.speaker == "caller"]
         self.assertTrue(caller_lines)
         self.assertIn("quiero ventas", caller_lines[0].text)
-        # The sidecar never opened a spurious turn.
+        # The sidecar never opened a spurious turn. Listening resumes
+        # once RTP drains the turn's queued playout.
         self.assertEqual(session.current_turn, 2)
+        settle_media(session, telephony)
         self.assertEqual(session.mode, ActiveMode.LISTENING)
 
 

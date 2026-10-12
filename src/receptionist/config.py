@@ -13,6 +13,7 @@ from receptionist.boundaries import (
     KnowledgeSourceDeclaration,
     KnowledgeSourceRepository,
 )
+from receptionist.telephony_config import TelephonyConfig
 
 GREETING_KEY = "greeting"
 LANGUAGE_KEY = "language"
@@ -97,6 +98,14 @@ class ConfigService:
         if self._alerts is None:
             return AlertSettings()
         return self._alerts.load()
+
+    def telephony_config(self) -> TelephonyConfig:
+        """Typed SIP-identity read over config.db. Only explicit
+        ``sip.*`` keys; secrets stay ``repr=False`` and never enter logs.
+        Raises ValueError when the identity is incomplete."""
+        from receptionist.telephony_config import telephony_config_from_mapping
+
+        return telephony_config_from_mapping(self._repository.get)
 
     def voice_profile(self) -> VoiceProfile:
         """Typed voice-profile read over config.db. Only the small
