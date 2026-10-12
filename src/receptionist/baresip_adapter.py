@@ -208,6 +208,15 @@ class _CallRecord:
     local_close: bool = False
     transfer_open: bool = False
     transfer_watchdog: Any = None
+    # Deferred remote close (#26 race A): a far-end BYE arriving while a
+    # transfer outcome is still open is stashed here instead of racing
+    # the outcome. When the transfer settles, ACCEPTED wins (the close
+    # was the transfer's consequence; the PBX owns the call) and the
+    # stash is dropped; any non-accepted outcome emits the stash first
+    # so the session terminates instead of falling back onto a dead
+    # dialog. Bounded by the transfer watchdog, which always settles an
+    # open attempt; shutdown drops records outright.
+    pending_close_reason: str | None = None
     # Project-owned transfer attempt identity (#26): the application
     # issues one id per blind_transfer; the adapter echoes it on the
     # single outcome for that attempt. Late/duplicate native outcomes
@@ -537,6 +546,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 record.transfer_watchdog = None
                 record.transfer_open = False
                 record.transfer_attempt_id = None
+                record.pending_close_reason = None
             calls = list(self._calls.values())
             self._pending.clear()
         for record in calls:
@@ -741,15 +751,17 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
     ) -> None:
         with self._lock:
             record = self._calls.get(app_id)
-            if record is None or not record.transfer_open:
+            if record is None:
                 return
-            if record.transfer_attempt_id != attempt_id:
-                return  # superseded attempt: stale watchdog, suppress
-            record.transfer_open = False
-            record.transfer_attempt_id = None
-            record.transfer_watchdog = None
+            settled, pending = self._settle_transfer_locked(record, attempt_id)
+            if settled:
+                record.transfer_watchdog = None
+        if not settled:
+            return  # superseded attempt: stale watchdog, suppress
         LOG.warning("transfer watchdog: no outcome, reporting TIMEOUT")
-        self._emit_transfer_result(app_id, TransferResult.TIMEOUT, attempt_id)
+        self._emit_transfer_settled(
+            app_id, TransferResult.TIMEOUT, attempt_id, pending
+        )
 
     def hold(self, call_id: str) -> None:
         with self._lock:
@@ -966,6 +978,12 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
         core the two-step sequence it expects in every interleaving,
         including CANCEL-before-answer. Transfer-accepted closes stay
         silent: the transfer result already ended the session.
+
+        Remote closes racing an open transfer (#26) are deferred: the
+        outcome decides (ACCEPTED wins and drops the stash, anything
+        else emits the stash first so the session terminates instead
+        of falling back onto a dead dialog). Local closes always win
+        immediately.
         """
         with self._lock:
             record = self._calls.get(app_id)
@@ -983,12 +1001,24 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 # the record is gone, or never). Idempotent: the return
                 # path skips emission when the record is already gone,
                 # and the core ignores non-handoff results.
+                attempt = record.transfer_attempt_id
                 record.transfer_open = False
+                record.transfer_attempt_id = None
+                record.pending_close_reason = None
                 self._cancel_transfer_watchdog(record)
                 self._calls.pop(app_id, None)
                 closed_first = True
+                closed_attempt: str | None = attempt
+            elif record.transfer_open and not record.local_close:
+                # Far-end BYE (or RTP-timeout teardown) while the PBX
+                # has not settled our REFER: stash it. First close wins;
+                # the settle path emits it in outcome order.
+                if record.pending_close_reason is None:
+                    record.pending_close_reason = reason
+                return
             else:
                 closed_first = False
+                closed_attempt = None
             local = record.local_close
             if local:
                 record.close_emitted = True
@@ -1018,7 +1048,10 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             self._report_media(False, app_id, "rtp timeout")
         if closed_first:
             self._deliver(
-                app_id, "on_transfer_result", TransferResult.ACCEPTED_BY_PBX
+                app_id,
+                "on_transfer_result",
+                TransferResult.ACCEPTED_BY_PBX,
+                closed_attempt,
             )
         elif local:
             self._deliver(app_id, "on_hangup_completed")
@@ -1231,18 +1264,11 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
                 return
             LOG.info("transfer: accepted for %s", record.app_id)
             with self._lock:
-                if record.app_id not in self._calls:
-                    return  # record gone (shutdown/close): suppress
-                if (
-                    not record.transfer_open
-                    or record.transfer_attempt_id != attempt_id
-                ):
-                    return  # stale primary outcome after fallback: suppress
-                record.transfer_open = False
-                record.transfer_attempt_id = None
-                self._cancel_transfer_watchdog(record)
-            self._emit_transfer_result(
-                record.app_id, TransferResult.ACCEPTED_BY_PBX, attempt_id
+                settled, pending = self._settle_transfer_locked(record, attempt_id)
+            if not settled:
+                return  # gone/shutdown/stale: suppress
+            self._emit_transfer_settled(
+                record.app_id, TransferResult.ACCEPTED_BY_PBX, attempt_id, pending
             )
 
         try:
@@ -1270,17 +1296,59 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             except Exception:
                 pass
 
+    def _settle_transfer_locked(
+        self, record: _CallRecord, attempt_id: str | None
+    ) -> tuple[bool, str | None]:
+        """Settle the open transfer attempt (adapter lock held).
+
+        Returns ``(settled, pending_close_reason)``. Stale completions
+        (record gone, attempt already settled, or superseded id) return
+        ``(False, None)`` and emit nothing.
+        """
+        if record.app_id not in self._calls:
+            return False, None
+        if not record.transfer_open or record.transfer_attempt_id != attempt_id:
+            return False, None
+        record.transfer_open = False
+        record.transfer_attempt_id = None
+        self._cancel_transfer_watchdog(record)
+        pending = record.pending_close_reason
+        record.pending_close_reason = None
+        return True, pending
+
+    def _emit_transfer_settled(
+        self,
+        app_id: str,
+        result: TransferResult,
+        attempt_id: str | None,
+        pending_close: str | None,
+    ) -> None:
+        """Emit a settled outcome in race order (#26 race A).
+
+        ACCEPTED wins and drops a stashed close (it was the transfer's
+        consequence; the PBX owns the call now). Any other outcome emits
+        the stashed close first so the session terminates instead of
+        falling back onto a dead dialog; the outcome itself then arrives
+        inert (no audit, no fallback).
+        """
+        if pending_close is not None:
+            if result is TransferResult.ACCEPTED_BY_PBX:
+                with self._lock:
+                    if app_id in self._calls:
+                        self._calls.pop(app_id, None)
+                self._emit_transfer_result(app_id, result, attempt_id)
+                self._drop_cb_lock(app_id)
+                return
+            self._on_native_closed(app_id, pending_close)
+        self._emit_transfer_result(app_id, result, attempt_id)
+
     def _transfer_failed(
         self, record: _CallRecord, error: Exception, attempt_id: str | None = None
     ) -> None:
         with self._lock:
-            if record.app_id not in self._calls:
-                return
-            if not record.transfer_open or record.transfer_attempt_id != attempt_id:
-                return  # stale primary failure after fallback: suppress
-            record.transfer_open = False
-            record.transfer_attempt_id = None
-            self._cancel_transfer_watchdog(record)
+            settled, pending = self._settle_transfer_locked(record, attempt_id)
+        if not settled:
+            return  # stale primary failure after fallback: suppress
         status = getattr(error, "status", None)
         message = str(error).lower()
         if status in (408,) or "timeout" in message or "timed out" in message:
@@ -1291,7 +1359,7 @@ class BaresipTelephonyAdapter(TelephonyAdapter):
             result = TransferResult.REJECTED
         else:
             result = TransferResult.TRANSPORT_ERROR
-        self._emit_transfer_result(record.app_id, result, attempt_id)
+        self._emit_transfer_settled(record.app_id, result, attempt_id, pending)
 
     def _emit_transfer_result(
         self, app_id: str, result: TransferResult, attempt_id: str | None = None

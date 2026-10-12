@@ -60,18 +60,37 @@ ADAPTER_SIP = H.ADAPTER_SIP
 LOG = logging.getLogger("transfer-matrix")
 
 
-def wait_transfer_value(listener, call_id, pred, timeout: float):
-    """Poll the recorded outcome until pred(result) holds (fail-safe wait;
+class TransferListener(H.RecordingListener):
+    """Append-only outcome recording: every normalized outcome per call
+    with a timestamp. Never overwrites, so a fast fallback outcome can
+    never hide the primary's (the #26 rerun lesson)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcome_lists: dict[str, list] = {}
+
+    def on_transfer_result(self, call_id: str, result) -> None:
+        super().on_transfer_result(call_id, result)
+        with self._lock:
+            self.outcome_lists.setdefault(call_id, []).append(
+                (time.monotonic(), result)
+            )
+
+    def outcomes(self, call_id: str) -> list:
+        with self._lock:
+            return [result for _, result in self.outcome_lists.get(call_id, [])]
+
+
+def wait_nth_outcome(listener, call_id, n: int, timeout: float):
+    """Block until n outcomes are recorded for one call (fail-safe wait;
     correctness comes from the recorded content, never the delay)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        with listener._lock:  # noqa: SLF001
-            result = listener.transfers.get(call_id)
-        if result is not None and pred(result):
-            return result
-        time.sleep(0.2)
-    with listener._lock:  # noqa: SLF001
-        return listener.transfers.get(call_id)
+        if len(listener.outcomes(call_id)) >= n:
+            return listener.outcomes(call_id)[n - 1]
+        time.sleep(0.05)
+    current = listener.outcomes(call_id)
+    return current[n - 1] if len(current) >= n else None
 
 
 def scenario_record() -> dict:
@@ -165,7 +184,7 @@ def main() -> int:
     import socket as _socket
 
     busy = []
-    for _port in (5060, 5070, 5071, 5076):
+    for _port in (5060, 5070, 5071, 5076, 5077):
         _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         try:
             _sock.bind(("127.0.0.1", _port))
@@ -246,7 +265,7 @@ def main() -> int:
     logging.getLogger("baresip.native.sip").addHandler(_SipTrace())
     logging.getLogger("baresip.native.sip").setLevel(logging.DEBUG)
 
-    listener = H.RecordingListener()
+    listener = TransferListener()
     # One process-wide call-id sequence: two sequential cores must never
     # reissue the same app id while the shared listener still records it.
     call_ids = H.CounterIds()
@@ -322,7 +341,11 @@ def main() -> int:
     # only ever sees the resolved PBX-local targets below.
     dest_ok = _Destination(id="primaria-ok", target=f"sip:702@{AST_SIP}",
                            kind="extension", label="Primaria OK")
-    dest_ring = _Destination(id="primaria-lenta", target=f"sip:299@{AST_SIP}",
+    # Timeout primary: 703 is registered but NEVER answers, so the REFER
+    # rings without a final NOTIFY until the declarative watchdog fires.
+    # (299 answers at ringback through the dialplan and cannot hold a
+    # transfer open; learned from the first matrix run.)
+    dest_ring = _Destination(id="primaria-lenta", target=f"sip:703@{AST_SIP}",
                              kind="extension", label="Primaria lenta")
     dest_bad_domain = _Destination(id="primaria-rota",
                                    target="sip:702@nonexistent.invalid",
@@ -370,6 +393,16 @@ def main() -> int:
     if not (ok702 and armed702):
         return _finish(evidence, checks, 1)
 
+    # Timeout target 703: registered, autoanswer NEVER armed.
+    caller703 = H.CallerProc([codec], listen="127.0.0.1:5077",
+                             user="703", password="vr-test-703")
+    ok703 = caller703.start()
+    checks.record("xfer-timeout-ready",
+                  "transfer timeout target 703 registered, never answering",
+                  ok703, f"reg={ok703}")
+    if not ok703:
+        return _finish(evidence, checks, 1)
+
     from receptionist.boundaries import TransferRequest as _TR
 
     def run_leg(tag: str, core, voice):
@@ -403,12 +436,42 @@ def main() -> int:
             caller.cmd({"op": "hangup", "tag": tag})
         except Exception:
             pass
+        # Free 702-side capacity: answered transfer legs hold INCOMING-*
+        # calls on the target UA; release them best-effort between runs.
+        for index in range(6):
+            try:
+                caller702.cmd({"op": "hangup", "tag": f"INCOMING-{index}"})
+            except Exception:
+                pass
 
-    def pop_recorded_transfer(app: str) -> None:
-        """Forget the recorded outcome so the next wait blocks for fresh."""
-        with listener._lock:  # noqa: SLF001
-            listener.transfers.pop(app, None)
-            listener.transfer_events.pop(app, None)
+    def audit_trail(core) -> list:
+        try:
+            events = core._runtime.audit.list_all()  # noqa: SLF001
+        except Exception:
+            return []
+        return [
+            {
+                "decision": e.decision.value,
+                "destination": e.destination,
+                "result": str(e.result) if e.result is not None else None,
+                "detail": e.detail,
+            }
+            for e in events
+        ]
+
+    def finalize(rec: dict, session, core) -> dict:
+        counts = history_counts(session)
+        rec["fallback_attempts"] = counts["fallback_handoff"]
+        rec["final_state"] = session.state.value
+        rec["history"] = [s.value for s in session.history]
+        rec["history_counts"] = counts
+        try:
+            rec["transfer_attempts_used"] = session._attempts_used  # noqa: SLF001
+        except Exception:
+            pass
+        rec["audit"] = audit_trail(core)
+        rec["outcomes"] = [str(r) for r in listener.outcomes(session.call_id)]
+        return rec
 
     # -- M1: primary accepted ------------------------------------------
     rec = scenario_record()
@@ -418,18 +481,17 @@ def main() -> int:
                       "dial/answer failed")
     else:
         rec["destination_ids"] = ["primaria-ok"]
+        started = time.monotonic()
         voiceA.sessions[app].deliver_action_request(_TR("primaria-ok"))
-        result = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.ACCEPTED_BY_PBX, 40)
+        result = wait_nth_outcome(listener, app, 1, 40)
         target_up = caller702.expect(
             lambda e: e.get("event") == "established"
             and str(e.get("tag", "")).startswith("INCOMING"), 30) is not None
         gone = H.wait_for(lambda: coreA.get_session(app) is None, 20)
+        rec["duration_seconds"] = round(time.monotonic() - started, 1)
         counts = history_counts(session)
         rec["primary_outcome"] = str(result)
-        rec["fallback_attempts"] = counts["fallback_handoff"]
-        rec["final_state"] = session.state.value
-        rec["history"] = [s.value for s in session.history]
+        finalize(rec, session, coreA)
         checks.record(
             "M1-accepted", "primary accepted -> HANDED_OFF, fallback never called",
             result is TransferResult.ACCEPTED_BY_PBX and target_up and gone
@@ -447,22 +509,19 @@ def main() -> int:
                       "dial/answer failed")
     else:
         rec["destination_ids"] = ["primaria-inexistente", "guardia"]
+        started = time.monotonic()
         voiceA.sessions[app].deliver_action_request(_TR("primaria-inexistente"))
-        first = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.REJECTED, 40)
-        pop_recorded_transfer(app)
-        second = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.ACCEPTED_BY_PBX, 40)
+        first = wait_nth_outcome(listener, app, 1, 40)
+        second = wait_nth_outcome(listener, app, 2, 40)
         target_up = caller702.expect(
             lambda e: e.get("event") == "established"
             and str(e.get("tag", "")).startswith("INCOMING"), 30) is not None
         gone = H.wait_for(lambda: coreA.get_session(app) is None, 20)
+        rec["duration_seconds"] = round(time.monotonic() - started, 1)
         counts = history_counts(session)
         rec["primary_outcome"] = str(first)
         rec["fallback_outcomes"] = [str(second)]
-        rec["fallback_attempts"] = counts["fallback_handoff"]
-        rec["final_state"] = session.state.value
-        rec["history"] = [s.value for s in session.history]
+        finalize(rec, session, coreA)
         checks.record(
             "M2-rejected-fallback", "rejected -> fallback once -> HANDED_OFF",
             first is TransferResult.REJECTED
@@ -483,23 +542,19 @@ def main() -> int:
                       "dial/answer failed")
     else:
         rec["destination_ids"] = ["primaria-lenta", "guardia"]
+        started = time.monotonic()
         voiceA.sessions[app].deliver_action_request(_TR("primaria-lenta"))
-        first = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.TIMEOUT,
-            args.transfer_timeout + 30)
-        pop_recorded_transfer(app)
-        second = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.ACCEPTED_BY_PBX, 40)
+        first = wait_nth_outcome(listener, app, 1, args.transfer_timeout + 30)
+        second = wait_nth_outcome(listener, app, 2, 40)
         target_up = caller702.expect(
             lambda e: e.get("event") == "established"
             and str(e.get("tag", "")).startswith("INCOMING"), 30) is not None
         gone = H.wait_for(lambda: coreA.get_session(app) is None, 20)
+        rec["duration_seconds"] = round(time.monotonic() - started, 1)
         counts = history_counts(session)
         rec["primary_outcome"] = str(first)
         rec["fallback_outcomes"] = [str(second)]
-        rec["fallback_attempts"] = counts["fallback_handoff"]
-        rec["final_state"] = session.state.value
-        rec["history"] = [s.value for s in session.history]
+        finalize(rec, session, coreA)
         checks.record(
             "M3-timeout-fallback", "timeout -> fallback once -> HANDED_OFF",
             first is TransferResult.TIMEOUT
@@ -514,8 +569,10 @@ def main() -> int:
 
     # -- M4: primary transport-error + fallback accepted ---------------
     # Transport fault injected at the owned native seam on a real
-    # established leg (stub transfer() raises OSError); the REAL adapter
-    # normalizes it and the REAL fallback REFER completes. The session
+    # established leg: a single-shot stub fails exactly the primary
+    # REFER with OSError, then delegates every later call to the real
+    # leg, so there is no restore race. The REAL adapter normalizes to
+    # TRANSPORT_ERROR and the REAL fallback REFER completes. The session
     # never fabricates the enum.
     rec = scenario_record()
     app, session = run_leg("M4", coreA, voiceA)
@@ -524,39 +581,40 @@ def main() -> int:
                       "dial/answer failed")
     else:
         rec["destination_ids"] = ["primaria-rota", "guardia"]
+        started = time.monotonic()
         with adapter._lock:  # noqa: SLF001 (harness fault injection)
             record = adapter._calls.get(app)  # noqa: SLF001
             real_native = record.native if record is not None else None
 
-        class _DeadLeg:
-            def transfer(self, target: str):
-                raise OSError("injected leg transport failure")
+        class _FailOnce:
+            def __init__(self) -> None:
+                self.armed = True
 
-        try:
-            with adapter._lock:  # noqa: SLF001
-                if record is not None:
-                    record.native = _DeadLeg()
-            voiceA.sessions[app].deliver_action_request(_TR("primaria-rota"))
-            first = wait_transfer_value(
-                listener, app, lambda r: r is TransferResult.TRANSPORT_ERROR, 30)
-        finally:
-            with adapter._lock:  # noqa: SLF001
-                if record is not None:
-                    record.native = real_native
-        pop_recorded_transfer(app)
-        second = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.ACCEPTED_BY_PBX, 40)
+            def transfer(self, target: str):
+                if self.armed:
+                    self.armed = False
+                    raise OSError("injected leg transport failure")
+                return real_native.transfer(target)
+
+        with adapter._lock:  # noqa: SLF001
+            if record is not None:
+                record.native = _FailOnce()
+        voiceA.sessions[app].deliver_action_request(_TR("primaria-rota"))
+        first = wait_nth_outcome(listener, app, 1, 30)
+        second = wait_nth_outcome(listener, app, 2, 40)
         target_up = caller702.expect(
             lambda e: e.get("event") == "established"
             and str(e.get("tag", "")).startswith("INCOMING"), 30) is not None
         gone = H.wait_for(lambda: coreA.get_session(app) is None, 20)
+        rec["duration_seconds"] = round(time.monotonic() - started, 1)
         counts = history_counts(session)
         rec["primary_outcome"] = str(first)
         rec["fallback_outcomes"] = [str(second)]
-        rec["fallback_attempts"] = counts["fallback_handoff"]
-        rec["final_state"] = session.state.value
-        rec["history"] = [s.value for s in session.history]
-        rec["transport_mechanism"] = "native-seam OSError fault on a real leg"
+        rec["transport_mechanism"] = (
+            "single-shot native-seam OSError on a real leg, "
+            "delegating afterwards"
+        )
+        finalize(rec, session, coreA)
         checks.record(
             "M4-transport-fallback",
             "transport-error -> fallback once -> HANDED_OFF",
@@ -583,24 +641,20 @@ def main() -> int:
                       False, "dial/answer failed")
     else:
         rec["destination_ids"] = ["primaria-inexistente", "guardia-caida"]
+        started = time.monotonic()
         voiceB.sessions[app].deliver_action_request(_TR("primaria-inexistente"))
-        first = wait_transfer_value(
-            listener, app, lambda r: r is TransferResult.REJECTED, 40)
-        pop_recorded_transfer(app)
-        second = wait_transfer_value(
-            listener, app,
-            lambda r: r is TransferResult.REJECTED, 40)
+        first = wait_nth_outcome(listener, app, 1, 40)
+        second = wait_nth_outcome(listener, app, 2, 40)
         # Deterministic exit: apology spoken, our BYE observed, ENDED.
         bye_seen = caller.expect(
             lambda e: e.get("event") == "closed" and e.get("tag") == "M5",
             20) is not None
         gone = H.wait_for(lambda: coreB.get_session(app) is None, 20)
+        rec["duration_seconds"] = round(time.monotonic() - started, 1)
         counts = history_counts(session)
         rec["primary_outcome"] = str(first)
         rec["fallback_outcomes"] = [str(second)]
-        rec["fallback_attempts"] = counts["fallback_handoff"]
-        rec["final_state"] = session.state.value
-        rec["history"] = [s.value for s in session.history]
+        finalize(rec, session, coreB)
         checks.record(
             "M5-double-failure",
             "primary+fallback rejected -> apology/terminate -> ENDED",
@@ -622,6 +676,10 @@ def main() -> int:
         pass
     try:
         caller702.stop()
+    except Exception:
+        pass
+    try:
+        caller703.stop()
     except Exception:
         pass
     try:

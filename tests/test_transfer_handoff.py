@@ -765,6 +765,128 @@ class AdapterAttemptIdentityTest(unittest.TestCase):
         self.assertTrue(record.transfer_open)
         self.assertEqual(record.transfer_attempt_id, "call-1:xfer:2")
 
+    def test_remote_close_while_open_is_deferred_until_settle(self) -> None:
+        from receptionist.baresip_adapter import _CallRecord
+
+        adapter = self._adapter()
+        adapter._running = True  # noqa: SLF001
+        events: list = []
+
+        class _Recorder:
+            def on_transfer_result(self, call_id, result, attempt_id=None):  # noqa: ANN202
+                events.append(("transfer", result, attempt_id))
+
+            def on_caller_hangup(self, call_id):  # noqa: ANN202
+                events.append(("hangup", call_id))
+
+        adapter.set_listener(_Recorder())
+        record = _CallRecord(app_id="call-1", native=None)
+        record.transfer_open = True
+        record.transfer_attempt_id = "call-1:xfer:1"
+        adapter._calls["call-1"] = record  # noqa: SLF001
+
+        # Far-end BYE racing the REFER outcome: stashed, not delivered.
+        adapter._on_native_closed("call-1", "OK")  # noqa: SLF001
+        adapter._drain_native_events("call-1")  # noqa: SLF001
+        self.assertEqual(events, [])
+        self.assertEqual(record.pending_close_reason, "OK")
+
+    def test_deferred_close_drops_on_accepted(self) -> None:
+        from receptionist.baresip_adapter import _CallRecord
+        from receptionist.boundaries import TransferResult
+
+        adapter = self._adapter()
+        adapter._running = True  # noqa: SLF001
+        events: list = []
+
+        class _Recorder:
+            def on_transfer_result(self, call_id, result, attempt_id=None):  # noqa: ANN202
+                events.append(("transfer", result, attempt_id))
+
+            def on_caller_hangup(self, call_id):  # noqa: ANN202
+                events.append(("hangup", call_id))
+
+        adapter.set_listener(_Recorder())
+        record = _CallRecord(app_id="call-1", native=None)
+        record.transfer_open = True
+        record.transfer_attempt_id = "call-1:xfer:1"
+        adapter._calls["call-1"] = record  # noqa: SLF001
+        adapter._on_native_closed("call-1", "OK")  # noqa: SLF001
+
+        class _Ok:
+            def transfer(self, target: str):  # noqa: ANN202
+                return None
+
+        record.native = _Ok()
+        # Drive the real settle path through the loop-less seam: the
+        # watchdog is cancelled and replaced by a direct failed/success
+        # check would need a loop, so settle via the failure mapper with
+        # a success-shaped outcome through _emit_transfer_settled.
+        adapter._emit_transfer_settled(  # noqa: SLF001
+            "call-1", TransferResult.ACCEPTED_BY_PBX, "call-1:xfer:1", "OK"
+        )
+        adapter._drain_native_events("call-1")  # noqa: SLF001
+        kinds = [kind for kind, *_ in events]
+        self.assertEqual(kinds, ["transfer"])
+        self.assertIs(events[0][1], TransferResult.ACCEPTED_BY_PBX)
+        self.assertEqual(events[0][2], "call-1:xfer:1")
+
+    def test_deferred_close_emitted_first_on_rejected(self) -> None:
+        from receptionist.baresip_adapter import _CallRecord
+
+        adapter = self._adapter()
+        adapter._running = True  # noqa: SLF001
+        events: list = []
+
+        class _Recorder:
+            def on_transfer_result(self, call_id, result, attempt_id=None):  # noqa: ANN202
+                events.append(("transfer", result, attempt_id))
+
+            def on_caller_hangup(self, call_id):  # noqa: ANN202
+                events.append(("hangup", call_id))
+
+        adapter.set_listener(_Recorder())
+        record = _CallRecord(app_id="call-1", native=None)
+        record.transfer_open = True
+        record.transfer_attempt_id = "call-1:xfer:1"
+        adapter._calls["call-1"] = record  # noqa: SLF001
+        adapter._on_native_closed("call-1", "OK")  # noqa: SLF001
+
+        class _Gone(Exception):
+            status = 404
+
+        adapter._transfer_failed(record, _Gone("nope"), "call-1:xfer:1")  # noqa: SLF001
+        adapter._drain_native_events("call-1")  # noqa: SLF001
+        kinds = [kind for kind, *_ in events]
+        # Close first (session terminates), result second (inert there).
+        self.assertEqual(kinds, ["hangup", "transfer"])
+
+    def test_local_close_while_open_wins_immediately(self) -> None:
+        from receptionist.baresip_adapter import _CallRecord
+
+        adapter = self._adapter()
+        adapter._running = True  # noqa: SLF001
+        events: list = []
+
+        class _Recorder:
+            def on_transfer_result(self, call_id, result, attempt_id=None):  # noqa: ANN202
+                events.append(("transfer", result, attempt_id))
+
+            def on_hangup_completed(self, call_id):  # noqa: ANN202
+                events.append(("completed", call_id))
+
+        adapter.set_listener(_Recorder())
+        record = _CallRecord(app_id="call-1", native=None)
+        record.transfer_open = True
+        record.transfer_attempt_id = "call-1:xfer:1"
+        record.local_close = True
+        adapter._calls["call-1"] = record  # noqa: SLF001
+
+        adapter._on_native_closed("call-1", "OK")  # noqa: SLF001
+        kinds = [kind for kind, *_ in events]
+        self.assertEqual(kinds, ["completed"])
+        self.assertIsNone(record.pending_close_reason)
+
     def test_shutdown_cancels_watchdog_no_late_outcome(self) -> None:
         import threading
 
