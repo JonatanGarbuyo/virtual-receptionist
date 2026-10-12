@@ -8,8 +8,6 @@ it is the fake far end, not the system under test.
 Commands (one JSON object per line):
   {"op": "start", "user": "701", "password": ..., "domain": "127.0.0.1",
    "codecs": ["pcmu"], "listen": "127.0.0.1:5071"}
-  {"op": "ring_incoming"} (never answer: the leg rings until the caller
-   gives up -- the transfer-timeout shape for #26)
   {"op": "dial", "uri": "sip:700@127.0.0.1:5060", "tag": "A"}
   {"op": "tone", "tag": "A", "seconds": 3.0, "freq": 440.0}
   {"op": "read", "tag": "A", "seconds": 3.0}
@@ -170,16 +168,6 @@ async def amain() -> int:
 
             ua.on_incoming(_on_incoming)  # type: ignore[union-attr]
             emit({"event": "autoanswer_armed"})
-        elif op == "ring_incoming":
-            # Ring forever, never answer (#26 timeout target): record the
-            # inbound leg and deliberately do nothing, so the far end
-            # hears ringback without a final outcome until its watchdog.
-            def _on_ring(call) -> None:  # noqa: ANN001
-                emit({"event": "incoming", "peer": str(getattr(call, "peer", ""))})
-                calls[f"RING-{len([k for k in calls if k.startswith('RING')])}"] = call
-
-            ua.on_incoming(_on_ring)  # type: ignore[union-attr]
-            emit({"event": "ring_armed"})
         elif op == "dial":
             tag = cmd["tag"]
             call = await ua.dial(cmd["uri"])  # type: ignore[union-attr]

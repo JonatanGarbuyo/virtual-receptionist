@@ -80,6 +80,11 @@ class TransferListener(H.RecordingListener):
         with self._lock:
             return [result for _, result in self.outcome_lists.get(call_id, [])]
 
+    def outcome_events(self, call_id: str) -> list:
+        """(monotonic timestamp, result) pairs, append-only."""
+        with self._lock:
+            return list(self.outcome_lists.get(call_id, []))
+
 
 def wait_nth_outcome(listener, call_id, n: int, timeout: float):
     """Block until n outcomes are recorded for one call (fail-safe wait;
@@ -186,7 +191,7 @@ def main() -> int:
     import socket as _socket
 
     busy = []
-    for _port in (5060, 5070, 5071, 5076, 5077):
+    for _port in (5060, 5070, 5071, 5076):
         _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         try:
             _sock.bind(("127.0.0.1", _port))
@@ -346,11 +351,10 @@ def main() -> int:
     # only ever sees the resolved PBX-local targets below.
     dest_ok = _Destination(id="primaria-ok", target=f"sip:702@{AST_SIP}",
                            kind="extension", label="Primaria OK")
-    # Timeout primary: 703 is registered but NEVER answers, so the REFER
-    # rings without a final NOTIFY until the declarative watchdog fires.
-    # (299 answers at ringback through the dialplan and cannot hold a
-    # transfer open; learned from the first matrix run.)
-    dest_ring = _Destination(id="primaria-lenta", target=f"sip:703@{AST_SIP}",
+    # Timeout primary: the when-sent target is irrelevant because the
+    # attempt is held open by a stuck transfer command (see M3): the
+    # synthetic 299 target documents intent only.
+    dest_ring = _Destination(id="primaria-lenta", target=f"sip:299@{AST_SIP}",
                              kind="extension", label="Primaria lenta")
     dest_bad_domain = _Destination(id="primaria-rota",
                                    target="sip:702@nonexistent.invalid",
@@ -398,20 +402,7 @@ def main() -> int:
     if not (ok702 and armed702):
         return _finish(evidence, checks, 1)
 
-    # Timeout target 703: registered, rings forever, NEVER answers.
-    caller703 = H.CallerProc([codec], listen="127.0.0.1:5077",
-                             user="703", password="vr-test-703")
-    ok703 = caller703.start()
-    ring703 = False
-    if ok703:
-        caller703.cmd({"op": "ring_incoming"})
-        ring703 = caller703.expect(
-            lambda e: e.get("event") == "ring_armed", 10) is not None
-    checks.record("xfer-timeout-ready",
-                  "transfer timeout target 703 registered, ringing never answered",
-                  ok703 and ring703, f"reg={ok703} ring={ring703}")
-    if not (ok703 and ring703):
-        return _finish(evidence, checks, 1)
+
 
     from receptionist.boundaries import TransferRequest as _TR
 
@@ -470,6 +461,35 @@ def main() -> int:
             return _orig_emit(app_id, result, attempt_id)
 
         adapter._emit_transfer_result = _logged_emit  # noqa: SLF001
+        _orig_bt = adapter.blind_transfer  # noqa: SLF001
+
+        def _logged_bt(call_id: str, target: str, attempt_id=None) -> None:
+            try:
+                with adapter._lock:  # noqa: SLF001
+                    record = adapter._calls.get(call_id)  # noqa: SLF001
+                    info = (
+                        f"open={record.transfer_open} "
+                        f"attempt={record.transfer_attempt_id} "
+                        f"native={type(record.native).__name__}"
+                        if record is not None
+                        else "no-record"
+                    )
+            except Exception:
+                info = "lock-error"
+            LOG.info("DBG blind_transfer app=%s target=%s attempt=%s %s",
+                     call_id, target, attempt_id, info)
+            return _orig_bt(call_id, target, attempt_id)
+
+        adapter.blind_transfer = _logged_bt  # noqa: SLF001
+        _orig_failed = adapter._transfer_failed  # noqa: SLF001
+
+        def _logged_failed(record, error, attempt_id=None) -> None:
+            LOG.info("DBG transfer_failed app=%s error=%s status=%s attempt=%s",
+                     record.app_id, type(error).__name__,
+                     getattr(error, "status", None), attempt_id)
+            return _orig_failed(record, error, attempt_id)
+
+        adapter._transfer_failed = _logged_failed  # noqa: SLF001
 
     def history_counts(session) -> dict:
         return {
@@ -611,14 +631,52 @@ def main() -> int:
     else:
         rec["destination_ids"] = ["primaria-lenta", "guardia"]
         started = time.monotonic()
+        action_at = time.monotonic()
         audit_start = len(audit_trail(coreA))
+        # Timeout mechanism (documented fault at the owned native seam):
+        # a stuck transfer command never resolves, so the attempt stays
+        # without result on a REAL established dialog until the REAL
+        # declarative watchdog fires. Real PBX stalls proved unusable:
+        # Asterisk fast-fails every tried shape (404-style NOTIFY
+        # failure, or a binding-level TransferFailed that also wedges
+        # the dialog for the fallback). The fallback REFER below is a
+        # real REFER over real SIP on the pristine dialog.
+        import asyncio as _asyncio
+
+        with adapter._lock:  # noqa: SLF001 (harness fault injection)
+            record = adapter._calls.get(app)  # noqa: SLF001
+            real_native = record.native if record is not None else None
+
+        class _HangOnce:
+            def __init__(self) -> None:
+                self.armed = True
+
+            def transfer(self, target: str):
+                if self.armed:
+                    self.armed = False
+
+                    async def _hang():
+                        await _asyncio.sleep(30)
+                        raise OSError("stuck transfer finally gave up")
+
+                    return _hang()
+                return real_native.transfer(target)
+
+        with adapter._lock:  # noqa: SLF001
+            if record is not None:
+                record.native = _HangOnce()
+        rec["timeout_mechanism"] = (
+            "single-shot stuck transfer command on a real leg; "
+            "real declarative watchdog; real fallback REFER"
+        )
         voiceA.sessions[app].deliver_action_request(_TR("primaria-lenta"))
-        # The referred leg must actually start ringing on 703 (fast PBX
-        # failure would disprove the timeout shape before the watchdog).
-        ringing = caller703.expect(
-            lambda e: e.get("event") == "incoming", 20) is not None
-        rec["referred_leg_ringing"] = ringing
         first = wait_nth_outcome(listener, app, 1, args.transfer_timeout + 30)
+        # Watchdog proof: the first outcome must arrive at ~the
+        # configured transfer timeout (a fast PBX failure would arrive
+        # in <1 s and disprove the timeout shape).
+        timed = [(round(t - action_at, 2), str(r))
+                 for t, r in listener.outcome_events(app)]
+        rec["outcome_timeline_seconds"] = timed
         second = wait_nth_outcome(listener, app, 2, 40)
         target_up = caller702.expect(
             lambda e: e.get("event") == "established"
@@ -629,15 +687,19 @@ def main() -> int:
         rec["primary_outcome"] = str(first)
         rec["fallback_outcomes"] = [str(second)]
         finalize(rec, session, coreA, audit_start)
+        watchdog_ok = (
+            timed and timed[0][1] == str(TransferResult.TIMEOUT)
+            and timed[0][0] >= args.transfer_timeout - 1.0
+        )
         checks.record(
             "M3-timeout-fallback", "timeout -> fallback once -> HANDED_OFF",
-            ringing
+            watchdog_ok
             and first is TransferResult.TIMEOUT
             and second is TransferResult.ACCEPTED_BY_PBX
             and counts["fallback_handoff"] == 1
             and counts["handed_off"] == 1 and counts["ended"] == 1
             and target_up and gone,
-            f"ringing={ringing} first={first} second={second} "
+            f"timeline={timed} first={first} second={second} "
             f"target_up={target_up} gone={gone} counts={counts}")
     evidence["scenarios"]["M3-timeout-fallback-accepted"] = rec
     cleanup_tag("M3")
@@ -758,6 +820,9 @@ def main() -> int:
 
     capturing[0] = False
     evidence["sip_timelines"]["adapter_trace"] = H.collapse_timeline(sip_lines)
+    # Full directional trace (capped): collapsed timelines lose the
+    # REFER/BYE/NOTIFY interleaving that decides transfer races.
+    evidence["sip_timelines"]["adapter_trace_full"] = sip_lines[-300:]
     H.snapshot_adapter_events(evidence, adapter)
     try:
         caller.stop()
@@ -765,10 +830,6 @@ def main() -> int:
         pass
     try:
         caller702.stop()
-    except Exception:
-        pass
-    try:
-        caller703.stop()
     except Exception:
         pass
     try:
